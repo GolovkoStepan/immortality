@@ -217,6 +217,28 @@ fn status_prints_a_task_that_exists_only_in_the_journal() {
 }
 
 #[test]
+fn human_output_to_a_pipe_carries_no_escape_sequences() {
+    // Assert-cmd captures stdout through a pipe, which is exactly the logged-or-redirected case.
+    // This is the end-to-end proof of the `should_colour` rule: the unit tests pin the decision,
+    // and this pins that every command actually consults it.
+    let daemon = Daemon::new();
+    daemon.journal(1);
+    daemon.ask();
+    daemon.serve();
+
+    for arguments in [vec!["status"], vec!["escalations"]] {
+        let output = daemon.cli().args(&arguments).output().unwrap();
+        assert!(output.status.success(), "{arguments:?}");
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !text.contains('\u{1b}'),
+            "{arguments:?} wrote escape sequences to a pipe: {text:?}"
+        );
+        assert!(!text.is_empty(), "{arguments:?} printed nothing");
+    }
+}
+
+#[test]
 fn status_json_is_machine_readable() {
     let daemon = Daemon::new();
     daemon.journal(2);
@@ -325,11 +347,15 @@ fn attach_replays_the_backlog_through_the_renderer() {
     let mut reader = std::io::BufReader::new(stdout);
     let mut line = String::new();
     std::io::BufRead::read_line(&mut reader, &mut line).unwrap();
-    // The rendered line is `<seq right-aligned>  <kind>`, so the fields are split rather than
-    // searched: `contains('0')` would also be satisfied by a seq of 10 or a payload digit.
+    // The rendered line is `<seq right-aligned>  <kind>  <detail>`, so the fields are split
+    // rather than searched: `contains('0')` would also be satisfied by a seq of 10 or a digit
+    // in the payload.
     let mut fields = line.split_whitespace();
     assert_eq!(fields.next(), Some("0"), "first line was {line:?}");
     assert_eq!(fields.next(), Some("task_state"), "first line was {line:?}");
+    // Styling is decided by `should_colour`, and stdout here is a pipe. A redirected run must be
+    // a clean file with no escape sequences at all.
+    assert!(!line.contains('\u{1b}'), "a pipe must get plain text: {line:?}");
 
     let mut second = String::new();
     std::io::BufRead::read_line(&mut reader, &mut second).unwrap();

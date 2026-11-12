@@ -26,6 +26,7 @@ use immortality_daemon::doctor::{self, Report, Status};
 
 mod client;
 mod render;
+mod style;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -164,7 +165,7 @@ async fn status_command(task: Option<String>, json: bool) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(&result)?);
     } else {
-        print!("{}", render::status(&result));
+        print!("{}", render::status(&result, style()));
     }
     Ok(())
 }
@@ -181,7 +182,7 @@ async fn escalations_command(task: Option<String>, json: bool) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(&result)?);
     } else {
-        print!("{}", render::escalations(&result));
+        print!("{}", render::escalations(&result, style()));
     }
     Ok(())
 }
@@ -196,7 +197,7 @@ async fn approve_command(id: &str, answer: &str, json: bool) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(&result)?);
     } else {
-        print!("{}", render::approved(&result));
+        print!("{}", render::approved(&result, style()));
     }
     Ok(())
 }
@@ -228,15 +229,39 @@ async fn attach_command(task: Option<String>, since_seq: u64, json: bool) -> Res
     // Bytes, not lines: a renderer that buffers until a newline makes a running task look
     // frozen, and "looks frozen" is how a human concludes the agent hung and kills it.
     let stdout = std::io::stdout();
+    let mut renderer = render::Renderer::new(style());
     client
         .attach(&task, since_seq, |record| {
             use std::io::Write as _;
+            let text = renderer.line(record);
+            if text.is_empty() {
+                // `tool_call_started` carries no news of its own; a write of zero bytes would be
+                // a syscall per record for nothing.
+                return;
+            }
             let mut lock = stdout.lock();
-            let _ = lock.write_all(render::record(record).as_bytes());
+            let _ = lock.write_all(text.as_bytes());
             let _ = lock.flush();
         })
         .await?;
     Ok(())
+}
+
+/// Whether this process may write colour, and the cost of deciding it once.
+///
+/// Read on every call rather than cached in a global: a CLI process is short-lived, and a global
+/// would make the test binary's first call decide for every test after it.
+fn style() -> style::Style {
+    use std::io::IsTerminal as _;
+
+    let is_tty = std::io::stdout().is_terminal();
+    let no_color = std::env::var_os("NO_COLOR");
+    let term = std::env::var_os("TERM");
+    if style::should_colour(is_tty, no_color.as_deref(), term.as_deref()) {
+        style::Style::colour()
+    } else {
+        style::Style::plain()
+    }
 }
 
 /// The one task a daemon knows, or an error naming what to do instead.
