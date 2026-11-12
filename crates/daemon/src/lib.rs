@@ -10,7 +10,12 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 pub mod doctor;
+pub mod rpc;
+pub mod server;
 
-/// Version of the daemon<->client protocol. Bumped on any incompatible change; the client
-/// refuses to talk to a daemon with a different major value.
-pub const PROTOCOL_VERSION: u32 = 1;
+/// Version of the daemon<->client protocol.
+///
+/// Re-exported rather than declared twice: [`rpc::VERSION`] is what is actually put on the
+/// wire, and two constants with the same value is one constant and one accident waiting to
+/// diverge.
+pub const PROTOCOL_VERSION: u32 = rpc::VERSION;

@@ -85,6 +85,62 @@ pub enum Kind {
 }
 
 impl Kind {
+    /// The wire name, as it appears in a journal line.
+    ///
+    /// `serde`'s `rename_all = "snake_case"` is the authority for this table, and a test
+    /// (`as_str_agrees_with_the_wire_name`) asserts the two agree for every variant. The
+    /// duplication is what lets a caller render a kind without allocating a serialized
+    /// `Value`; the test is what stops the duplication from becoming a second schema.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            // ── lifecycle ──────────────────────────────────────────────────────
+            Self::TaskCreated => "task_created",
+            Self::TaskState => "task_state",
+            Self::PlanWritten => "plan_written",
+            Self::PlanEdited => "plan_edited",
+            Self::PlanApproved => "plan_approved",
+            Self::SubtaskState => "subtask_state",
+            Self::SubtaskSplit => "subtask_split",
+            Self::AttemptStarted => "attempt_started",
+            Self::AttemptFailed => "attempt_failed",
+            Self::AttemptRestarted => "attempt_restarted",
+            // ── inference ──────────────────────────────────────────────────────
+            Self::ModelRequest => "model_request",
+            Self::ModelResponse => "model_response",
+            Self::ModelStreamAborted => "model_stream_aborted",
+            // ── protocol quality ───────────────────────────────────────────────
+            Self::NativeToolcall => "native_toolcall",
+            Self::TextFallback => "text_fallback",
+            Self::InvalidToolcall => "invalid_toolcall",
+            // ── tool calls: the three-record protocol ──────────────────────────
+            Self::ToolCallIntent => "tool_call_intent",
+            Self::ToolCallStarted => "tool_call_started",
+            Self::ToolCallCompleted => "tool_call_completed",
+            Self::ToolCallFailed => "tool_call_failed",
+            Self::ToolCallUnknown => "tool_call_unknown",
+            Self::EffectVerified => "effect_verified",
+            Self::EffectAbsent => "effect_absent",
+            // ── checkpoints and recovery ───────────────────────────────────────
+            Self::CheckpointCreated => "checkpoint_created",
+            Self::JournalTruncatedTail => "journal_truncated_tail",
+            Self::DaemonStarted => "daemon_started",
+            Self::DaemonStopped => "daemon_stopped",
+            Self::DaemonRecovered => "daemon_recovered",
+            // ── context, detection, budgets ────────────────────────────────────
+            Self::DetectorFired => "detector_fired",
+            Self::Compaction => "compaction",
+            Self::GateResult => "gate_result",
+            Self::CacheStats => "cache_stats",
+            // ── human interaction ──────────────────────────────────────────────
+            Self::EscalationOpened => "escalation_opened",
+            Self::EscalationResolved => "escalation_resolved",
+            // ── environment ────────────────────────────────────────────────────
+            Self::BackendUnavailable => "backend_unavailable",
+            Self::BackendRestored => "backend_restored",
+        }
+    }
+
     /// Every kind, for exhaustive round-trip tests.
     ///
     /// A hand-written list rather than a derive macro because the list is the schema: it is
@@ -257,7 +313,18 @@ impl JournalRecord {
     /// produce byte-identical output for the same record — which is what makes the `prev`
     /// chain meaningful and golden files stable.
     pub fn to_line(&self) -> crate::Result<String> {
-        let serialized = LineOut {
+        serde_json::to_string(&self.line_out())
+            .map_err(|error| crate::Error::JournalCorrupt(error.to_string()))
+    }
+
+    /// The on-disk shape, for a caller that must hand a record to something other than the
+    /// journal file — `attach` streams records to a client, and a client should render exactly
+    /// what the file holds rather than a second, subtly different shape.
+    ///
+    /// Built from the same [`LineOut`] the writer uses, so the two cannot drift: a field added
+    /// to the line format appears in the stream automatically.
+    fn line_out(&self) -> LineOut<'_> {
+        LineOut {
             v: SCHEMA_VERSION,
             seq: self.fields.seq,
             ts: self.fields.at,
@@ -268,8 +335,7 @@ impl JournalRecord {
             payload: &self.event.payload,
             artifact: self.event.artifact.as_deref(),
             prev: self.prev.as_ref().map(super::digest_text),
-        };
-        serde_json::to_string(&serialized).map_err(|error| crate::Error::JournalCorrupt(error.to_string()))
+        }
     }
 
     /// Parse one line, rejecting anything the schema does not recognise.
@@ -303,6 +369,18 @@ impl JournalRecord {
             },
             prev,
         })
+    }
+}
+
+/// One line of the journal, as JSON.
+///
+/// Delegates to the same [`LineOut`] the file writer uses. A second shape for the client
+/// stream is how an attached terminal ends up rendering something the journal never contained:
+/// the two would drift the first time a field was added, and nobody would notice until a human
+/// compared a screen against a file.
+impl Serialize for JournalRecord {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        self.line_out().serialize(serializer)
     }
 }
 
@@ -377,6 +455,32 @@ mod tests {
             JournalEvent::with_payload(serde_json::json!({"title": "fix the tests"})),
             None,
         )
+    }
+
+    #[test]
+    fn as_str_agrees_with_the_wire_name() {
+        // `as_str` is a hand-written copy of what serde writes. This is the test that stops it
+        // being a *second* schema: the moment a variant's serde name changes and the table does
+        // not, rendering and recovery disagree about what a record says.
+        for kind in Kind::ALL {
+            let wire = serde_json::to_value(kind).unwrap();
+            assert_eq!(wire.as_str(), Some(kind.as_str()), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn a_record_serializes_to_the_same_json_that_it_writes() {
+        // `attach` streams records as JSON. If that JSON were built by a second impl, it would
+        // drift from the file, and a human comparing a terminal against the journal would find
+        // two different truths.
+        let record = record();
+        let line = record.to_line().unwrap();
+        let streamed = serde_json::to_string(&record).unwrap();
+        assert_eq!(streamed, line);
+        let parsed: serde_json::Value = serde_json::from_str(&streamed).unwrap();
+        assert_eq!(parsed["seq"], 7);
+        assert_eq!(parsed["kind"], "task_created");
+        assert!(parsed.get("prev").is_none(), "the first record has no prev");
     }
 
     #[test]

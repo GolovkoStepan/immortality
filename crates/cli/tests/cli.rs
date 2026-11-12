@@ -167,11 +167,47 @@ fn init_twice_is_idempotent() {
 }
 
 #[test]
+fn daemon_commands_fail_clearly_when_no_daemon_is_running() {
+    // The most common failure of every socket command. The message must say what is missing and
+    // what to do; "connection refused" or a stack of `Caused by:` lines would not.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = dead_backend_config(dir.path());
+
+    for command in ["status", "escalations", "attach"] {
+        binary()
+            .arg("--global-config")
+            .arg(&config)
+            .arg(command)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("no daemon is running"))
+            .stderr(predicate::str::contains("immortality serve"));
+    }
+}
+
+#[test]
+fn approve_requires_an_id_and_an_answer() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = dead_backend_config(dir.path());
+
+    // Clap enforces both, before any socket is opened, so the message is about usage rather than
+    // about a daemon that was never contacted.
+    binary()
+        .arg("--global-config")
+        .arg(&config)
+        .arg("approve")
+        .arg("esc_01ARZ3NDEKTSV4RRFFQ69G5FAV")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("<ANSWER>"));
+}
+
+#[test]
 fn unimplemented_commands_fail_with_the_milestone() {
     let dir = tempfile::tempdir().expect("tempdir");
     let config = dead_backend_config(dir.path());
 
-    for (command, milestone) in [("status", "M5"), ("attach", "M5"), ("escalations", "M3")] {
+    for (command, milestone) in [("log", "M5"), ("plan", "M4"), ("serve", "M5"), ("gc", "M1")] {
         binary()
             .arg("--global-config")
             .arg(&config)

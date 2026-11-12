@@ -32,6 +32,7 @@ pub mod logging;
 pub mod paths;
 pub mod protocol;
 pub mod recover;
+pub mod registry;
 pub mod time;
 pub mod worktree;
 

@@ -25,7 +25,7 @@ daemon.lock              # pid + старт, защита от второго д
 daemon.sock              # 0600
 daemon.token             # 0600, аутентификация клиента
 index.db                 # индекс/кэш (rebuildable)
-registry.json            # проекты: id, путь, remote
+registry.json            # проекты: id, путь, remote (D-070)
 state/<project>/<task>/
     config_snapshot.toml
     subtasks.json
