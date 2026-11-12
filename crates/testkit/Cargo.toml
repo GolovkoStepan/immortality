@@ -1,0 +1,22 @@
+[package]
+name = "immortality-testkit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+description = "Mock OpenAI backend, run simulator and fixtures for testing without a live model."
+
+[dependencies]
+immortality-core.workspace = true
+immortality-llm.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,27 @@
+[package]
+name = "immortality-daemon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+description = "Long-lived engine: scheduler, agent runner, RPC server."
+
+[dependencies]
+immortality-core.workspace = true
+immortality-llm.workspace = true
+immortality-tools.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+chrono.workspace = true
+reqwest.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

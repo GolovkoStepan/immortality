@@ -1,0 +1,19 @@
+# Build artefacts
+/target
+**/target
+Cargo.lock.orig
+
+# Spike output: traces are fixtures, the built binary is not
+/spike/traces
+/spike/target
+
+# Runtime state (never committed; the real location is outside the repo)
+/.agent/runtime
+*.sock
+daemon.token
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
