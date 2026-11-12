@@ -100,6 +100,7 @@ pub struct ToolCtx {
     budget: OutputBudget,
     call: Option<String>,
     task: Option<immortality_core::ids::TaskId>,
+    depth: u8,
 }
 
 impl ToolCtx {
@@ -115,6 +116,7 @@ impl ToolCtx {
             budget,
             call: None,
             task: None,
+            depth: 0,
         }
     }
 
@@ -150,6 +152,24 @@ impl ToolCtx {
     #[must_use]
     pub const fn task(&self) -> Option<&immortality_core::ids::TaskId> {
         self.task.as_ref()
+    }
+
+    /// The same context, marked as belonging to a sub-agent `depth` levels down.
+    ///
+    /// Depth is a property of the *caller*, not of the tool: the daemon builds a sub-agent's
+    /// context this way and the whole registry then treats it as one. Tools that must not nest
+    /// — `delegate` — read it instead of being handed a different registry, because a second
+    /// registry is a second place for the rule to be forgotten.
+    #[must_use]
+    pub const fn with_depth(mut self, depth: u8) -> Self {
+        self.depth = depth;
+        self
+    }
+
+    /// How deep in the delegation tree this call sits. `0` is the top-level agent.
+    #[must_use]
+    pub const fn depth(&self) -> u8 {
+        self.depth
     }
 
     /// The gate, for a tool that needs to ask a question the convenience methods do not cover.

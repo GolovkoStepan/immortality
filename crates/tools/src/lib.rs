@@ -8,6 +8,7 @@
 
 pub mod args;
 pub mod classify;
+pub mod delegate;
 pub mod escalate;
 pub mod find;
 pub mod git;
@@ -24,6 +25,7 @@ pub mod write;
 
 pub use args::Args;
 pub use classify::{Classification, classify};
+pub use delegate::{Delegate, Delegation, NoSubAgent, SubAgent, SubAgentOutcome, probe_delegated};
 pub use escalate::{DirectoryQueue, Escalate, EscalationQueue, JournalQueue, answer_question};
 pub use find::GlobTool;
 pub use git::Git;

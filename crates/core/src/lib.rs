@@ -21,6 +21,7 @@ pub mod artifacts;
 pub mod atomic;
 pub mod checkpoint;
 pub mod config;
+pub mod delegation;
 pub mod domain;
 pub mod error;
 pub mod escalation;
