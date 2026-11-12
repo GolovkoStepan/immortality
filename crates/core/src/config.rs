@@ -76,6 +76,17 @@ pub struct Policy {
     pub workspace_root: PathBuf,
     /// Hosts reachable without an escalation. Must include the model backend.
     pub trusted_hosts: BTreeSet<String>,
+    /// Paths inside the task worktree a write may land on.
+    ///
+    /// A worktree-relative glob list, and the reason it defaults to `**`: the worktree is already
+    /// the isolation boundary, so the allow list's job is to *narrow* it for an operator who wants
+    /// that, not to enumerate every file the agent may touch.
+    pub allow_write_globs: Vec<String>,
+    /// Paths no write may land on, checked before the allow list.
+    ///
+    /// Denies win over allows, always. A list that could be overridden by adding a broader allow
+    /// pattern would be a suggestion rather than a rule.
+    pub deny_write_globs: Vec<String>,
     pub allow_commit: bool,
     pub allow_push: bool,
     pub allow_network: bool,
@@ -177,6 +188,8 @@ impl Default for Policy {
                 "localhost".to_string(),
                 "127.0.0.1".to_string(),
             ]),
+            allow_write_globs: vec!["**".to_string()],
+            deny_write_globs: vec!["**/.git/config".to_string(), "**/.env*".to_string()],
             allow_commit: true,
             allow_push: false,
             allow_network: false,
@@ -291,6 +304,8 @@ pub struct RawBackend {
 pub struct RawPolicy {
     pub workspace_root: Option<PathBuf>,
     pub trusted_hosts: Option<Vec<String>>,
+    pub allow_write_globs: Option<Vec<String>>,
+    pub deny_write_globs: Option<Vec<String>>,
     pub allow_commit: Option<bool>,
     pub allow_push: Option<bool>,
     pub allow_network: Option<bool>,
@@ -488,6 +503,12 @@ fn apply_policy(target: &mut Policy, raw: RawPolicy) {
     }
     if let Some(value) = raw.trusted_hosts {
         target.trusted_hosts = value.into_iter().collect();
+    }
+    if let Some(value) = raw.allow_write_globs {
+        target.allow_write_globs = value;
+    }
+    if let Some(value) = raw.deny_write_globs {
+        target.deny_write_globs = value;
     }
     target.allow_commit = raw.allow_commit.unwrap_or(target.allow_commit);
     target.allow_push = raw.allow_push.unwrap_or(target.allow_push);
@@ -813,6 +834,28 @@ mod tests {
             loaded.warnings.iter().any(|w| w.contains("[policy]` is ignored")),
             "expected a warning, got {:?}",
             loaded.warnings
+        );
+    }
+
+    #[test]
+    fn project_file_cannot_widen_the_write_allow_list() {
+        // The allow list is a permission, so it lives in the global file only. A project file that
+        // could add `**` would be a project file that can grant itself the right to write
+        // anywhere in the worktree - including `.git/hooks`.
+        let fx = fixture();
+        std::fs::write(&fx.global, "[policy]\nallow_write_globs = [\"src/**\"]\n").unwrap();
+        std::fs::write(
+            &fx.project,
+            "[policy]\nallow_write_globs = [\"**\"]\ndeny_write_globs = []\n",
+        )
+        .unwrap();
+
+        let loaded = load(&overrides_for(&fx)).unwrap();
+        assert_eq!(loaded.config.policy.allow_write_globs, vec!["src/**".to_string()]);
+        assert_eq!(
+            loaded.config.policy.deny_write_globs,
+            vec!["**/.git/config".to_string(), "**/.env*".to_string()],
+            "the project file must not be able to empty the deny list"
         );
     }
 
