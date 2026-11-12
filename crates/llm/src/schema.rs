@@ -639,9 +639,7 @@ fn check(schema: &Value, path: &str, depth: usize, out: &mut Vec<Defect>) {
                     ));
                 }
             }
-            "minLength" | "maxLength" | "minItems" | "maxItems"
-                if value.as_u64().is_none() =>
-            {
+            "minLength" | "maxLength" | "minItems" | "maxItems" if value.as_u64().is_none() => {
                 out.push(Defect::new(
                     path,
                     "limit",

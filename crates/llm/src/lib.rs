@@ -11,6 +11,7 @@
 //! - [`failure`] — why an attempt failed, and whether sending it again could help.
 //! - [`extract`] — native tool calls first, a conservative text fallback second.
 //! - [`schema`] — argument validation against the tool's JSON Schema, with a model-facing error.
+//! - [`tokens`] — a calibrated estimate for when the backend reports no usage.
 //!
 //! # Why the split
 //!
@@ -35,6 +36,7 @@ pub mod failure;
 pub mod schema;
 pub mod sse;
 pub mod stream;
+pub mod tokens;
 pub mod turn;
 pub mod wire;
 
@@ -49,5 +51,6 @@ pub use schema::{
     validate,
 };
 pub use stream::{StreamDecoder, StreamEnd, StreamError, TurnAccumulator};
+pub use tokens::{DEFAULT_CHARS_PER_TOKEN, Estimator, char_count};
 pub use turn::{AssistantTurn, CalledFunction, FINISH_LENGTH, ToolCall, Usage};
 pub use wire::{CacheReport, ChatRequest, ChatResponse, Message, StreamOptions, ToolDef};
