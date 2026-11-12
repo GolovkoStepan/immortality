@@ -39,6 +39,7 @@ pub struct Config {
     pub loop_: LoopLimits,
     pub detectors: Detectors,
     pub logging: Logging,
+    pub storage: Storage,
 }
 
 /// LLM backend.
@@ -135,6 +136,23 @@ pub struct Logging {
     pub dir: PathBuf,
 }
 
+/// Data growth limits, enforced by `gc` and the disk guard.
+///
+/// Split from [`Logging`] because these are about disk, not about verbosity: an operator tuning
+/// log levels should not be able to shorten the artifact TTL by accident.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+pub struct Storage {
+    /// Days an artifact with no live reference is kept before `gc` may delete it.
+    pub artifact_ttl_days: u32,
+    /// Months of compressed logs to keep. The current and previous month are never deleted.
+    pub log_retention_months: u32,
+    /// Free space below this is a warning.
+    pub disk_warn_bytes: u64,
+    /// Free space below this pauses the task: the next write would fail.
+    pub disk_pause_bytes: u64,
+}
+
 impl Default for Backend {
     fn default() -> Self {
         Self {
@@ -224,6 +242,20 @@ impl Default for Logging {
     }
 }
 
+impl Default for Storage {
+    fn default() -> Self {
+        Self {
+            artifact_ttl_days: 30,
+            log_retention_months: 12,
+            // 1 GiB / 256 MiB: the pause threshold is low enough that a single tool output or a
+            // checkpoint cannot be the write that fills the disk, and high enough that a normal
+            // build or a git operation still fits.
+            disk_warn_bytes: 1024 * 1024 * 1024,
+            disk_pause_bytes: 256 * 1024 * 1024,
+        }
+    }
+}
+
 // ── raw (partial) file shapes ───────────────────────────────────────────────────
 
 /// Shape of a TOML config file; every field optional so files may be small.
@@ -238,6 +270,7 @@ pub struct RawConfig {
     pub loop_: Option<RawLoop>,
     pub detectors: Option<RawDetectors>,
     pub logging: Option<RawLogging>,
+    pub storage: Option<RawStorage>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -309,6 +342,15 @@ pub struct RawDetectors {
 pub struct RawLogging {
     pub level: Option<String>,
     pub dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawStorage {
+    pub artifact_ttl_days: Option<u32>,
+    pub log_retention_months: Option<u32>,
+    pub disk_warn_bytes: Option<u64>,
+    pub disk_pause_bytes: Option<u64>,
 }
 
 // ── command-line overrides ──────────────────────────────────────────────────────
@@ -528,6 +570,13 @@ fn apply_non_policy(config: &mut Config, raw: RawConfig) {
             target.dir = v;
         }
     }
+    if let Some(raw) = raw.storage {
+        let target = &mut config.storage;
+        target.artifact_ttl_days = raw.artifact_ttl_days.unwrap_or(target.artifact_ttl_days);
+        target.log_retention_months = raw.log_retention_months.unwrap_or(target.log_retention_months);
+        target.disk_warn_bytes = raw.disk_warn_bytes.unwrap_or(target.disk_warn_bytes);
+        target.disk_pause_bytes = raw.disk_pause_bytes.unwrap_or(target.disk_pause_bytes);
+    }
 }
 
 fn apply_env(config: &mut Config) {
@@ -600,6 +649,26 @@ fn validate(config: &Config) -> Result<()> {
             "loop.max_subtask_depth above 3 is not supported: context quality collapses".into(),
         ));
     }
+    if config.storage.disk_pause_bytes >= config.storage.disk_warn_bytes {
+        return Err(Error::ConfigInvalid(format!(
+            "storage.disk_pause_bytes ({}) must be smaller than disk_warn_bytes ({})",
+            config.storage.disk_pause_bytes, config.storage.disk_warn_bytes
+        )));
+    }
+    if config.storage.artifact_ttl_days == 0 {
+        return Err(Error::ConfigInvalid(
+            "storage.artifact_ttl_days must be at least 1: a zero TTL would delete artifacts \
+             the next step is about to read"
+                .into(),
+        ));
+    }
+    if config.storage.log_retention_months < 2 {
+        return Err(Error::ConfigInvalid(
+            "storage.log_retention_months must be at least 2: the previous month is still being \
+             written when the new one starts"
+                .into(),
+        ));
+    }
     // The backend must be reachable without an escalation, otherwise every model call
     // becomes a human approval.
     let host = host_of(&config.backend.base_url);
@@ -669,6 +738,64 @@ mod tests {
     #[test]
     fn defaults_are_valid() {
         validate(&Config::default()).unwrap();
+    }
+
+    #[test]
+    fn storage_defaults_match_the_documented_thresholds() {
+        let storage = Storage::default();
+        assert_eq!(storage.artifact_ttl_days, 30);
+        assert_eq!(storage.log_retention_months, 12);
+        assert_eq!(storage.disk_warn_bytes, 1024 * 1024 * 1024);
+        assert_eq!(storage.disk_pause_bytes, 256 * 1024 * 1024);
+    }
+
+    #[test]
+    fn storage_is_read_from_the_project_file() {
+        // Unlike `[policy]`, `[storage]` is a tuning knob, not a permission: the project may set
+        // it, and a shorter TTL there is a developer's choice, not a privilege escalation.
+        let fx = fixture();
+        std::fs::write(&fx.global, "").unwrap();
+        std::fs::write(&fx.project, "[storage]\nartifact_ttl_days = 3\n").unwrap();
+        let loaded = load(&overrides_for(&fx)).unwrap();
+        assert_eq!(loaded.config.storage.artifact_ttl_days, 3);
+        assert_eq!(loaded.config.storage.log_retention_months, 12);
+        assert!(
+            !loaded.warnings.iter().any(|w| w.contains("[policy]")),
+            "a `[storage]` section must not be mistaken for `[policy]`"
+        );
+    }
+
+    #[test]
+    fn a_zero_artifact_ttl_is_rejected() {
+        let fx = fixture();
+        std::fs::write(&fx.global, "").unwrap();
+        std::fs::write(&fx.project, "[storage]\nartifact_ttl_days = 0\n").unwrap();
+        let error = load(&overrides_for(&fx)).unwrap_err();
+        assert!(error.to_string().contains("artifact_ttl_days"), "{error}");
+    }
+
+    #[test]
+    fn a_pause_threshold_at_or_above_the_warning_is_rejected() {
+        // Equal thresholds would mean the warning and the pause fire at the same moment, and the
+        // operator would never see the warning before work stopped.
+        let fx = fixture();
+        std::fs::write(&fx.global, "").unwrap();
+        std::fs::write(
+            &fx.project,
+            "[storage]\ndisk_warn_bytes = 1000\ndisk_pause_bytes = 1000\n",
+        )
+        .unwrap();
+        let error = load(&overrides_for(&fx)).unwrap_err();
+        assert!(error.to_string().contains("disk_pause_bytes"), "{error}");
+    }
+
+    #[test]
+    fn a_log_retention_shorter_than_two_months_is_rejected() {
+        let fx = fixture();
+        std::fs::write(&fx.global, "").unwrap();
+        std::fs::write(&fx.project, "[storage]\nlog_retention_months = 1\n").unwrap();
+        let error = load(&overrides_for(&fx)).unwrap_err();
+        assert!(error.to_string().contains("log_retention_months"), "{error}");
     }
 
     #[test]

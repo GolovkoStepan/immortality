@@ -22,6 +22,7 @@ pub mod checkpoint;
 pub mod config;
 pub mod domain;
 pub mod error;
+pub mod gc;
 pub mod ids;
 pub mod journal;
 pub mod logging;
