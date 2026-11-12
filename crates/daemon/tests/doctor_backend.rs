@@ -17,7 +17,7 @@
 )]
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use immortality_core::config::Config;
 use immortality_daemon::doctor::{self, Status};
@@ -92,12 +92,12 @@ async fn respond(stream: &mut tokio::net::TcpStream, code: u16, content_type: &s
     let _ = stream.flush().await;
 }
 
-fn config_for(addr: SocketAddr) -> Config {
+fn config_for(addr: SocketAddr, log_dir: &Path) -> Config {
     let mut config = Config::default();
     config.backend.base_url = format!("http://{addr}/v1");
     config.backend.connect_timeout_secs = 5;
     config.policy.trusted_hosts.insert("127.0.0.1".into());
-    config.logging.dir = PathBuf::from("/tmp/immortality-doctor-test-logs");
+    config.logging.dir = log_dir.to_path_buf();
     config
 }
 
@@ -122,8 +122,9 @@ fn find<'a>(checks: &'a [doctor::Check], name: &str) -> &'a doctor::Check {
 
 #[tokio::test]
 async fn healthy_backend_passes_every_backend_check() {
+    let dir = tempfile::tempdir().expect("tempdir");
     let (addr, server) = spawn_mock(Mode::Healthy).await;
-    let config = config_for(addr);
+    let config = config_for(addr, dir.path());
     let checks = run(&config).await;
 
     assert_eq!(find(&checks, "backend-models").status, Status::Ok);
@@ -138,8 +139,9 @@ async fn healthy_backend_passes_every_backend_check() {
 
 #[tokio::test]
 async fn server_error_fails_models_and_skips_latency() {
+    let dir = tempfile::tempdir().expect("tempdir");
     let (addr, server) = spawn_mock(Mode::ServerError).await;
-    let config = config_for(addr);
+    let config = config_for(addr, dir.path());
     let checks = run(&config).await;
 
     let models = find(&checks, "backend-models");
@@ -155,8 +157,9 @@ async fn server_error_fails_models_and_skips_latency() {
 
 #[tokio::test]
 async fn connection_drop_is_a_failure_not_a_hang() {
+    let dir = tempfile::tempdir().expect("tempdir");
     let (addr, server) = spawn_mock(Mode::HangUp).await;
-    let config = config_for(addr);
+    let config = config_for(addr, dir.path());
     let checks = run(&config).await;
 
     assert_eq!(find(&checks, "backend-models").status, Status::Fail);
@@ -168,11 +171,12 @@ async fn connection_drop_is_a_failure_not_a_hang() {
 #[tokio::test]
 async fn unreachable_backend_reports_failure_and_finishes() {
     // Port 1 on loopback: reserved, nothing listens, connection refused immediately.
+    let dir = tempfile::tempdir().expect("tempdir");
     let mut config = Config::default();
     config.backend.base_url = "http://127.0.0.1:1/v1".into();
     config.backend.connect_timeout_secs = 2;
     config.policy.trusted_hosts.insert("127.0.0.1".into());
-    config.logging.dir = PathBuf::from("/tmp/immortality-doctor-test-logs");
+    config.logging.dir = dir.path().to_path_buf();
 
     let checks = run(&config).await;
     assert_eq!(find(&checks, "backend-models").status, Status::Fail);
@@ -185,8 +189,9 @@ async fn unreachable_backend_reports_failure_and_finishes() {
 
 #[tokio::test]
 async fn untrusted_host_is_reported_even_when_backend_answers() {
+    let dir = tempfile::tempdir().expect("tempdir");
     let (addr, server) = spawn_mock(Mode::Healthy).await;
-    let mut config = config_for(addr);
+    let mut config = config_for(addr, dir.path());
     config.policy.trusted_hosts.remove("127.0.0.1");
 
     let checks = run(&config).await;
@@ -199,8 +204,9 @@ async fn untrusted_host_is_reported_even_when_backend_answers() {
 
 #[tokio::test]
 async fn exit_code_reflects_the_worst_check() {
+    let dir = tempfile::tempdir().expect("tempdir");
     let (addr, server) = spawn_mock(Mode::Healthy).await;
-    let config = config_for(addr);
+    let config = config_for(addr, dir.path());
     let warnings = Vec::new();
     let global = PathBuf::from("/tmp/immortality-doctor-test.toml");
     let report = doctor::run(&doctor::Context {
@@ -212,8 +218,10 @@ async fn exit_code_reflects_the_worst_check() {
     .await;
     assert_eq!(report.exit_code(), 0, "{:?}", report.checks);
 
+    let broken_dir = tempfile::tempdir().expect("tempdir");
     let mut broken = config.clone();
     broken.backend.base_url = "http://127.0.0.1:1/v1".into();
+    broken.logging.dir = broken_dir.path().to_path_buf();
     let report = doctor::run(&doctor::Context {
         config: &broken,
         config_warnings: &warnings,

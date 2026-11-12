@@ -311,7 +311,10 @@ fn log_dir_check(config: &Config) -> Check {
     let dir = &config.logging.dir;
     match std::fs::create_dir_all(dir) {
         Ok(()) => {
-            let probe = dir.join(".doctor-probe");
+            // The probe name includes the pid: two `doctor` processes running at once (a
+            // human and the daemon's health check, say) must not delete each other's probe
+            // and report a writable directory as broken.
+            let probe = dir.join(format!(".doctor-probe-{}", std::process::id()));
             match std::fs::write(&probe, b"ok").and_then(|()| std::fs::remove_file(&probe)) {
                 Ok(()) => Check::ok("log-dir", format!("writable: {}", dir.display())),
                 Err(err) => Check::fail("log-dir", format!("{} is not writable: {err}", dir.display())),
