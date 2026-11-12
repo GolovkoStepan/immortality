@@ -176,6 +176,32 @@ pub fn approved(result: &Value, style: Style) -> String {
     )
 }
 
+/// A client-side notice, for the things that are not journal records.
+///
+/// Written in the same gutter as the stream so it reads as part of it, but with no sequence
+/// number: it is about the connection, not about the task, and inventing a number for it would
+/// make `--since-seq` ambiguous.
+#[must_use]
+pub fn notice(notice: crate::client::Notice, style: Style) -> String {
+    use std::fmt::Write as _;
+
+    match notice {
+        crate::client::Notice::Reconnecting { from, attempt } => {
+            let mut out = String::new();
+            let _ = writeln!(
+                out,
+                "{} {} {}",
+                style.dim("      "),
+                style.yellow("⟳"),
+                style.yellow(&format!(
+                    "stream closed; reconnecting from seq {from} (attempt {attempt})"
+                ))
+            );
+            out
+        }
+    }
+}
+
 /// Renders one `attach` stream.
 ///
 /// Holds the only piece of state the block layout needs: which tool each open call belongs to.
@@ -772,6 +798,38 @@ mod tests {
             assert_eq!(bytes[6], b' ', "seq must not touch the marker: {body:?}");
             assert_ne!(bytes[7], b' ', "the marker follows one space: {body:?}");
         }
+    }
+
+    #[test]
+    fn a_reconnect_notice_has_no_sequence_number_but_sits_in_the_gutter() {
+        // The notice is about the connection, not the task. A number would make `--since-seq`
+        // ambiguous, so the gutter carries blank space instead.
+        let out = notice(
+            crate::client::Notice::Reconnecting { from: 42, attempt: 2 },
+            PLAIN,
+        );
+        assert!(out.contains("seq 42"), "{out}");
+        assert!(out.contains("attempt 2"), "{out}");
+        // Same column as a block's marker: `      <seq> ⏺` puts the marker at index 7, so the
+        // notice's must be there too or the stream looks ragged on every reconnect.
+        let marker_column = out.find('⟳').expect("marker");
+        assert_eq!(marker_column, 7, "the marker sits in the block column: {out:?}");
+        assert!(
+            out[..marker_column].trim().is_empty(),
+            "no sequence number: {out:?}"
+        );
+        assert_eq!(out.matches('\n').count(), 1, "{out:?}");
+    }
+
+    #[test]
+    fn a_reconnect_notice_is_yellow_and_says_the_stream_closed() {
+        // The whole point: a frozen screen must not be mistaken for a thinking model.
+        let out = notice(
+            crate::client::Notice::Reconnecting { from: 0, attempt: 1 },
+            Style::colour(),
+        );
+        assert!(out.contains("\u{1b}[33m"), "{out:?}");
+        assert!(out.contains("stream closed"), "{out}");
     }
 
     #[test]

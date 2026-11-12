@@ -217,11 +217,19 @@ async fn attach_command(task: Option<String>, since_seq: u64, json: bool) -> Res
         // One record per line, unmodified: this is what a script parses, and any prettifying
         // would be a second format to keep in sync with the daemon's.
         client
-            .attach(&task, since_seq, |record| {
-                if let Ok(line) = serde_json::to_string(record) {
-                    println!("{line}");
-                }
-            })
+            .attach(
+                &task,
+                since_seq,
+                |record| {
+                    if let Ok(line) = serde_json::to_string(record) {
+                        println!("{line}");
+                    }
+                },
+                // A script consuming `--json` gets records only: a reconnect notice is not a
+                // record and would make the stream unparseable. `stderr` is not used either,
+                // because the point of `--json` is an exactly reproducible byte stream.
+                |_notice| {},
+            )
             .await?;
         return Ok(());
     }
@@ -229,22 +237,39 @@ async fn attach_command(task: Option<String>, since_seq: u64, json: bool) -> Res
     // Bytes, not lines: a renderer that buffers until a newline makes a running task look
     // frozen, and "looks frozen" is how a human concludes the agent hung and kills it.
     let stdout = std::io::stdout();
-    let mut renderer = render::Renderer::new(style());
+    let style = style();
+    let mut renderer = render::Renderer::new(style);
     client
-        .attach(&task, since_seq, |record| {
-            use std::io::Write as _;
-            let text = renderer.line(record);
-            if text.is_empty() {
-                // `tool_call_started` carries no news of its own; a write of zero bytes would be
-                // a syscall per record for nothing.
-                return;
-            }
-            let mut lock = stdout.lock();
-            let _ = lock.write_all(text.as_bytes());
-            let _ = lock.flush();
-        })
+        .attach(
+            &task,
+            since_seq,
+            |record| {
+                write_stdout(&stdout, &renderer.line(record));
+            },
+            // `Style` is `Copy`, so the notice closure does not need to borrow the renderer —
+            // two closures cannot hold `&mut` on it at once.
+            |notice| {
+                write_stdout(&stdout, &render::notice(notice, style));
+            },
+        )
         .await?;
     Ok(())
+}
+
+/// Write `text` and flush, ignoring a closed pipe.
+///
+/// A human who pressed Ctrl-C or piped into `head` closed stdout; the command is over, and an
+/// error there would only be noise. Bytes are written rather than lines so a block that arrives
+/// in pieces still appears as it arrives.
+fn write_stdout(stdout: &std::io::Stdout, text: &str) {
+    if text.is_empty() {
+        // `tool_call_started` carries no news of its own; a write of zero bytes would be a
+        // syscall per record for nothing.
+        return;
+    }
+    let mut lock = stdout.lock();
+    let _ = std::io::Write::write_all(&mut lock, text.as_bytes());
+    let _ = std::io::Write::flush(&mut lock);
 }
 
 /// Whether this process may write colour, and the cost of deciding it once.

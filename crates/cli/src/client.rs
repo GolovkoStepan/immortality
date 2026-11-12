@@ -50,6 +50,22 @@ const ANSWER_TIMEOUT: Duration = Duration::from_secs(30);
 /// loop is worse than an error message.
 const MAX_FRUITLESS_RECONNECTS: u32 = 3;
 
+/// Something the client has to say that is not a journal record.
+///
+/// Only reconnection so far. It exists because silence on screen means two very different things
+/// — "the model is thinking" and "the stream died" — and a run lasts hours, so the human will
+/// eventually be looking at both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Notice {
+    /// The stream ended and a reconnect is being attempted from `from`.
+    Reconnecting {
+        /// The first sequence number the client has not seen.
+        from: u64,
+        /// Which consecutive attempt this is, counting from 1.
+        attempt: u32,
+    },
+}
+
 /// A connection to a running daemon.
 pub struct Client {
     write: tokio::net::unix::OwnedWriteHalf,
@@ -59,6 +75,12 @@ pub struct Client {
     /// Remembered so a stream that the daemon closes can be re-opened. The file descriptor
     /// cannot be read back into a path, so the path is kept rather than derived.
     socket: PathBuf,
+    /// Deadline for a *request* answer.
+    ///
+    /// A field rather than the constant, so a test can shorten it. It must never be applied to
+    /// the event stream: an attached run is idle for as long as the model thinks, and a cold
+    /// prefill here was measured at 166 s.
+    answer_timeout: Duration,
 }
 
 impl Client {
@@ -140,6 +162,7 @@ impl Client {
             next_id: 0,
             token,
             socket: socket.to_path_buf(),
+            answer_timeout: ANSWER_TIMEOUT,
         })
     }
 
@@ -184,6 +207,7 @@ impl Client {
         task: &str,
         since_seq: u64,
         mut on_event: impl FnMut(&Value),
+        mut on_notice: impl FnMut(Notice),
     ) -> Result<()> {
         let mut from = since_seq;
         let mut fruitless_reconnects = 0u32;
@@ -223,6 +247,15 @@ impl Client {
                 fruitless_reconnects = 0;
             }
             tracing::info!("the daemon closed the stream; re-attaching from {from}");
+            // The screen would otherwise simply stop changing, and a stopped screen is
+            // indistinguishable from a model that is thinking. Saying it out loud is the
+            // difference between "wait" and "the daemon died".
+            on_notice(Notice::Reconnecting {
+                from,
+                // The count was just incremented, so this is the attempt about to be made:
+                // the first reconnection announces itself as 1, not as 2.
+                attempt: fruitless_reconnects,
+            });
             *self = Self::reopen(&self.socket, &self.token).await?;
         }
     }
@@ -235,7 +268,10 @@ impl Client {
     /// reconnect is attempted rather than guessed at.
     async fn stream(&mut self, from: &mut u64, on_event: &mut impl FnMut(&Value)) -> Result<()> {
         loop {
-            let line = match self.read_line().await {
+            // No deadline: this is the event stream, not a request. An attached run is legitimately
+            // silent for as long as the model thinks, and a cold prefill on this backend measured
+            // 166 s. A 30-second answer deadline here would disconnect a healthy run.
+            let line = match self.read_line_within(None).await {
                 Ok(line) => line,
                 Err(error) if error.to_string().contains("closed the connection") => return Ok(()),
                 Err(error) => return Err(error),
@@ -267,15 +303,24 @@ impl Client {
 
     /// Read one line, with a deadline.
     async fn read_line(&mut self) -> Result<String> {
+        let deadline = self.answer_timeout;
+        self.read_line_within(Some(deadline)).await
+    }
+
+    /// Read one line, waiting at most `deadline`.
+    ///
+    /// `None` means "wait as long as the daemon needs", and the stream passes `None`: a human
+    /// watching a run expects silence while the model works, not a client that gives up on it.
+    async fn read_line_within(&mut self, deadline: Option<Duration>) -> Result<String> {
         let mut line = String::new();
-        let read = tokio::time::timeout(ANSWER_TIMEOUT, self.reader.read_line(&mut line))
-            .await
-            .map_err(|_| {
-                anyhow::anyhow!(
-                    "the daemon did not answer within {} seconds",
-                    ANSWER_TIMEOUT.as_secs()
-                )
-            })??;
+        let read = match deadline {
+            Some(deadline) => tokio::time::timeout(deadline, self.reader.read_line(&mut line))
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!("the daemon did not answer within {} seconds", deadline.as_secs())
+                })??,
+            None => self.reader.read_line(&mut line).await?,
+        };
         if read == 0 {
             bail!("the daemon closed the connection");
         }
@@ -427,5 +472,171 @@ mod tests {
         assert_eq!(socket.parent(), token.parent());
         assert_eq!(socket.file_name().unwrap(), "daemon.sock");
         assert_eq!(token.file_name().unwrap(), "daemon.token");
+    }
+
+    /// A fake daemon that answers `hello`, then serves one scripted event line.
+    ///
+    /// Hand-written rather than the real server: the point is to control *when* bytes arrive, and
+    /// the real server cannot be told to stay silent for two seconds.
+    fn fake_daemon(dir: &Path, event_delay: Duration) -> std::path::PathBuf {
+        let socket = dir.join("daemon.sock");
+        let path = socket.clone();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            runtime.block_on(async move {
+                let listener = tokio::net::UnixListener::bind(&path).expect("bind");
+                let (stream, _) = listener.accept().await.expect("accept");
+                let (read, mut write) = stream.into_split();
+                let mut lines = tokio::io::BufReader::new(read).lines();
+                // `hello`
+                if lines.next_line().await.ok().flatten().is_none() {
+                    return;
+                }
+                write
+                    .write_all(b"{\"id\":1,\"result\":{\"version\":1}}\n")
+                    .await
+                    .ok();
+                // `attach`
+                if lines.next_line().await.ok().flatten().is_none() {
+                    return;
+                }
+                write
+                    .write_all(b"{\"id\":2,\"result\":{\"backlog\":[],\"next_seq\":0}}\n")
+                    .await
+                    .ok();
+                // Silence for longer than any request deadline, then one event.
+                tokio::time::sleep(event_delay).await;
+                write
+                    .write_all(b"{\"record\":{\"seq\":0,\"kind\":\"task_state\",\"task\":\"t\"}}\n")
+                    .await
+                    .ok();
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            });
+        });
+        // The listener binds inside the thread; wait until the path exists.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !socket.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        socket
+    }
+
+    /// A fake daemon that answers `hello` and `attach`, then closes the stream immediately.
+    ///
+    /// This is the lagged-subscriber case from the server's side: the client must reconnect and
+    /// say so, rather than either hanging silently or giving up.
+    fn closing_daemon(dir: &Path) -> std::path::PathBuf {
+        let socket = dir.join("daemon.sock");
+        let path = socket.clone();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            runtime.block_on(async move {
+                let listener = tokio::net::UnixListener::bind(&path).expect("bind");
+                loop {
+                    let Ok((stream, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let (read, mut write) = stream.into_split();
+                    let mut lines = tokio::io::BufReader::new(read).lines();
+                    if lines.next_line().await.ok().flatten().is_none() {
+                        continue;
+                    }
+                    let _ = write.write_all(b"{\"id\":1,\"result\":{\"version\":1}}\n").await;
+                    if lines.next_line().await.ok().flatten().is_none() {
+                        continue;
+                    }
+                    let _ = write
+                        .write_all(b"{\"id\":2,\"result\":{\"backlog\":[],\"next_seq\":0}}\n")
+                        .await;
+                    // Close at once: every connection is fruitless.
+                }
+            });
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !socket.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        socket
+    }
+
+    #[tokio::test]
+    async fn a_daemon_closing_every_stream_is_reported_and_bounded() {
+        // Two failures in one: the human must be told the stream closed (a frozen screen looks
+        // like a thinking model), and the loop must stop instead of reconnecting forever.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = closing_daemon(dir.path());
+        let token_path = dir.path().join("daemon.token");
+        std::fs::write(&token_path, "t\n").expect("token");
+
+        let mut client = Client::connect(&socket, &token_path).await.expect("connect");
+        let mut notices = Vec::new();
+        let error = client
+            .attach(
+                "t",
+                0,
+                |_| {},
+                |notice| {
+                    notices.push(notice);
+                },
+            )
+            .await
+            .expect_err("a daemon that never streams must not be retried forever");
+
+        assert!(
+            error.to_string().contains("without"),
+            "the message must say what happened: {error}"
+        );
+        // Exactly the tolerated reconnections, numbered from one. An off-by-one here would
+        // tell the human "attempt 2" on the first retry, which reads as a lost attempt.
+        let attempts: Vec<u32> = notices
+            .iter()
+            .map(|notice| match notice {
+                Notice::Reconnecting { attempt, .. } => *attempt,
+            })
+            .collect();
+        assert_eq!(attempts, vec![1, 2, 3], "{notices:?}");
+        assert_eq!(
+            attempts.len(),
+            usize::try_from(MAX_FRUITLESS_RECONNECTS).unwrap(),
+            "the tolerated count is the announced count"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_silent_stream_is_not_a_timed_out_request() {
+        // A real bug: the stream read through `read_line`, which applies the 30-second answer
+        // deadline. A run where the model thought for longer than that was disconnected as if
+        // the daemon had hung, and a cold prefill here is 166 s — so it happened every time.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = fake_daemon(dir.path(), Duration::from_millis(300));
+        let token_path = dir.path().join("daemon.token");
+        std::fs::write(&token_path, "t\n").expect("token");
+
+        let mut client = Client::connect(&socket, &token_path).await.expect("connect");
+        // Shorter than the silence above: the request path would fail here, the stream must not.
+        client.answer_timeout = Duration::from_millis(50);
+
+        let mut seen = Vec::new();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(3),
+            client.attach(
+                "t",
+                0,
+                |record| {
+                    seen.push(record.get("seq").and_then(Value::as_u64));
+                },
+                |_| {},
+            ),
+        )
+        .await;
+        // `attach` loops forever by design; the event arriving before the timeout is the point.
+        assert!(outcome.is_err(), "attach should still be streaming, not returned");
+        assert_eq!(seen, vec![Some(0)], "the silent stream must still deliver");
     }
 }
