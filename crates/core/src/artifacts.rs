@@ -612,7 +612,7 @@ mod tests {
         std::fs::write(store.dir().join(TEMP_DIR).join("interrupted.part"), &payload[..6]).unwrap();
 
         assert!(!store.contains(&digest));
-        assert!(store.entries().unwrap().is_empty());
+        assert_eq!(store.entries().unwrap().len(), 0);
         assert!(store.read(&digest).is_err());
 
         // Recovery: the later write succeeds and the temp file is irrelevant to it.
