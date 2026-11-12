@@ -133,7 +133,9 @@ pub struct Denial {
 }
 
 impl Denial {
-    fn new(reason: impl Into<String>, subject: impl Into<String>) -> Self {
+    /// A refusal, so that callers outside this module can build one.
+    #[must_use]
+    pub fn new(reason: impl Into<String>, subject: impl Into<String>) -> Self {
         Self {
             reason: reason.into(),
             subject: subject.into(),
@@ -463,7 +465,13 @@ impl PolicyGate {
 
     /// Make `raw` absolute, resolve `.` and `..`, and refuse anything that climbs above the
     /// worktree even if it lands back inside afterwards.
-    fn resolve(&self, raw: &str) -> Option<PathBuf> {
+    ///
+    /// Public because the tool layer must use *this* answer rather than joining the raw argument
+    /// onto the worktree itself. Two resolutions of one argument are one resolution too many:
+    /// with a symlink in the path, the gate would judge the canonicalised target while the tool
+    /// opened the link, and the check would be decoration.
+    #[must_use]
+    pub fn resolve(&self, raw: &str) -> Option<PathBuf> {
         if raw.is_empty() {
             return None;
         }

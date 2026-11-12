@@ -226,18 +226,74 @@ where
 }
 
 fn match_segments(pattern: &[Segment], path: &[&str]) -> bool {
-    match pattern.split_first() {
+    // Memoised on (segments left, components left). Without it, a pattern like
+    // `**/a/**/a/**/a/**/a/**/b` is `components ^ stars` branches; with it the answer costs
+    // `segments × components`, which is a few hundred cells. The key is the remaining lengths
+    // because the recursion only ever slices from the front.
+    let mut memo = Memo::new(pattern.len(), path.len());
+    segments_at(pattern, path, &mut memo)
+}
+
+fn segments_at(pattern: &[Segment], path: &[&str], memo: &mut Memo) -> bool {
+    if let Some(known) = memo.get(pattern.len(), path.len()) {
+        return known;
+    }
+    let answer = match pattern.split_first() {
         // `**` at the end matches the prefix itself and everything under it, which is the
         // recursion below with an empty tail.
         Some((Segment::Any, rest)) => {
-            // Zero segments consumed, then one, then two, and so on.
-            (0..=path.len()).any(|skip| match_segments(rest, path.get(skip..).unwrap_or(&[])))
+            (0..=path.len()).any(|skip| segments_at(rest, path.get(skip..).unwrap_or(&[]), memo))
         }
         Some((Segment::One(tokens), rest)) => match path.split_first() {
-            Some((part, remaining)) => match_tokens(tokens, part) && match_segments(rest, remaining),
+            Some((part, remaining)) => match_tokens(tokens, part) && segments_at(rest, remaining, memo),
             None => false,
         },
         None => path.is_empty(),
+    };
+    memo.put(pattern.len(), path.len(), answer);
+    answer
+}
+
+/// A small boolean memo, keyed by two remaining lengths.
+///
+/// Deliberately tiny: the row count is the number of pattern segments and the column count the
+/// number of path components, both of which a real path keeps in the dozens.
+#[derive(Debug)]
+struct Memo {
+    width: usize,
+    cells: Vec<Cell>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Cell {
+    Unknown,
+    No,
+    Yes,
+}
+
+impl Memo {
+    fn new(rows: usize, columns: usize) -> Self {
+        Self {
+            width: columns + 1,
+            cells: vec![Cell::Unknown; (rows + 1) * (columns + 1)],
+        }
+    }
+
+    const fn index(&self, row: usize, column: usize) -> usize {
+        row * self.width + column
+    }
+
+    fn get(&self, row: usize, column: usize) -> Option<bool> {
+        match self.cells[self.index(row, column)] {
+            Cell::Unknown => None,
+            Cell::No => Some(false),
+            Cell::Yes => Some(true),
+        }
+    }
+
+    fn put(&mut self, row: usize, column: usize, value: bool) {
+        let index = self.index(row, column);
+        self.cells[index] = if value { Cell::Yes } else { Cell::No };
     }
 }
 
@@ -245,30 +301,69 @@ fn match_tokens(tokens: &[Token], text: &str) -> bool {
     // Lowercased on both sides once, so the comparison inside the loop is one `char` compare
     // rather than a case-fold per candidate.
     let text: Vec<char> = text.chars().map(|ch| ch.to_ascii_lowercase()).collect();
-    match_tokens_at(tokens, &text)
+
+    // Two pointers and one remembered star, not recursion. A recursive matcher tries every split
+    // of every `*`, so `*a*a*a*a*a*a*a*a` against a long name is exponential — and the pattern
+    // comes from the model, which means that is a hang an answer can cause. This form is
+    // `tokens × characters` worst case and allocates nothing.
+    let mut token = 0usize;
+    let mut at = 0usize;
+    // `(token after the star, character index to resume from)` — the last star seen, because a
+    // later star can always absorb what an earlier one failed to.
+    let mut star: Option<(usize, usize)> = None;
+
+    while at < text.len() {
+        let Some(current) = tokens.get(token) else {
+            // Tokens exhausted but characters left: only a star can rescue this.
+            match star {
+                Some((resume_token, resume_at)) => {
+                    token = resume_token;
+                    at = resume_at + 1;
+                    star = Some((resume_token, resume_at + 1));
+                }
+                None => return false,
+            }
+            continue;
+        };
+
+        if matches!(current, Token::AnyRun) {
+            star = Some((token + 1, at));
+            token += 1;
+            continue;
+        }
+        if matches_one(current, text[at]) {
+            token += 1;
+            at += 1;
+            continue;
+        }
+        match star {
+            Some((resume_token, resume_at)) => {
+                token = resume_token;
+                at = resume_at + 1;
+                star = Some((resume_token, resume_at + 1));
+            }
+            None => return false,
+        }
+    }
+
+    // A trailing `*` consumes nothing and still matches, so skip the ones that remain.
+    while matches!(tokens.get(token), Some(Token::AnyRun)) {
+        token += 1;
+    }
+    token == tokens.len()
 }
 
-fn match_tokens_at(tokens: &[Token], text: &[char]) -> bool {
-    match tokens.split_first() {
-        None => text.is_empty(),
-        Some((Token::AnyRun, rest)) => {
-            // `*` is greedy but must be able to give characters back, so try every split.
-            (0..=text.len()).any(|take| match_tokens_at(rest, text.get(take..).unwrap_or(&[])))
+/// Whether one non-`*` token matches one character.
+fn matches_one(token: &Token, ch: char) -> bool {
+    match token {
+        Token::Literal(expected) => *expected == ch,
+        Token::AnyOne => true,
+        Token::Class { ranges, negated } => {
+            let inside = ranges.iter().any(|(low, high)| (*low..=*high).contains(&ch));
+            inside != *negated
         }
-        Some((Token::AnyOne, rest)) => {
-            !text.is_empty() && match_tokens_at(rest, text.get(1..).unwrap_or(&[]))
-        }
-        Some((Token::Class { ranges, negated }, rest)) => {
-            let Some((&first, remaining)) = text.split_first() else {
-                return false;
-            };
-            let inside = ranges.iter().any(|(low, high)| (*low..=*high).contains(&first));
-            (inside != *negated) && match_tokens_at(rest, remaining)
-        }
-        Some((Token::Literal(expected), rest)) => match text.split_first() {
-            Some((&first, remaining)) if first == *expected => match_tokens_at(rest, remaining),
-            _ => false,
-        },
+        // The caller handles `*` itself, because it is the only token that can consume nothing.
+        Token::AnyRun => false,
     }
 }
 
@@ -469,6 +564,38 @@ mod tests {
 
     /// The deny list from the design, checked against the paths it exists to stop.
     #[test]
+    fn pathological_star_patterns_finish_in_linear_time() {
+        // The bug this prevents is a hang, not a wrong answer: a backtracking matcher tries every
+        // split of every `*`, so this pair is 2^40 branches. A test that only checked the answer
+        // would pass slowly on a short name and never finish on a real one, so the name is long.
+        let name = "a".repeat(400);
+        assert!(!glob("*a*a*a*a*a*a*a*a*a*a*b").matches(&name));
+        let pattern = glob("*a*a*a*a*a*a*a*a*a*a");
+        assert!(pattern.matches(&name), "ten stars must still match a run of `a`");
+        assert!(!pattern.matches("bbb"));
+    }
+
+    #[test]
+    fn many_double_stars_do_not_multiply() {
+        // Each `**` is a choice, so a naive recursive segment matcher is `components^stars`.
+        let path = (0..40).map(|n| format!("d{n}")).collect::<Vec<_>>().join("/");
+        let pattern = glob("**/a/**/a/**/a/**/a/**/a/**/a/**/z");
+        assert!(!pattern.matches(&path));
+        assert!(glob("**/d39").matches(&path), "trailing `**` must still work");
+    }
+
+    #[test]
+    fn a_trailing_star_matches_the_prefix_and_the_whole_name() {
+        // Regression guard for the non-recursive matcher: a `*` at the end consumes nothing and
+        // still has to count as matched.
+        assert!(glob("*.rs").matches("a.rs"));
+        assert!(glob("*").matches("anything"));
+        assert!(glob("a*").matches("a"));
+        assert!(Glob::parse("a**b").is_err(), "`a**b` is still rejected");
+        assert!(glob("ab*").matches("ab"));
+    }
+
+    #[test]
     fn the_designs_deny_patterns_stop_secret_and_git_files() {
         let deny = PatternSet::parse(&["**/.git/config", "**/.env*"]).unwrap();
         for path in [".git/config", ".env", "sub/.env.local", ".env.production"] {
@@ -481,5 +608,95 @@ mod tests {
         // that holds secrets. Denying more than intended costs one escalation; denying less
         // ships the secret.
         assert!(deny.matches(".envrc.example.bak"));
+    }
+}
+
+#[cfg(test)]
+mod differential {
+    //! The non-recursive matcher against a reference one.
+    //!
+    //! The two-pointer loop replaced a recursion that was obviously correct but exponential. That
+    //! trade is only safe if the fast version answers every input the same way, and no hand-picked
+    //! example can establish that. So the recursion lives on here, in the test module, small and
+    //! obviously correct, and `proptest` compares them over generated patterns and names.
+    //!
+    //! The reference is exponential and that is fine: the generator keeps inputs short, and a
+    //! reference that also had to be clever would be a second implementation to be wrong in.
+
+    use super::*;
+    use proptest::prelude::*;
+
+    /// Reference matcher: try every split of every `*`. Exponential, obviously correct.
+    fn reference(tokens: &[Token], text: &[char]) -> bool {
+        match tokens.split_first() {
+            None => text.is_empty(),
+            Some((Token::AnyRun, rest)) => {
+                (0..=text.len()).any(|take| reference(rest, text.get(take..).unwrap_or(&[])))
+            }
+            Some((Token::AnyOne, rest)) => !text.is_empty() && reference(rest, text.get(1..).unwrap_or(&[])),
+            Some((Token::Class { ranges, negated }, rest)) => {
+                let Some((&first, remaining)) = text.split_first() else {
+                    return false;
+                };
+                let inside = ranges.iter().any(|(low, high)| (*low..=*high).contains(&first));
+                (inside != *negated) && reference(rest, remaining)
+            }
+            Some((Token::Literal(expected), rest)) => match text.split_first() {
+                Some((&first, remaining)) if first == *expected => reference(rest, remaining),
+                _ => false,
+            },
+        }
+    }
+
+    /// A pattern segment built from the tokens a model actually writes, with repeated `*` runs
+    /// over-represented because that is where the two algorithms could diverge.
+    ///
+    /// Adjacent stars are filtered out: `**` inside a segment is a deliberate parse error, so
+    /// generating it would test the parser's rejection rather than the matcher's agreement.
+    fn segment() -> impl Strategy<Value = String> {
+        proptest::collection::vec(
+            prop_oneof![
+                Just("*".to_string()),
+                Just("?".to_string()),
+                Just("[ab]".to_string()),
+                Just("[!a]".to_string()),
+                Just("a".to_string()),
+                Just("b".to_string()),
+                Just("c".to_string()),
+            ],
+            1..6,
+        )
+        .prop_map(|parts| parts.concat())
+        .prop_filter("the parser must accept it as one ordinary segment", |text| {
+            Glob::parse(text).is_ok()
+        })
+    }
+
+    fn name() -> impl Strategy<Value = String> {
+        proptest::collection::vec(prop_oneof![Just('a'), Just('b'), Just('c')], 0..10)
+            .prop_map(|chars| chars.into_iter().collect())
+    }
+
+    proptest! {
+        #[test]
+        fn the_fast_matcher_agrees_with_the_reference(pattern in segment(), text in name()) {
+            let compiled = Glob::parse(&pattern).expect("the generator filters to valid patterns");
+            let tokens = compiled.segments.first().and_then(|segment| match segment {
+                Segment::One(tokens) => Some(tokens.clone()),
+                Segment::Any => None,
+            });
+            let Some(tokens) = tokens else {
+                // A bare `**` is handled by the segment matcher, not the token matcher.
+                return Ok(());
+            };
+            let chars: Vec<char> = text.chars().map(|ch| ch.to_ascii_lowercase()).collect();
+            prop_assert_eq!(
+                match_tokens(&tokens, &text),
+                reference(&tokens, &chars),
+                "pattern `{}` against `{}`",
+                pattern,
+                text
+            );
+        }
     }
 }

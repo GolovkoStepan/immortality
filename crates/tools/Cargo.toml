@@ -10,12 +10,15 @@ description = "Tool implementations, policy gate, worktree management and shell 
 
 [dependencies]
 immortality-core.workspace = true
+immortality-llm.workspace = true
+regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+proptest.workspace = true
 tempfile.workspace = true
 
 [lints]

@@ -43,6 +43,7 @@ getrandom = "0.4"
 sha2 = "0.10"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 tempfile = "3"
+regex = "1"
 proptest = "1"
 insta = { version = "1", features = ["json"] }
 

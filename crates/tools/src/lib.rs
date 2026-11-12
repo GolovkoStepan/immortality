@@ -6,13 +6,23 @@
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
+pub mod args;
 pub mod classify;
+pub mod find;
 pub mod glob;
 pub mod policy;
+pub mod read;
+pub mod search;
+pub mod tool;
 
+pub use args::Args;
 pub use classify::{Classification, classify};
+pub use find::GlobTool;
 pub use glob::{Glob, GlobError, PatternSet};
 pub use policy::{Denial, Escalation, PathUse, PolicyGate, Verdict};
+pub use read::ReadFile;
+pub use search::Grep;
+pub use tool::{OutputBudget, Registry, RegistryError, Tool, ToolCtx, ToolError, ToolResult};
 
 /// Classification of a tool's side effects.
 ///
