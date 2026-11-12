@@ -1,0 +1,724 @@
+//! Git checkpoints: the thing that makes L3 ("roll back and try again") mean something.
+//!
+//! Two independent kinds, as the design requires:
+//!
+//! - **Hidden** (`agent-ckpt/<task>`): a snapshot taken before every risky action. It never
+//!   appears in the task's history, so an attempt that produces nothing leaves no trace.
+//! - **Meaningful** (`agent/<task>`): a Conventional Commit when a subtask closes.
+//!
+//! The difference is not cosmetic. A hidden checkpoint is written on a branch nobody reads, so
+//! "checkpoint every 30 seconds" costs nothing in review quality; a meaningful commit is what a
+//! human merges, so it must be one per subtask and nothing else.
+//!
+//! # How a snapshot is taken
+//!
+//! `git stash create` is not used. It writes to the *global* stash and can be raced by the user;
+//! moreover it refuses to run when there is nothing to stash, which makes the common "nothing
+//! changed" case look like an error. Instead the tree is snapshotted with
+//! `git add --all` + `git write-tree` + `git commit-tree`, and the resulting commit is pointed at
+//! by a ref. This works with dirty trees, never touches the index's visible state for longer
+//! than the command sequence, and produces a real SHA that `reset --hard` accepts.
+//!
+//! # Why the rollback preserves uncommitted work
+//!
+//! `reset --hard` destroys whatever the model was doing. The work may be exactly what the next
+//! attempt needs to build on, and losing it after a crash makes the whole "days of autonomous
+//! work" claim a lie. So a rollback first writes a **safety checkpoint** of the current tree, and
+//! only then resets. If the safety checkpoint cannot be written, the rollback is refused: an
+//! operator can always delete the worktree by hand, but the tool must not do it silently.
+//!
+//! # Why every command is `git -C <worktree>`
+//!
+//! The daemon serves several projects and the user's working directory is arbitrary. Relying on
+//! the process's cwd would break the moment two tasks run in two worktrees, and would make a
+//! stray `git` invocation operate on the wrong repository — the kind of mistake that is
+//! discovered only after it has committed to `main`.
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use crate::domain::NonceTag;
+
+/// Prefix of the hidden checkpoint branch. One per task, force-updated on every snapshot.
+pub const CKPT_BRANCH_PREFIX: &str = "agent-ckpt/";
+
+/// Prefix of the meaningful task branch.
+pub const TASK_BRANCH_PREFIX: &str = "agent/";
+
+/// How a checkpoint was produced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CheckpointKind {
+    /// Hidden snapshot: no message, no history, force-moved.
+    Hidden,
+    /// Meaningful commit: Conventional Commit message, appended to the branch.
+    Meaningful,
+}
+
+impl CheckpointKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Hidden => "hidden",
+            Self::Meaningful => "meaningful",
+        }
+    }
+}
+
+/// A recorded checkpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Checkpoint {
+    pub sha: String,
+    pub kind: CheckpointKind,
+    /// Branch the checkpoint was written to.
+    pub branch: String,
+    /// What it was taken for, shown in `immortality status`.
+    pub reason: String,
+}
+
+/// A failure to talk to git.
+///
+/// Carries the command's stderr: `git`'s own message is better than any paraphrase, and it is
+/// what an operator will search for.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("git {command} failed: {message}")]
+pub struct GitError {
+    pub command: String,
+    pub message: String,
+}
+
+impl GitError {
+    fn new(command: impl Into<String>, stderr: &str) -> Self {
+        Self {
+            command: command.into(),
+            message: stderr.trim().to_string(),
+        }
+    }
+}
+
+/// A checkout of the repository that checkpoints are taken in.
+///
+/// Usually a dedicated worktree per task, never the user's own checkout: the agent runs
+/// `git add --all` and `reset --hard`, and doing that in the directory a human is editing would
+/// be a hostile surprise.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitRepo {
+    worktree: PathBuf,
+}
+
+/// Identity used for agent commits.
+///
+/// Set through `-c` on every invocation rather than written to `.git/config`: the user's global
+/// identity must not leak into commits attributed to the agent, and editing repository config is
+/// exactly what the policy layer forbids.
+const AGENT_NAME: &str = "immortality";
+const AGENT_EMAIL: &str = "agent@immortality.local";
+
+impl GitRepo {
+    /// Wrap a worktree path. Does not verify that it is a repository: [`Self::is_repository`]
+    /// exists for that, and a caller that skips it gets a clear git error rather than a panic.
+    #[must_use]
+    pub fn new(worktree: impl Into<PathBuf>) -> Self {
+        Self {
+            worktree: worktree.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn worktree(&self) -> &Path {
+        &self.worktree
+    }
+
+    /// Whether the path is inside a git work tree.
+    #[must_use]
+    pub fn is_repository(&self) -> bool {
+        self.git(&["rev-parse", "--git-dir"]).is_ok()
+    }
+
+    /// Current `HEAD` SHA, or `None` in an empty repository with no commits.
+    pub fn head(&self) -> Result<Option<String>, GitError> {
+        match self.git(&["rev-parse", "--verify", "HEAD"]) {
+            Ok(out) => Ok(Some(out.trim().to_string())),
+            Err(error) if error.message.contains("Needed a single revision") => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Whether the working tree has any modification, staged or not, including untracked files.
+    ///
+    /// Untracked files count: a new file the model wrote is work, and a rollback that keeps
+    /// "modifications" but silently deletes new files would be surprising.
+    pub fn is_dirty(&self) -> Result<bool, GitError> {
+        let out = self.git(&["status", "--porcelain", "--untracked-files=all"])?;
+        Ok(!out.trim().is_empty())
+    }
+
+    /// Take a hidden snapshot and move `agent-ckpt/<task>` to it.
+    ///
+    /// Returns `None` when the tree is clean and `HEAD` is already on the checkpoint branch:
+    /// there is nothing new to record, and creating an identical commit on every risky action
+    /// would fill the object store with duplicates for no benefit.
+    pub fn hidden_checkpoint(&self, task_branch: &str, reason: &str) -> Result<Option<Checkpoint>, GitError> {
+        let ckpt_branch = format!("{CKPT_BRANCH_PREFIX}{}", strip_agent_prefix(task_branch));
+        let parent = self.head()?;
+
+        if !self.is_dirty()? {
+            // A clean tree still needs a checkpoint pointing at HEAD the first time, otherwise
+            // `reset --hard <ckpt>` has nothing to target.
+            let Some(parent) = parent else {
+                return Ok(None);
+            };
+            self.force_branch(&ckpt_branch, &parent)?;
+            return Ok(Some(Checkpoint {
+                sha: parent,
+                kind: CheckpointKind::Hidden,
+                branch: ckpt_branch,
+                reason: reason.to_string(),
+            }));
+        }
+
+        // Snapshot the index into a tree object without moving HEAD or the user-visible index
+        // for longer than this command sequence.
+        let tree = self.snapshot_tree()?;
+        let tree = tree.trim().to_string();
+        let identity = identity_args();
+        let mut args: Vec<&str> = vec!["-c", &identity[0], "-c", &identity[1], "commit-tree", &tree];
+        if let Some(parent) = &parent {
+            args.extend(["-p", parent]);
+        }
+        // `-m` must come after the parent flags: git parses options positionally in practice.
+        args.extend(["-m", "checkpoint"]);
+        let sha = self.git(&args)?.trim().to_string();
+
+        self.force_branch(&ckpt_branch, &sha)?;
+        Ok(Some(Checkpoint {
+            sha,
+            kind: CheckpointKind::Hidden,
+            branch: ckpt_branch,
+            reason: reason.to_string(),
+        }))
+    }
+
+    /// Commit the current tree to the task branch with a Conventional Commit message.
+    ///
+    /// `nonce` is appended as a trailer so that a crash-time probe can find this commit by
+    /// searching the log. Without it, "did the commit happen?" is unanswerable after a crash
+    /// between `commit` and writing the journal record.
+    pub fn meaningful_commit(
+        &self,
+        task_branch: &str,
+        message: &str,
+        nonce: &NonceTag,
+    ) -> Result<Checkpoint, GitError> {
+        let branch = ensure_agent_prefix(task_branch);
+        // Detach onto the branch first so the commit lands in the right history even when the
+        // worktree was left on another branch by a previous failed attempt.
+        self.git(&["checkout", "--force", &branch])?;
+        self.git(&["add", "--all"])?;
+
+        let body = format!("{message}\n\nAttempt: {nonce}");
+        let identity = identity_args();
+        self.git(&[
+            "-c",
+            &identity[0],
+            "-c",
+            &identity[1],
+            // `--no-verify`: a repository hook written by the model must not be able to veto or
+            // silently rewrite the agent's own commits.
+            "commit",
+            "--no-verify",
+            "-m",
+            &body,
+        ])?;
+        let sha = self
+            .head()?
+            .ok_or_else(|| GitError::new("rev-parse HEAD", "commit produced no HEAD"))?;
+        Ok(Checkpoint {
+            sha,
+            kind: CheckpointKind::Meaningful,
+            branch,
+            reason: message.to_string(),
+        })
+    }
+
+    /// Create the task branch from `base` if it does not exist and check it out.
+    pub fn ensure_branch(&self, task_branch: &str, base: &str) -> Result<(), GitError> {
+        let branch = ensure_agent_prefix(task_branch);
+        if self.git(&["rev-parse", "--verify", &branch]).is_ok() {
+            self.git(&["checkout", "--force", &branch])?;
+        } else {
+            self.git(&["checkout", "--force", "-B", &branch, base])?;
+        }
+        Ok(())
+    }
+
+    /// Roll the worktree back to `sha`, keeping the current work in a safety checkpoint.
+    ///
+    /// Returns the safety checkpoint so the caller can journal it: a human who is told "your
+    /// work was rolled back" must be able to find what was rolled back.
+    pub fn rollback_to(
+        &self,
+        sha: &str,
+        task_branch: &str,
+        reason: &str,
+    ) -> Result<Option<Checkpoint>, GitError> {
+        if self
+            .git(&["cat-file", "-e", &format!("{sha}^{{commit}}")])
+            .is_err()
+        {
+            return Err(GitError::new(
+                format!("cat-file {sha}"),
+                "checkpoint commit does not exist",
+            ));
+        }
+        let safety = self.hidden_checkpoint(task_branch, reason)?;
+        self.git(&["reset", "--hard", sha])?;
+        // Untracked files are not touched by `reset --hard`, and they are exactly the leftovers
+        // that make the next attempt fail for reasons nobody understands.
+        self.git(&["clean", "-fd"])?;
+        Ok(safety)
+    }
+
+    /// Commit exists and is reachable from any ref, used by the post-crash probe for `git commit`.
+    #[must_use]
+    pub fn has_commit_with_nonce(&self, nonce: &NonceTag) -> bool {
+        let pattern = format!("Attempt: {nonce}");
+        self.git(&[
+            "log",
+            "--all",
+            "--fixed-strings",
+            "--grep",
+            &pattern,
+            "--format=%H",
+        ])
+        .is_ok_and(|out| !out.trim().is_empty())
+    }
+
+    /// List commits whose message contains the nonce, newest first.
+    pub fn commits_with_nonce(&self, nonce: &NonceTag) -> Result<Vec<String>, GitError> {
+        let pattern = format!("Attempt: {nonce}");
+        let out = self.git(&[
+            "log",
+            "--all",
+            "--fixed-strings",
+            "--grep",
+            &pattern,
+            "--format=%H",
+        ])?;
+        Ok(out
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect())
+    }
+
+    /// Whether a branch exists.
+    #[must_use]
+    pub fn branch_exists(&self, branch: &str) -> bool {
+        self.git(&["rev-parse", "--verify", branch]).is_ok()
+    }
+
+    /// Whether a SHA exists in this repository.
+    #[must_use]
+    pub fn has_commit(&self, sha: &str) -> bool {
+        self.git(&["cat-file", "-e", &format!("{sha}^{{commit}}")])
+            .is_ok()
+    }
+
+    /// Files changed between two commits, for the reviewer subagent and diff sanity.
+    pub fn changed_files(&self, from: &str, to: &str) -> Result<Vec<PathBuf>, GitError> {
+        let out = self.git(&["diff", "--name-only", from, to])?;
+        Ok(out
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(PathBuf::from)
+            .collect())
+    }
+
+    fn snapshot_tree(&self) -> Result<String, GitError> {
+        // `add --all` stages deletions and untracked files alike, which is what a snapshot of
+        // "the state of the working tree" means. The index is left populated; every caller
+        // either resets or commits immediately afterwards.
+        self.git(&["add", "--all"])?;
+        self.git(&["write-tree"])
+    }
+
+    fn force_branch(&self, branch: &str, sha: &str) -> Result<(), GitError> {
+        self.git(&["update-ref", &format!("refs/heads/{branch}"), sha])?;
+        Ok(())
+    }
+
+    fn git(&self, args: &[&str]) -> Result<String, GitError> {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&self.worktree)
+            .args(args)
+            // Never let a credential prompt or a pager hang the daemon.
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_PAGER", "cat")
+            .env("LC_ALL", "C")
+            .output()
+            .map_err(|error| GitError {
+                command: args.join(" "),
+                message: error.to_string(),
+            })?;
+        if output.status.success() {
+            Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        } else {
+            Err(GitError::new(
+                args.join(" "),
+                &String::from_utf8_lossy(&output.stderr),
+            ))
+        }
+    }
+}
+
+/// `-c` pairs that attribute commits to the agent rather than to the user.
+///
+/// Returned as owned strings because `Command::args` borrows them across the call; building
+/// them inline produces temporaries that die before `git` runs.
+fn identity_args() -> [String; 2] {
+    [
+        format!("user.name={AGENT_NAME}"),
+        format!("user.email={AGENT_EMAIL}"),
+    ]
+}
+
+/// Strip a leading `agent/` so a full branch name can be passed where a task part is expected.
+fn strip_agent_prefix(branch: &str) -> &str {
+    branch.strip_prefix(TASK_BRANCH_PREFIX).unwrap_or(branch)
+}
+
+/// Add `agent/` unless the caller already supplied a prefixed branch.
+fn ensure_agent_prefix(branch: &str) -> String {
+    if branch.starts_with(TASK_BRANCH_PREFIX) || branch.starts_with(CKPT_BRANCH_PREFIX) {
+        branch.to_string()
+    } else {
+        format!("{TASK_BRANCH_PREFIX}{branch}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+
+    /// A throwaway repository with one commit and a `main` branch.
+    struct Fixture {
+        dir: tempfile::TempDir,
+        repo: GitRepo,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let repo = GitRepo::new(dir.path());
+            for args in [
+                vec!["init", "-q", "-b", "main"],
+                vec!["config", "user.name", "Test"],
+                vec!["config", "user.email", "test@example.com"],
+            ] {
+                run(dir.path(), &args);
+            }
+            std::fs::write(dir.path().join("README.md"), "# fixture\n").unwrap();
+            run(dir.path(), &["add", "--all"]);
+            run(dir.path(), &["commit", "-q", "-m", "chore: initial"]);
+            Self { dir, repo }
+        }
+
+        fn write(&self, name: &str, contents: &str) {
+            let path = self.dir.path().join(name);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(path, contents).unwrap();
+        }
+
+        fn read(&self, name: &str) -> String {
+            std::fs::read_to_string(self.dir.path().join(name)).unwrap()
+        }
+    }
+
+    fn nonce() -> NonceTag {
+        NonceTag::new(crate::ids::Nonce::generate().to_string())
+    }
+
+    fn run(dir: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn a_repository_is_recognised() {
+        let fixture = Fixture::new();
+        assert!(fixture.repo.is_repository());
+        assert!(!GitRepo::new(fixture.dir.path().join("nope")).is_repository());
+    }
+
+    #[test]
+    fn a_hidden_checkpoint_snapshots_a_dirty_tree() {
+        let fixture = Fixture::new();
+        fixture.write("work.txt", "attempt one");
+        let checkpoint = fixture
+            .repo
+            .hidden_checkpoint("agent/tsk_1", "before shell")
+            .unwrap()
+            .expect("a checkpoint");
+
+        assert_eq!(checkpoint.kind, CheckpointKind::Hidden);
+        assert_eq!(checkpoint.branch, "agent-ckpt/tsk_1");
+        // The working tree is untouched and the field is on disk.
+        assert_eq!(fixture.read("work.txt"), "attempt one");
+        assert!(fixture.repo.has_commit(&checkpoint.sha));
+    }
+
+    #[test]
+    fn a_hidden_checkpoint_captures_untracked_files() {
+        let fixture = Fixture::new();
+        fixture.write("new/deep/file.txt", "payload");
+        let checkpoint = fixture
+            .repo
+            .hidden_checkpoint("agent/tsk_1", "before risky")
+            .unwrap()
+            .unwrap();
+        // The SHA is a real commit whose tree contains the untracked file.
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(fixture.dir.path())
+            .args(["show", "--name-only", "--format=", &checkpoint.sha])
+            .output()
+            .unwrap();
+        let listed = String::from_utf8_lossy(&out.stdout);
+        assert!(listed.contains("new/deep/file.txt"), "{listed}");
+    }
+
+    #[test]
+    fn a_checkpoint_with_nothing_to_snapshot_points_at_head() {
+        let fixture = Fixture::new();
+        let head = fixture.repo.head().unwrap().unwrap();
+        let checkpoint = fixture
+            .repo
+            .hidden_checkpoint("agent/tsk_1", "clean tree")
+            .unwrap()
+            .unwrap();
+        assert_eq!(checkpoint.sha, head);
+    }
+
+    #[test]
+    fn rollback_restores_the_exact_tree() {
+        let fixture = Fixture::new();
+        fixture.write("work.txt", "good");
+        let checkpoint = fixture
+            .repo
+            .hidden_checkpoint("agent/tsk_1", "good state")
+            .unwrap()
+            .unwrap();
+
+        fixture.write("work.txt", "broken");
+        fixture.write("junk.txt", "leftover");
+        fixture
+            .repo
+            .rollback_to(&checkpoint.sha, "agent/tsk_1", "L3")
+            .unwrap();
+
+        assert_eq!(fixture.read("work.txt"), "good");
+        assert!(
+            !fixture.dir.path().join("junk.txt").exists(),
+            "untracked leftovers must be cleaned"
+        );
+    }
+
+    #[test]
+    fn rollback_preserves_discarded_work_in_a_safety_checkpoint() {
+        let fixture = Fixture::new();
+        fixture.write("work.txt", "good");
+        let checkpoint = fixture
+            .repo
+            .hidden_checkpoint("agent/tsk_1", "good")
+            .unwrap()
+            .unwrap();
+
+        fixture.write("only-in-broken.txt", "precious");
+        let safety = fixture
+            .repo
+            .rollback_to(&checkpoint.sha, "agent/tsk_1", "L3 needs the old work")
+            .unwrap()
+            .expect("a safety checkpoint");
+
+        assert!(!fixture.dir.path().join("only-in-broken.txt").exists());
+        assert!(fixture.repo.has_commit(&safety.sha));
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(fixture.dir.path())
+            .args(["show", &format!("{}:only-in-broken.txt", safety.sha)])
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "precious");
+    }
+
+    #[test]
+    fn rollback_to_a_missing_sha_is_an_error_and_changes_nothing() {
+        let fixture = Fixture::new();
+        fixture.write("work.txt", "keep me");
+        let error = fixture
+            .repo
+            .rollback_to("0000000000000000000000000000000000000000", "agent/tsk_1", "L3")
+            .unwrap_err();
+        assert!(error.message.contains("does not exist"), "{error}");
+        assert_eq!(fixture.read("work.txt"), "keep me");
+    }
+
+    #[test]
+    fn a_meaningful_commit_lands_on_the_task_branch_with_its_nonce() {
+        let fixture = Fixture::new();
+        fixture.repo.ensure_branch("agent/tsk_2", "main").unwrap();
+        fixture.write("feature.rs", "fn main() {}\n");
+        let nonce = nonce();
+        let checkpoint = fixture
+            .repo
+            .meaningful_commit("agent/tsk_2", "feat: add the feature", &nonce)
+            .unwrap();
+
+        assert_eq!(checkpoint.kind, CheckpointKind::Meaningful);
+        assert_eq!(checkpoint.branch, "agent/tsk_2");
+        assert!(fixture.repo.has_commit_with_nonce(&nonce));
+        assert_eq!(
+            fixture.repo.commits_with_nonce(&nonce).unwrap(),
+            vec![checkpoint.sha]
+        );
+    }
+
+    #[test]
+    fn a_nonce_from_another_attempt_is_not_found() {
+        let fixture = Fixture::new();
+        fixture.repo.ensure_branch("agent/tsk_2", "main").unwrap();
+        fixture.write("a.rs", "x\n");
+        let mine = nonce();
+        fixture
+            .repo
+            .meaningful_commit("agent/tsk_2", "feat: one", &mine)
+            .unwrap();
+
+        let other = NonceTag::new("NOT-A-REAL-NONCE");
+        assert!(!fixture.repo.has_commit_with_nonce(&other));
+        assert_eq!(fixture.repo.commits_with_nonce(&other).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn the_probe_search_is_by_substring_not_by_prefix() {
+        // A commit made by a *different* attempt must not satisfy this attempt's probe, and a
+        // substring search is the only shape that works for a git message.
+        let fixture = Fixture::new();
+        fixture.repo.ensure_branch("agent/tsk_3", "main").unwrap();
+        fixture.write("a.rs", "x\n");
+        let mine = nonce();
+        fixture
+            .repo
+            .meaningful_commit("agent/tsk_3", "feat: real", &mine)
+            .unwrap();
+        assert!(
+            !fixture
+                .repo
+                .has_commit_with_nonce(&NonceTag::new(format!("{}x", mine.as_str()))),
+            "a longer nonce must not match"
+        );
+    }
+
+    #[test]
+    fn ensure_branch_creates_then_reuses() {
+        let fixture = Fixture::new();
+        fixture.repo.ensure_branch("agent/tsk_4", "main").unwrap();
+        assert!(fixture.repo.branch_exists("agent/tsk_4"));
+        fixture.write("a.rs", "x\n");
+        fixture
+            .repo
+            .meaningful_commit("agent/tsk_4", "feat: first", &nonce())
+            .unwrap();
+        let head = fixture.repo.head().unwrap().unwrap();
+
+        // Re-entering must not recreate the branch from main and lose the commit.
+        fixture.repo.ensure_branch("agent/tsk_4", "main").unwrap();
+        assert_eq!(fixture.repo.head().unwrap().unwrap(), head);
+    }
+
+    #[test]
+    fn a_full_branch_name_is_accepted_where_a_task_part_is_expected() {
+        let fixture = Fixture::new();
+        fixture.repo.ensure_branch("agent/tsk_5", "main").unwrap();
+        fixture.write("a.rs", "x\n");
+        let checkpoint = fixture
+            .repo
+            .meaningful_commit("agent/tsk_5", "feat: x", &nonce())
+            .unwrap();
+        assert_eq!(checkpoint.branch, "agent/tsk_5");
+    }
+
+    #[test]
+    fn changed_files_lists_the_diff() {
+        let fixture = Fixture::new();
+        let base = fixture.repo.head().unwrap().unwrap();
+        fixture.write("one.rs", "1\n");
+        fixture.write("two/two.rs", "2\n");
+        let from = fixture
+            .repo
+            .hidden_checkpoint("agent/tsk_6", "one")
+            .unwrap()
+            .unwrap();
+        fixture.write("three.rs", "3\n");
+        let to = fixture
+            .repo
+            .hidden_checkpoint("agent/tsk_6", "two")
+            .unwrap()
+            .unwrap();
+
+        let changed = fixture.repo.changed_files(&from.sha, &to.sha).unwrap();
+        assert_eq!(changed, vec![PathBuf::from("three.rs")]);
+        let _ = base;
+    }
+
+    #[test]
+    fn a_clean_tree_produces_no_new_commit() {
+        let fixture = Fixture::new();
+        let first = fixture
+            .repo
+            .hidden_checkpoint("agent/tsk_7", "one")
+            .unwrap()
+            .unwrap();
+        let second = fixture
+            .repo
+            .hidden_checkpoint("agent/tsk_7", "two")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            first.sha, second.sha,
+            "an unchanged tree must not create a duplicate commit"
+        );
+    }
+
+    #[test]
+    fn is_dirty_tracks_untracked_files() {
+        let fixture = Fixture::new();
+        assert!(!fixture.repo.is_dirty().unwrap());
+        fixture.write("untracked.txt", "x");
+        assert!(fixture.repo.is_dirty().unwrap(), "untracked files are work");
+    }
+
+    #[test]
+    fn git_errors_carry_the_stderr() {
+        let fixture = Fixture::new();
+        let error = fixture.repo.git(&["checkout", "no-such-branch"]).unwrap_err();
+        assert!(error.message.contains("no-such-branch"), "{error}");
+        assert!(error.command.contains("checkout"), "{error}");
+    }
+}
