@@ -111,12 +111,14 @@ const READ_PROGRAMS: &[&str] = &[
     "md5",
     "nl",
     "od",
+    "printf",
     "pwd",
     "readlink",
     "realpath",
     "rg",
     "seq",
     "shasum",
+    "sleep",
     "sha256sum",
     "sort",
     "stat",
@@ -132,6 +134,22 @@ const READ_PROGRAMS: &[&str] = &[
     "which",
     "whoami",
     "yq",
+];
+
+/// POSIX shell builtins that touch no file and reach no network.
+///
+/// An agent writes `test -f`, `wait`, `export FOO=1` and `:` constantly, and the unknown-command
+/// rule would escalate every one of them to a human — which trains a human to approve reflexively,
+/// the exact opposite of what the rule is for. Registered separately from [`READ_PROGRAMS`]
+/// because these are not programs: a builtin has no binary, and moving one here does not mean a
+/// tool of that name may be executed.
+///
+/// `export` and `set` are harmless *because of D-058*: the `sh` that would hold the variable dies
+/// with the command, so a variable cannot leak into the next call. Under a persistent shell this
+/// list would be wrong.
+const BUILTIN_PROGRAMS: &[&str] = &[
+    ":", "[", "export", "getopts", "hash", "jobs", "read", "set", "shift", "test", "times", "umask",
+    "unalias", "unset", "wait",
 ];
 
 /// Programs that change files inside the worktree.
@@ -536,6 +554,8 @@ fn classify_program(program: &str, args: &[&str]) -> Classification {
 
     let mut result = if MUTATE_PROGRAMS.contains(&program) {
         Classification::new(Effect::Mutate, format!("`{program}` writes files"))
+    } else if BUILTIN_PROGRAMS.contains(&program) {
+        Classification::new(Effect::Read, format!("`{program}` is a shell builtin"))
     } else if READ_PROGRAMS.contains(&program) {
         Classification::new(Effect::Read, format!("`{program}` reads"))
     } else {

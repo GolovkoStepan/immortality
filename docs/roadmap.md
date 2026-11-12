@@ -153,10 +153,10 @@
 
 | Шаг | Что делаем | Тесты | Дней |
 | --- | --- | --- | --- |
-| M3.1 | `PolicyGate`: `Effect` (read/mutate/external), path allowlist, deny-глобы, классификатор команд, `Denied` как observation | каждая ветка gate; незнакомая команда → external; выход за `workspace_root` → denied + событие | 2 |
-| M3.2 | Чтение: `read_file`, `glob`, `grep` | бинарный файл; лимит результатов; нумерация строк; regex-ошибки | 1.5 |
-| M3.3 | Изменение: `write_file`, `edit_file` (точная замена, ошибка при неоднозначности) | `old` не найден; `old` найден дважды; `replace_all`; CRLF-файлы | 1 |
-| M3.4 | `shell`: persistent shell, закрытый stdin, таймаут (SIGTERM→SIGKILL), автоперевод в фон, усечение вывода в artifact | команда, ждущая stdin; `sleep 300`; вывод 100 МБ; убийство процесса; cwd/env сохраняются | 3 |
+| M3.1 ✅ | `PolicyGate`: `Effect` (read/mutate/external), path allowlist, deny-глобы, классификатор команд, `Denied` как observation | каждая ветка gate; незнакомая команда → external; выход за `workspace_root` → denied + событие | 2 |
+| M3.2 ✅ | Чтение: `read_file`, `glob`, `grep` | бинарный файл; лимит результатов; нумерация строк; regex-ошибки | 1.5 |
+| M3.3 ✅ | Изменение: `write_file`, `edit_file` (точная замена, ошибка при неоднозначности) | `old` не найден; `old` найден дважды; `replace_all`; CRLF-файлы | 1 |
+| M3.4 ✅ | `shell`: процесс на команду (D-058), закрытый stdin, таймаут (SIGTERM→SIGKILL), автоперевод в фон, усечение вывода в artifact | команда, ждущая stdin; `sleep 300`; вывод 100 МБ; убийство процесса; cwd/env сохраняются | 3 |
 | M3.5 | Реестр процессов: `start_process`, `read_process`, `kill_process`, маркер в env для probe | чтение инкрементальное; процесс умер между вызовами; kill дважды | 1 |
 | M3.6 | Git-инструменты (`status/diff/log/add/commit/branch/worktree/stash`) + менеджер worktree на задачу + связка с чекпоинтами | commit probe по nonce; worktree пересоздаётся; правка вне worktree отклоняется | 2 |
 | M3.7 | Состояние: `read_state`, `update_state`, `grep_journal` | атомарная запись состояния; grep по журналу с `since_seq` | 1 |

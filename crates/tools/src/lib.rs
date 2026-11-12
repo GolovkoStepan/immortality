@@ -13,6 +13,7 @@ pub mod glob;
 pub mod policy;
 pub mod read;
 pub mod search;
+pub mod shell;
 pub mod tool;
 pub mod write;
 
@@ -23,6 +24,7 @@ pub use glob::{Glob, GlobError, PatternSet};
 pub use policy::{Denial, Escalation, PathUse, PolicyGate, Verdict};
 pub use read::ReadFile;
 pub use search::Grep;
+pub use shell::{Shell, ShellState};
 pub use tool::{OutputBudget, Registry, RegistryError, Tool, ToolCtx, ToolError, ToolResult};
 pub use write::{EditFile, WriteFile};
 
