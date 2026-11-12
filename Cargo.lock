@@ -839,6 +839,7 @@ dependencies = [
 name = "immortality-testkit"
 version = "0.0.0"
 dependencies = [
+ "chrono",
  "immortality-core",
  "immortality-llm",
  "serde",

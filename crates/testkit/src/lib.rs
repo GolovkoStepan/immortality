@@ -5,7 +5,21 @@
 //! of the protocol — character-by-character tool arguments, `: keep-alive` comments — rather
 //! than an idealised version of it.
 
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
+// Assertion helpers in this crate exist in order to fail: `Check::assert_match`, `crash_at` and
+// the simulators all abort a test loudly on purpose. Allow the lints crate-wide rather than per
+// item, and keep the rule that the *rest* of the workspace is denied.
+#![allow(clippy::panic, clippy::unwrap_used, clippy::expect_used)]
+
+pub mod clock;
+pub mod fakefs;
+pub mod fault;
+pub mod golden;
+pub mod sim;
+
+pub use clock::Clock;
+pub use fakefs::{FlakyFs, Fs, FsReader, MemFs, Op, StdFs};
+pub use fault::{Action, Fault, Faults, Hook};
+pub use golden::{Check, GoldenDir};
 
 /// A recorded exchange with the backend, used to drive the mock.
 ///
