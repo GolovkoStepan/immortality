@@ -14,12 +14,14 @@ pub mod clock;
 pub mod fakefs;
 pub mod fault;
 pub mod golden;
+pub mod mock;
 pub mod sim;
 
 pub use clock::Clock;
 pub use fakefs::{FlakyFs, Fs, FsReader, MemFs, Op, StdFs};
 pub use fault::{Action, Fault, Faults, Hook};
 pub use golden::{Check, GoldenDir};
+pub use mock::{MockServer, ReceivedRequest, Reply};
 
 /// A recorded exchange with the backend, used to drive the mock.
 ///

@@ -7,8 +7,8 @@
 //! - [`stream`] — the SSE decoder that turns a byte stream into a turn.
 //! - [`sse`] — the byte-level SSE parser underneath the decoder.
 //!
-//! The HTTP client, error classification and backoff arrive next; these are what they operate
-//! on, which is why they land first.
+//! - [`client`] — the HTTP client: one attempt, cancellation, health.
+//! - [`failure`] — why an attempt failed, and whether sending it again could help.
 //!
 //! # Why the split
 //!
@@ -27,11 +27,18 @@
     )
 )]
 
+pub mod client;
+pub mod failure;
 pub mod sse;
 pub mod stream;
 pub mod turn;
 pub mod wire;
 
+pub use client::{Backend, DEFAULT_CONNECT_TIMEOUT, DEFAULT_REQUEST_TIMEOUT};
+pub use failure::{
+    Failure, MAX_ATTEMPTS, MAX_BACKOFF, ModelFault, RetryKind, backoff, classify_status, classify_turn,
+    should_retry,
+};
 pub use stream::{StreamDecoder, StreamEnd, StreamError, TurnAccumulator};
 pub use turn::{AssistantTurn, CalledFunction, FINISH_LENGTH, ToolCall, Usage};
 pub use wire::{CacheReport, ChatRequest, ChatResponse, Message, StreamOptions, ToolDef};
