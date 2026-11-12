@@ -25,7 +25,7 @@ use std::collections::BTreeMap;
 
 use crate::Result;
 use crate::journal::{Journal, JournalEvent, Kind};
-use crate::protocol::{CallId, Effect, Idempotency, Intent, OpenCall};
+use crate::protocol::{CallId, Idempotency, Intent, OpenCall, Probe};
 
 /// A journal-backed log of tool calls for one attempt.
 #[derive(Debug)]
@@ -127,12 +127,12 @@ impl<'journal> ToolCallLog<'journal> {
     }
 
     /// Record the verdict of a probe, as required by recovery.
-    pub fn effect(&mut self, call: &CallId, effect: Effect, detail: serde_json::Value) -> Result<()> {
+    pub fn effect(&mut self, call: &CallId, effect: Probe, detail: serde_json::Value) -> Result<()> {
         let kind = match effect {
-            Effect::Applied => Kind::EffectVerified,
-            Effect::NotApplied => Kind::EffectAbsent,
+            Probe::Applied => Kind::EffectVerified,
+            Probe::NotApplied => Kind::EffectAbsent,
             // A probe that could not decide is not a verdict; it must not be recorded as one.
-            Effect::Unknown => {
+            Probe::Unknown => {
                 return Err(crate::Error::Protocol(format!(
                     "call `{call}`: `Unknown` is not a probe verdict; leave the call open"
                 )));
@@ -422,12 +422,12 @@ mod tests {
         let mut log = ToolCallLog::new(&mut journal);
         let call = CallId::from_model("call_probe");
         assert!(
-            log.effect(&call, Effect::Unknown, serde_json::json!({})).is_err(),
+            log.effect(&call, Probe::Unknown, serde_json::json!({})).is_err(),
             "unknown is not a verdict"
         );
-        log.effect(&call, Effect::Applied, serde_json::json!({"commit": "abc"}))
+        log.effect(&call, Probe::Applied, serde_json::json!({"commit": "abc"}))
             .unwrap();
-        log.effect(&call, Effect::NotApplied, serde_json::json!({}))
+        log.effect(&call, Probe::NotApplied, serde_json::json!({}))
             .unwrap();
     }
 
@@ -661,7 +661,7 @@ mod tests {
                 let mut log = ToolCallLog::new(&mut journal);
                 log.effect(
                     &call.call,
-                    crate::protocol::Effect::NotApplied,
+                    crate::protocol::Probe::NotApplied,
                     serde_json::json!({"checked": "build/ exists"}),
                 )
                 .unwrap();

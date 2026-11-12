@@ -25,7 +25,7 @@ use std::path::Path;
 
 use immortality_core::domain::TaskId;
 use immortality_core::journal::{Journal, JournalReader, Kind, ReadOutcome};
-use immortality_core::protocol::{CallId, Effect, Idempotency, Intent, RecoveryAction, ToolCallLog};
+use immortality_core::protocol::{CallId, Idempotency, Intent, Probe, RecoveryAction, ToolCallLog};
 use immortality_core::recover::{
     self, LastCheckpoint, PersistedState, Prober, RecoveryReport, RecoveryStep, Verdict, WorkspaceFacts,
 };
@@ -109,7 +109,7 @@ impl Scenario {
     /// `checkpoint` is the SHA of the last green checkpoint, or `None` when the task has none —
     /// which is a separate branch in the planner, not a detail.
     #[must_use]
-    pub fn report(&self, probe: Effect, checkpoint: Option<&str>) -> RecoveryReport {
+    pub fn report(&self, probe: Probe, checkpoint: Option<&str>) -> RecoveryReport {
         let input = recover::RecoveryInput {
             journal: &self.outcome,
             workspace: WorkspaceFacts::healthy("agent/tsk_01", "abc"),
@@ -139,10 +139,10 @@ impl Scenario {
 
 /// A prober that answers the same thing every time, so the test controls the branch.
 #[derive(Debug, Clone, Copy)]
-pub struct Fixed(pub Effect);
+pub struct Fixed(pub Probe);
 
 impl Prober for Fixed {
-    fn probe(&self, _intent: &Intent) -> Effect {
+    fn probe(&self, _intent: &Intent) -> Probe {
         self.0
     }
 }
@@ -228,7 +228,7 @@ pub fn crash_at(
 /// Written as assertions rather than as a returned list because the failure message has to name
 /// the point: "the destructive call was retried" is useless without knowing where the process
 /// died.
-pub fn verify(dir: &Path, point: CrashPoint, idempotency: Idempotency, probe: Effect) {
+pub fn verify(dir: &Path, point: CrashPoint, idempotency: Idempotency, probe: Probe) {
     let scenario = crash_at(dir, point, idempotency)
         .unwrap_or_else(|e| panic!("{point}: the simulator could not build a journal: {e}"));
     let report = scenario.report(probe, Some("deadbeef"));
@@ -284,7 +284,7 @@ pub fn verify(dir: &Path, point: CrashPoint, idempotency: Idempotency, probe: Ef
 }
 
 /// Assert the planner did the right thing about an open call, given the probe's answer.
-fn check_disposition(scenario: &Scenario, report: &RecoveryReport, probe: Effect) {
+fn check_disposition(scenario: &Scenario, report: &RecoveryReport, probe: Probe) {
     let point = scenario.point;
     let recovered = &report.calls[0];
     let retried = scenario.retried_calls(report);
@@ -305,7 +305,7 @@ fn check_disposition(scenario: &Scenario, report: &RecoveryReport, probe: Effect
 
     match probe {
         // A known-absent effect: the call did not happen, so re-running it is the repair.
-        Effect::NotApplied => {
+        Probe::NotApplied => {
             assert_eq!(
                 retried,
                 [scenario.call.as_str()],
@@ -316,7 +316,7 @@ fn check_disposition(scenario: &Scenario, report: &RecoveryReport, probe: Effect
             assert_ne!(recovered.action, RecoveryAction::Abandon, "{point}");
         }
         // An applied effect: the observation is synthesized, the tool never runs again.
-        Effect::Applied => {
+        Probe::Applied => {
             assert!(
                 retried.is_empty(),
                 "{point}: a call whose effect is present must not run again: {report:?}"
@@ -332,7 +332,7 @@ fn check_disposition(scenario: &Scenario, report: &RecoveryReport, probe: Effect
         }
         // Unknown: roll back, never retry. A destructive call must not run twice, which is the
         // whole reason the probe exists.
-        Effect::Unknown => {
+        Probe::Unknown => {
             assert!(
                 retried.is_empty(),
                 "{point}: a call of unknown effect must never be blindly retried: {report:?}"
@@ -382,7 +382,7 @@ mod tests {
                 Idempotency::ByContent,
                 Idempotency::Unknown,
             ] {
-                for probe in [Effect::Applied, Effect::NotApplied, Effect::Unknown] {
+                for probe in [Probe::Applied, Probe::NotApplied, Probe::Unknown] {
                     let dir = scratch();
                     verify(dir.path(), point, idempotency, probe);
                 }
@@ -401,7 +401,7 @@ mod tests {
         ] {
             let dir = scratch();
             let scenario = crash_at(dir.path(), point, Idempotency::Unknown).unwrap();
-            for probe in [Effect::Applied, Effect::Unknown] {
+            for probe in [Probe::Applied, Probe::Unknown] {
                 let report = scenario.report(probe, Some("deadbeef"));
                 assert!(
                     scenario.retried_calls(&report).is_empty(),
@@ -416,7 +416,7 @@ mod tests {
     fn without_a_checkpoint_an_undecidable_effect_is_abandoned_not_retried() {
         let dir = scratch();
         let scenario = crash_at(dir.path(), CrashPoint::AfterStarted, Idempotency::Unknown).unwrap();
-        let report = scenario.report(Effect::Unknown, None);
+        let report = scenario.report(Probe::Unknown, None);
         assert!(
             report
                 .steps
@@ -435,7 +435,7 @@ mod tests {
         for point in [CrashPoint::AfterIntent, CrashPoint::AfterStarted] {
             let dir = scratch();
             let scenario = crash_at(dir.path(), point, Idempotency::Idempotent).unwrap();
-            let report = scenario.report(Effect::Unknown, Some("deadbeef"));
+            let report = scenario.report(Probe::Unknown, Some("deadbeef"));
             assert_eq!(
                 scenario.retried_calls(&report),
                 [scenario.call.as_str()],
@@ -449,7 +449,7 @@ mod tests {
         let dir = scratch();
         let scenario = crash_at(dir.path(), CrashPoint::MidAppend, Idempotency::Unknown).unwrap();
         assert!(scenario.outcome.has_torn_tail);
-        let report = scenario.report(Effect::NotApplied, Some("deadbeef"));
+        let report = scenario.report(Probe::NotApplied, Some("deadbeef"));
         assert!(report.dropped_tail_bytes > 0, "{report:?}");
         assert!(matches!(
             report.steps.first(),

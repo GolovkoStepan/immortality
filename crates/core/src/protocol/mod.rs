@@ -72,13 +72,17 @@ impl Idempotency {
 
 /// The verdict of a probe: did the effect happen?
 ///
+/// Named `Probe` and not `Effect` because `immortality_tools::Effect` is a different question —
+/// how much damage a tool *could* do. Two types with one name in adjacent layers is the kind of
+/// confusion that compiles and then destroys a worktree.
+///
 /// `Unknown` is not a failure of the probe — it is an honest answer, and it is the one that
 /// leads to L3 (roll back to a checkpoint and start a fresh attempt) rather than to a guess.
 /// A probe that always answered `Applied` or `NotApplied` would be lying, because "did this
 /// sed command touch the file" is sometimes genuinely undecidable after the fact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum Effect {
+pub enum Probe {
     /// The effect is present: a commit with the nonce exists, the process is running.
     Applied,
     /// The effect is absent: no commit, no process, file has the old content.
@@ -359,12 +363,12 @@ mod tests {
     #[test]
     fn effects_roundtrip_as_snake_case() {
         for (effect, text) in [
-            (Effect::Applied, "\"applied\""),
-            (Effect::NotApplied, "\"not_applied\""),
-            (Effect::Unknown, "\"unknown\""),
+            (Probe::Applied, "\"applied\""),
+            (Probe::NotApplied, "\"not_applied\""),
+            (Probe::Unknown, "\"unknown\""),
         ] {
             assert_eq!(serde_json::to_string(&effect).unwrap(), text);
-            assert_eq!(serde_json::from_str::<Effect>(text).unwrap(), effect);
+            assert_eq!(serde_json::from_str::<Probe>(text).unwrap(), effect);
         }
     }
 

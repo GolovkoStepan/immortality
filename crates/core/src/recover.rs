@@ -47,7 +47,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::checkpoint::CheckpointKind;
 use crate::domain::{SubtaskId, SubtaskState};
 use crate::journal::{JournalRecord, Kind, ReadOutcome, ReadProblem};
-use crate::protocol::{CallId, Effect, FoundOpenCall, Intent, OpenCall, RecoveryAction};
+use crate::protocol::{CallId, FoundOpenCall, Intent, OpenCall, Probe, RecoveryAction};
 
 /// Facts about the task's worktree, gathered by the caller.
 ///
@@ -167,7 +167,7 @@ pub struct CallRecovery {
     ///
     /// The executor reads this to write `effect_verified` / `effect_absent` before running the
     /// matching step, so the journal records the evidence and not just the conclusion.
-    pub effect: Option<Effect>,
+    pub effect: Option<Probe>,
 }
 
 impl CallRecovery {
@@ -304,7 +304,7 @@ impl RecoveryReport {
 /// a `shell` command is judged by the tree it produced. Core only needs the verdict.
 pub trait Prober {
     /// `Unknown` is a valid and expected answer, not a failure of the probe.
-    fn probe(&self, intent: &Intent) -> Effect;
+    fn probe(&self, intent: &Intent) -> Probe;
 }
 
 /// A prober that refuses to guess. The default for callers that cannot probe yet.
@@ -312,8 +312,8 @@ pub trait Prober {
 pub struct NoProbe;
 
 impl Prober for NoProbe {
-    fn probe(&self, _intent: &Intent) -> Effect {
-        Effect::Unknown
+    fn probe(&self, _intent: &Intent) -> Probe {
+        Probe::Unknown
     }
 }
 
@@ -582,18 +582,18 @@ fn reclaim_call(
             effect = Some(answer);
             *verdict = Verdict::Repaired;
             match answer {
-                Effect::Applied => actions.push(RecoveryStep::SynthesizeApplied {
+                Probe::Applied => actions.push(RecoveryStep::SynthesizeApplied {
                     call: call.clone(),
                     observation: format!(
                         "`{}` had already taken effect before the crash; it was not run again",
                         open.intent.expected_effect
                     ),
                 }),
-                Effect::NotApplied => actions.push(RecoveryStep::RetryCall {
+                Probe::NotApplied => actions.push(RecoveryStep::RetryCall {
                     call: call.clone(),
                     tool,
                 }),
-                Effect::Unknown => match &input.last_checkpoint {
+                Probe::Unknown => match &input.last_checkpoint {
                     // L3. Guessing here is how a destructive command runs twice.
                     Some(checkpoint) => rollbacks.push(RecoveryStep::RollbackToCheckpoint {
                         sha: checkpoint.sha.clone(),
@@ -843,10 +843,10 @@ mod tests {
     }
 
     /// A prober that always answers the same way, so each test names its scenario once.
-    struct Fixed(Effect);
+    struct Fixed(Probe);
 
     impl Prober for Fixed {
-        fn probe(&self, _intent: &Intent) -> Effect {
+        fn probe(&self, _intent: &Intent) -> Probe {
             self.0
         }
     }
@@ -1120,7 +1120,7 @@ mod tests {
             sha: "deadbeef".into(),
             kind: CheckpointKind::Hidden,
         });
-        let report = plan(&input, &Fixed(Effect::Unknown));
+        let report = plan(&input, &Fixed(Probe::Unknown));
         assert_eq!(report.verdict, Verdict::Repaired);
         let index = report
             .steps
@@ -1179,9 +1179,9 @@ mod tests {
                 WorkspaceFacts::healthy("agent/tsk_01", "abc"),
                 PersistedState::default(),
             ),
-            &Fixed(Effect::Applied),
+            &Fixed(Probe::Applied),
         );
-        assert_eq!(report.calls[0].effect, Some(Effect::Applied));
+        assert_eq!(report.calls[0].effect, Some(Probe::Applied));
         assert!(report.calls[0].needs_synthesized_observation());
         assert!(matches!(
             step_of(&report, "SynthesizeApplied"),
@@ -1203,9 +1203,9 @@ mod tests {
                 WorkspaceFacts::healthy("agent/tsk_01", "abc"),
                 PersistedState::default(),
             ),
-            &Fixed(Effect::NotApplied),
+            &Fixed(Probe::NotApplied),
         );
-        assert_eq!(report.calls[0].effect, Some(Effect::NotApplied));
+        assert_eq!(report.calls[0].effect, Some(Probe::NotApplied));
         assert!(matches!(
             step_of(&report, "RetryCall"),
             Some(RecoveryStep::RetryCall { call, .. }) if call.as_str() == "call_c"
@@ -1262,10 +1262,10 @@ mod tests {
                 WorkspaceFacts::healthy("agent/tsk_01", "abc"),
                 PersistedState::default(),
             ),
-            &Fixed(Effect::Applied),
+            &Fixed(Probe::Applied),
         );
         assert_eq!(report.calls[0].action, RecoveryAction::VerifyContent);
-        assert_eq!(report.calls[0].effect, Some(Effect::Applied));
+        assert_eq!(report.calls[0].effect, Some(Probe::Applied));
     }
 
     #[test]
@@ -1297,7 +1297,7 @@ mod tests {
                 WorkspaceFacts::healthy("agent/tsk_01", "abc"),
                 PersistedState::default(),
             ),
-            &Fixed(Effect::NotApplied),
+            &Fixed(Probe::NotApplied),
         );
         assert_eq!(report.calls.len(), 2);
         assert!(all_calls_addressed(&journal.records, &report));
@@ -1326,7 +1326,7 @@ mod tests {
                 WorkspaceFacts::healthy("agent/tsk_01", "abc"),
                 PersistedState::default(),
             ),
-            &Fixed(Effect::Unknown),
+            &Fixed(Probe::Unknown),
         );
         assert!(all_calls_addressed(&journal.records, &report));
         report.calls.clear();
@@ -1396,7 +1396,7 @@ mod tests {
             sha: "cafe".into(),
             kind: CheckpointKind::Hidden,
         });
-        let report = plan(&input, &Fixed(Effect::Unknown));
+        let report = plan(&input, &Fixed(Probe::Unknown));
         let rollbacks = report
             .steps
             .iter()
@@ -1831,7 +1831,7 @@ mod tests {
                 WorkspaceFacts::healthy("agent/tsk_01", "abc").dirty(),
                 PersistedState::default(),
             ),
-            &Fixed(Effect::Applied),
+            &Fixed(Probe::Applied),
         );
         let Some(RecoveryStep::RecordRecovery { summary }) = report.steps.last() else {
             panic!("last step must be record_recovery: {:?}", report.steps);
