@@ -14,10 +14,16 @@
     )
 )]
 
+#[macro_use]
+mod macros;
+
 pub mod config;
+pub mod domain;
 pub mod error;
 pub mod ids;
+pub mod journal;
 pub mod logging;
 pub mod paths;
+pub mod time;
 
 pub use error::{Error, Result};

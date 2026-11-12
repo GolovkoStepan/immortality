@@ -38,6 +38,17 @@ pub enum Error {
 
     #[error("logging setup failed: {0}")]
     Logging(String),
+
+    /// The journal contains something the schema does not recognise.
+    ///
+    /// Deliberately not recovered from: a record that cannot be parsed might be the one that
+    /// said a mutating command already ran, and guessing would either duplicate an effect or
+    /// skip one.
+    #[error("journal is corrupt: {0}")]
+    JournalCorrupt(String),
+
+    #[error("journal schema version {found} is not supported; this build reads version {expected}")]
+    JournalVersion { found: u16, expected: u16 },
 }
 
 impl Error {

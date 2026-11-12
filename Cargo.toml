@@ -40,6 +40,7 @@ futures-util = "0.3"
 clap = { version = "4", features = ["derive", "env"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 getrandom = "0.4"
+sha2 = "0.10"
 tempfile = "3"
 proptest = "1"
 insta = { version = "1", features = ["json"] }
@@ -63,6 +64,8 @@ missing_panics_doc = "allow"
 module_name_repetitions = "allow"
 must_use_candidate = "allow"
 cast_precision_loss = "allow"
+# Counting newlines in a test fixture: pulling in `bytecount` for that would be absurd.
+naive_bytecount = "allow"
 
 [profile.release]
 lto = "thin"
