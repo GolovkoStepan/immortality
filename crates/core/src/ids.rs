@@ -185,6 +185,7 @@ macro_rules! prefixed_id {
 prefixed_id!(TaskId, "tsk_");
 prefixed_id!(SubtaskId, "sub_");
 prefixed_id!(AttemptId, "att_");
+prefixed_id!(EscalationId, "esc_");
 
 /// Random-ish token embedded in commits and process environments so that a crash-time
 /// `probe` can tell "did this action already happen?".
@@ -278,6 +279,19 @@ mod tests {
         assert!(sub.as_str().starts_with("sub_"));
         let attempt = AttemptId::generate();
         assert!(attempt.as_str().starts_with("att_"));
+        let escalation = EscalationId::generate();
+        assert!(escalation.as_str().starts_with("esc_"));
+        assert_eq!(EscalationId::parse(escalation.as_str()).unwrap(), escalation);
+    }
+
+    #[test]
+    fn an_escalation_id_keeps_its_own_prefix() {
+        // The prefix is what makes an id self-describing in a log line and in a CLI argument;
+        // an `esc_` that parsed as a task id would let `immortality approve tsk_…` resolve an
+        // escalation that does not exist.
+        let escalation = EscalationId::generate();
+        assert!(TaskId::parse(escalation.as_str()).is_err());
+        assert!(EscalationId::parse(&TaskId::generate().to_string()).is_err());
     }
 
     #[test]

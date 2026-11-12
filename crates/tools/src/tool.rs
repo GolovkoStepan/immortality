@@ -99,6 +99,7 @@ pub struct ToolCtx {
     gate: Arc<PolicyGate>,
     budget: OutputBudget,
     call: Option<String>,
+    task: Option<immortality_core::ids::TaskId>,
 }
 
 impl ToolCtx {
@@ -113,6 +114,7 @@ impl ToolCtx {
             gate,
             budget,
             call: None,
+            task: None,
         }
     }
 
@@ -131,6 +133,23 @@ impl ToolCtx {
     #[must_use]
     pub fn call(&self) -> Option<&str> {
         self.call.as_deref()
+    }
+
+    /// The same context, carrying the task it belongs to.
+    ///
+    /// Most tools address their work by path and never need this. `escalate` does: a question is
+    /// owned by a task, and the queue file is per task, so a call without one has nowhere to
+    /// write and must be refused rather than guessed at.
+    #[must_use]
+    pub fn with_task(mut self, task: immortality_core::ids::TaskId) -> Self {
+        self.task = Some(task);
+        self
+    }
+
+    /// The task this call belongs to, when the caller supplied one.
+    #[must_use]
+    pub const fn task(&self) -> Option<&immortality_core::ids::TaskId> {
+        self.task.as_ref()
     }
 
     /// The gate, for a tool that needs to ask a question the convenience methods do not cover.

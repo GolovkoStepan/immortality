@@ -57,6 +57,38 @@ pub mod millis {
     }
 }
 
+/// The same fixed-width format, for a field that may be absent.
+///
+/// Used as `#[serde(with = "crate::time::millis_opt")]` with `skip_serializing_if` for the
+/// `Option` itself, so an unresolved timestamp is absent rather than `null`. A `null` would be
+/// a second spelling of "absent" in a file a human reads.
+pub mod millis_opt {
+    use chrono::{DateTime, SecondsFormat, SubsecRound as _, Utc};
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    use super::Timestamp;
+
+    /// `2026-11-12T10:14:03.221Z`, or nothing.
+    pub fn serialize<S: Serializer>(at: &Option<Timestamp>, serializer: S) -> Result<S::Ok, S::Error> {
+        match at {
+            Some(at) => {
+                serializer.serialize_some(&at.trunc_subsecs(3).to_rfc3339_opts(SecondsFormat::Millis, true))
+            }
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<Timestamp>, D::Error> {
+        Option::<String>::deserialize(deserializer)?
+            .map(|text| {
+                DateTime::parse_from_rfc3339(&text)
+                    .map(|at| at.with_timezone(&Utc))
+                    .map_err(serde::de::Error::custom)
+            })
+            .transpose()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -83,6 +115,23 @@ mod tests {
     fn format_roundtrips() {
         let at = Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap() + chrono::Duration::milliseconds(678);
         assert_eq!(from_json(&to_json(at)), at);
+    }
+
+    #[test]
+    fn an_optional_timestamp_roundtrips_both_ways() {
+        let at = Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap() + chrono::Duration::milliseconds(9);
+        for value in [Some(at), None] {
+            let text = serde_json::to_value(OptWrapper { at: value }).unwrap();
+            if value.is_none() {
+                // Absent, not `null`. The escalation file is read by humans.
+                assert_eq!(text, serde_json::json!({}), "{text}");
+            } else {
+                let stamp = text["at"].as_str().unwrap();
+                assert!(stamp.contains(".009Z"), "{text}");
+            }
+            let back: OptWrapper = serde_json::from_value(text).unwrap();
+            assert_eq!(back.at, value);
+        }
     }
 
     #[test]
@@ -118,5 +167,11 @@ mod tests {
     struct Wrapper {
         #[serde(with = "millis")]
         at: Timestamp,
+    }
+
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct OptWrapper {
+        #[serde(with = "millis_opt", skip_serializing_if = "Option::is_none", default)]
+        at: Option<Timestamp>,
     }
 }

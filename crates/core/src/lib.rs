@@ -18,10 +18,12 @@
 mod macros;
 
 pub mod artifacts;
+pub mod atomic;
 pub mod checkpoint;
 pub mod config;
 pub mod domain;
 pub mod error;
+pub mod escalation;
 pub mod gc;
 pub mod ids;
 pub mod journal;

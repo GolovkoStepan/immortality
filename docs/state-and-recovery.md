@@ -80,7 +80,7 @@ logs/2026-10.log.gz      # архивы по месяцам
 | `detector_fired` | тип детектора, уровень, метрика |
 | `compaction` | компактация контекста |
 | `gate_result` | сборка/тесты/линт/reviewer |
-| `escalation_opened`, `escalation_resolved` | очередь эскалаций |
+| `escalation_opened`, `escalation_resolved` | очередь эскалаций (D-067) |
 | `backend_unavailable`, `backend_restored` | сеть/бэкенд |
 | `cache_stats` | `cache_n` / `prompt_n` на запрос — метрика здоровья кэша |
 | `daemon_started`, `daemon_stopped`, `daemon_recovered` | жизненный цикл демона |
