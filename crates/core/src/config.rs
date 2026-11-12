@@ -413,10 +413,7 @@ pub fn load(overrides: &Overrides) -> Result<Loaded> {
 }
 
 fn default_global_path() -> PathBuf {
-    directories::ProjectDirs::from("dev", "immortality", "immortality").map_or_else(
-        || PathBuf::from("/nonexistent/immortality/config.toml"),
-        |dirs| dirs.config_dir().join("config.toml"),
-    )
+    crate::paths::StatePaths::discover().global_config()
 }
 
 fn discover_project_config() -> Option<PathBuf> {

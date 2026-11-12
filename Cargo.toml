@@ -18,11 +18,14 @@ repository = "https://github.com/OWNER/immortality"
 authors = ["immortality contributors"]
 
 [workspace.dependencies]
-immortality-core = { path = "crates/core" }
-immortality-llm = { path = "crates/llm" }
-immortality-tools = { path = "crates/tools" }
-immortality-daemon = { path = "crates/daemon" }
-immortality-testkit = { path = "crates/testkit" }
+# Internal path dependencies carry the workspace version explicitly. Without it cargo-deny
+# sees a `*` requirement and reports a wildcard dependency, which would be denied in CI for
+# no reason; the version is irrelevant at runtime because none of these are published.
+immortality-core = { path = "crates/core", version = "0.0.0" }
+immortality-llm = { path = "crates/llm", version = "0.0.0" }
+immortality-tools = { path = "crates/tools", version = "0.0.0" }
+immortality-daemon = { path = "crates/daemon", version = "0.0.0" }
+immortality-testkit = { path = "crates/testkit", version = "0.0.0" }
 
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
@@ -37,7 +40,6 @@ futures-util = "0.3"
 clap = { version = "4", features = ["derive", "env"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 getrandom = "0.4"
-directories = "6"
 tempfile = "3"
 proptest = "1"
 insta = { version = "1", features = ["json"] }

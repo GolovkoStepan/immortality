@@ -86,15 +86,16 @@ impl StatePaths {
     }
 
     /// Default location. `IMMORTALITY_STATE_DIR` wins, which keeps tests and CI hermetic.
+    ///
+    /// The path is computed here rather than through the `directories` crate: that crate
+    /// returns `dev.immortality.immortality` on macOS (not the name in the docs) and hands
+    /// back the *same* directory for config and data, while pulling in an MPL-2.0
+    /// dependency for what is three `join` calls on a macOS-only tool.
     pub fn discover() -> Self {
         if let Some(dir) = std::env::var_os("IMMORTALITY_STATE_DIR") {
             return Self::new(dir);
         }
-        let root = directories::ProjectDirs::from("dev", "immortality", "immortality").map_or_else(
-            || PathBuf::from("/nonexistent/immortality"),
-            |dirs| dirs.data_dir().to_path_buf(),
-        );
-        Self::new(root)
+        Self::new(data_dir())
     }
 
     pub fn root(&self) -> &Path {
@@ -102,10 +103,7 @@ impl StatePaths {
     }
 
     pub fn global_config(&self) -> PathBuf {
-        directories::ProjectDirs::from("dev", "immortality", "immortality").map_or_else(
-            || self.root.join("config.toml"),
-            |dirs| dirs.config_dir().join("config.toml"),
-        )
+        config_dir().join("config.toml")
     }
 
     pub fn daemon_lock(&self) -> PathBuf {
@@ -145,6 +143,21 @@ impl StatePaths {
     }
 }
 
+/// macOS application support directory for this user.
+///
+/// `$HOME` is used rather than the `directories` crate so the path matches what the
+/// documentation promises and needs no extra dependency.
+fn data_dir() -> PathBuf {
+    let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("/nonexistent"), PathBuf::from);
+    home.join("Library")
+        .join("Application Support")
+        .join("immortality")
+}
+
+fn config_dir() -> PathBuf {
+    data_dir()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -179,6 +192,15 @@ mod tests {
         assert_eq!(paths.root(), Path::new("/tmp/state"));
         assert_eq!(paths.daemon_socket(), PathBuf::from("/tmp/state/daemon.sock"));
         assert_eq!(paths.artifacts_dir(), PathBuf::from("/tmp/state/artifacts"));
+    }
+
+    #[test]
+    fn default_state_dir_is_under_application_support() {
+        // Not the `directories` crate's `dev.immortality.immortality`: the documented path
+        // is what users are told to edit, so it is what the code must produce.
+        let dir = data_dir();
+        assert!(dir.ends_with("Application Support/immortality"), "{dir:?}");
+        assert_eq!(config_dir(), dir);
     }
 
     #[test]
