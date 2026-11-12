@@ -9,6 +9,7 @@
 pub mod args;
 pub mod classify;
 pub mod find;
+pub mod git;
 pub mod glob;
 pub mod policy;
 pub mod processes;
@@ -21,6 +22,7 @@ pub mod write;
 pub use args::Args;
 pub use classify::{Classification, classify};
 pub use find::GlobTool;
+pub use git::Git;
 pub use glob::{Glob, GlobError, PatternSet};
 pub use policy::{Denial, Escalation, PathUse, PolicyGate, Verdict};
 pub use processes::{KillProcess, Liveness, ProcessRecord, ProcessRegistry, ReadProcess, StartProcess};

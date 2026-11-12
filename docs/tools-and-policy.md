@@ -45,7 +45,7 @@ pub trait Tool {
 | `grep` | `pattern`, `glob`, `path`, `-A/-B`, `limit` | Регексы; поиск идёт только по текстовым файлам |
 | `read_state` | `section` | Читает `PLAN.md` / `TASKS.json` / `NOTES.md` / `DECISIONS.md` |
 | `grep_journal` | `query`, `since_seq`, `limit` | Поиск по журналу задачи; возвращает сводку |
-| `git status/diff/log` | параметры git | Только чтение |
+| `git` с `subcommand` = `status`/`diff`/`log`/`show`/`rev_parse` | `args` — массив argv | Только чтение |
 
 ### Изменение (Effect::Mutate)
 
@@ -53,11 +53,18 @@ pub trait Tool {
 | --- | --- | --- |
 | `write_file` | `path`, `content` | ByContent |
 | `edit_file` | `path`, `old`, `new`, `replace_all` | ByContent |
-| `git add/commit/checkout/branch/worktree/stash` | параметры git | commit → Unknown (probe по nonce) |
+| `git` с `subcommand` = `add`/`commit`/`branch`/`worktree`/`stash` | `args`, `message`, `path`, `reason` | commit → Unknown (probe по `Immortality-Call` trailer) |
 | `update_state` | `file`, `content` или `patch` | ByContent |
 | `shell` (mutating) | `command`, `timeout_secs`, `cwd` | Unknown |
 | `start_process` | `command`, `cwd`, `env`, `name` | Unknown (probe по маркеру в командной строке, D-061) |
 | `kill_process` | `handle` | Idempotent |
+
+`git` — один инструмент с закрытым перечислением подкоманд (D-063), а не восемь отдельных.
+`push`, `fetch`, `pull`, `clone`, `remote` и `config` в перечисление не входят: человек делает
+push и merge, а `.git/config` уже в built-in deny-списке. Команды выполняются в worktree
+задачи, путь берётся у gate, а не из аргументов. Общие ref'ы ограничены (D-064): `branch`
+умеет только листить и создавать, `stash` — только добавлять и применять; `branch -D` из
+worktree задачи удаляет ветку в чекауте человека — замерено.
 
 `edit_file` — точная замена строки, по образцу read-tool'ов: если `old` не найден или
 найден неоднократно, возвращается структурированная ошибка (модель должна уточнить

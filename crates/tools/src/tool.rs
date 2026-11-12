@@ -98,13 +98,39 @@ impl ToolResult {
 pub struct ToolCtx {
     gate: Arc<PolicyGate>,
     budget: OutputBudget,
+    call: Option<String>,
 }
 
 impl ToolCtx {
     /// A context for one task.
+    ///
+    /// No call id: a tool that needs one — `git commit` embeds it as a trailer so a crash-time
+    /// probe can find its commit — gets it from [`Self::with_call`]. A default of `None` keeps
+    /// the dozens of tests that only exercise the policy from having to invent an id.
     #[must_use]
     pub const fn new(gate: Arc<PolicyGate>, budget: OutputBudget) -> Self {
-        Self { gate, budget }
+        Self {
+            gate,
+            budget,
+            call: None,
+        }
+    }
+
+    /// The same context, carrying the id of the call it is about to run.
+    ///
+    /// The id comes from the journal's `intent`, which is the only identity that survives a
+    /// crash. Stamping it into the effect — a commit trailer, a stash message — is what lets
+    /// recovery answer "did this happen?" without the arguments, which the journal does not keep.
+    #[must_use]
+    pub fn with_call(mut self, call: impl Into<String>) -> Self {
+        self.call = Some(call.into());
+        self
+    }
+
+    /// The call id, when the caller supplied one.
+    #[must_use]
+    pub fn call(&self) -> Option<&str> {
+        self.call.as_deref()
     }
 
     /// The gate, for a tool that needs to ask a question the convenience methods do not cover.

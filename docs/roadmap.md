@@ -158,7 +158,7 @@
 | M3.3 ✅ | Изменение: `write_file`, `edit_file` (точная замена, ошибка при неоднозначности) | `old` не найден; `old` найден дважды; `replace_all`; CRLF-файлы | 1 |
 | M3.4 ✅ | `shell`: процесс на команду (D-058), закрытый stdin, таймаут (SIGTERM→SIGKILL), автоперевод в фон, усечение вывода в artifact | команда, ждущая stdin; `sleep 300`; вывод 100 МБ; убийство процесса; cwd/env сохраняются | 3 |
 | M3.5 ✅ | Реестр процессов: `start_process`, `read_process`, `kill_process`, маркер в командной строке для probe (D-061) | чтение инкрементальное; процесс умер между вызовами; kill дважды | 1 |
-| M3.6 | Git-инструменты (`status/diff/log/add/commit/branch/worktree/stash`) + менеджер worktree на задачу + связка с чекпоинтами | commit probe по nonce; worktree пересоздаётся; правка вне worktree отклоняется | 2 |
+| M3.6 ✅ | Git-инструменты (один `git` с закрытым набором подкоманд, D-063) + `WorktreeManager` на задачу + связка с чекпоинтами | commit probe по call-id trailer; worktree пересоздаётся из `HEAD`/чекпоинта; правка вне worktree отклоняется; `push`/`fetch`/`branch -D`/`stash clear` отклонены (D-064) | 2 |
 | M3.7 | Состояние: `read_state`, `update_state`, `grep_journal` | атомарная запись состояния; grep по журналу с `since_seq` | 1 |
 | M3.8 | Эскалации: хранилище, дедуп по `key`, ответ, `allow_for_task`, macOS-нотификация через `osascript` | дедуп; ответ не из TUI; нотификация не падает в headless-режиме | 1.5 |
 | M3.9 | `delegate`: суб-агент с чистым контекстом в том же worktree, отчёт по id | probe по id отчёта; лимит шагов; вложенное делегирование запрещено | 1 |

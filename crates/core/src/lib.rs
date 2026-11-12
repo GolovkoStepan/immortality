@@ -30,5 +30,6 @@ pub mod paths;
 pub mod protocol;
 pub mod recover;
 pub mod time;
+pub mod worktree;
 
 pub use error::{Error, Result};

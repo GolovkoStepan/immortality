@@ -34,6 +34,7 @@
 //! stray `git` invocation operate on the wrong repository — the kind of mistake that is
 //! discovered only after it has committed to `main`.
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -209,13 +210,41 @@ impl GitRepo {
         message: &str,
         nonce: &NonceTag,
     ) -> Result<Checkpoint, GitError> {
+        self.commit_with_trailers(task_branch, message, &[("Attempt", nonce.as_str())])
+    }
+
+    /// Commit the current tree to the task branch, with arbitrary trailers in the body.
+    ///
+    /// One commit path for both callers. The attempt path records `Attempt: <nonce>` and the
+    /// model-driven `git` tool records `Call: <call-id>` — and the second exists because a probe
+    /// runs after a crash with nothing in memory but the journal, which carries the call id and
+    /// *not* the arguments. A probe that had to guess the subcommand would be a probe that
+    /// answers `Applied` for a commit nobody made.
+    pub fn commit_with_trailers(
+        &self,
+        task_branch: &str,
+        message: &str,
+        trailers: &[(&str, &str)],
+    ) -> Result<Checkpoint, GitError> {
         let branch = ensure_agent_prefix(task_branch);
         // Detach onto the branch first so the commit lands in the right history even when the
         // worktree was left on another branch by a previous failed attempt.
         self.git(&["checkout", "--force", &branch])?;
         self.git(&["add", "--all"])?;
 
-        let body = format!("{message}\n\nAttempt: {nonce}");
+        let mut body = message.to_string();
+        if !trailers.is_empty() {
+            // A blank line, because git only recognises trailers in the last paragraph. Without
+            // it `Attempt: …` is prose, and `log --grep` still finds it while a human reading
+            // `git log` sees a message that looks unfinished.
+            body.push_str("\n\n");
+            for (index, (key, value)) in trailers.iter().enumerate() {
+                if index > 0 {
+                    body.push('\n');
+                }
+                let _ = write!(body, "{key}: {value}");
+            }
+        }
         let identity = identity_args();
         self.git(&[
             "-c",
@@ -336,6 +365,103 @@ impl GitRepo {
             .collect())
     }
 
+    /// Commit the current index on whatever branch is checked out.
+    ///
+    /// Separate from [`Self::meaningful_commit`] because that one checks the task branch out
+    /// first: correct for the daemon closing a subtask, wrong for a model that asked to commit
+    /// its work *where it is*. A commit that silently moved `HEAD` would make the next `git
+    /// status` describe a tree the model never touched.
+    ///
+    /// Returns `None` when the index has nothing to commit. That is a normal answer — "working
+    /// tree clean" — and not an error a model should have to parse out of stderr.
+    ///
+    /// # Errors
+    /// Git failed for a reason other than an empty index.
+    pub fn commit_on_current(
+        &self,
+        message: &str,
+        trailers: &[(&str, &str)],
+    ) -> Result<Option<String>, GitError> {
+        // Checked before committing, not inferred from stderr afterwards: `git commit` exits 1
+        // both for "nothing to commit" and for a real failure, and the two need different
+        // answers. `--quiet` makes this a status question with no output.
+        if self.git(&["diff", "--cached", "--quiet"]).is_ok() {
+            return Ok(None);
+        }
+        let mut body = message.to_string();
+        if !trailers.is_empty() {
+            body.push_str("\n\n");
+            for (index, (key, value)) in trailers.iter().enumerate() {
+                if index > 0 {
+                    body.push('\n');
+                }
+                let _ = write!(body, "{key}: {value}");
+            }
+        }
+        let identity = identity_args();
+        self.git(&[
+            "-c",
+            &identity[0],
+            "-c",
+            &identity[1],
+            "commit",
+            "--no-verify",
+            "-m",
+            &body,
+        ])?;
+        self.head()
+    }
+
+    /// Stage everything, deletions and untracked files included.
+    ///
+    /// # Errors
+    /// Git failed.
+    pub fn add_all(&self) -> Result<(), GitError> {
+        self.git(&["add", "--all"]).map(|_| ())
+    }
+
+    /// Stage one path.
+    ///
+    /// # Errors
+    /// The path is not tracked and does not exist, which git reports as a fatal.
+    pub fn add_path(&self, path: &str) -> Result<(), GitError> {
+        self.git(&["add", "--", path]).map(|_| ())
+    }
+
+    /// Whether any commit's message contains `needle`, in any branch or the stash.
+    ///
+    /// Used by the `git` tool's commit probe. `--all` covers the task branch and the checkpoint
+    /// branch, and `refs/stash` is searched separately because `--all` does not include it —
+    /// measured, not assumed.
+    #[must_use]
+    pub fn has_trailer(&self, needle: &str) -> bool {
+        let pattern = needle.to_string();
+        if self
+            .git(&[
+                "log",
+                "--all",
+                "--fixed-strings",
+                "--grep",
+                &pattern,
+                "--format=%H",
+            ])
+            .is_ok_and(|out| !out.trim().is_empty())
+        {
+            return true;
+        }
+        self.git(&[
+            "log",
+            "refs/stash",
+            "-n",
+            "50",
+            "--fixed-strings",
+            "--grep",
+            &pattern,
+            "--format=%H",
+        ])
+        .is_ok_and(|out| !out.trim().is_empty())
+    }
+
     fn snapshot_tree(&self) -> Result<String, GitError> {
         // `add --all` stages deletions and untracked files alike, which is what a snapshot of
         // "the state of the working tree" means. The index is left populated; every caller
@@ -349,7 +475,13 @@ impl GitRepo {
         Ok(())
     }
 
-    fn git(&self, args: &[&str]) -> Result<String, GitError> {
+    /// Run a git command in this worktree and return its stdout.
+    ///
+    /// Public because the `git_*` tools are a thin surface over exactly this: a tool that built
+    /// its own `Command` would have to remember `-C`, `GIT_TERMINAL_PROMPT`, the pager and
+    /// `LC_ALL`, and the one that forgot would hang the daemon on a credential prompt. One
+    /// spawner, one set of guards, one place to audit.
+    pub fn git(&self, args: &[&str]) -> Result<String, GitError> {
         let output = Command::new("git")
             .arg("-C")
             .arg(&self.worktree)
