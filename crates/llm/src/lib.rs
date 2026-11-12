@@ -9,6 +9,7 @@
 //!
 //! - [`client`] — the HTTP client: one attempt, cancellation, health.
 //! - [`failure`] — why an attempt failed, and whether sending it again could help.
+//! - [`extract`] — native tool calls first, a conservative text fallback second.
 //!
 //! # Why the split
 //!
@@ -28,6 +29,7 @@
 )]
 
 pub mod client;
+pub mod extract;
 pub mod failure;
 pub mod sse;
 pub mod stream;
@@ -35,6 +37,7 @@ pub mod turn;
 pub mod wire;
 
 pub use client::{Backend, DEFAULT_CONNECT_TIMEOUT, DEFAULT_REQUEST_TIMEOUT};
+pub use extract::{Extracted, Extraction, extract, extract_from_text, repair_json};
 pub use failure::{
     Failure, MAX_ATTEMPTS, MAX_BACKOFF, ModelFault, RetryKind, backoff, classify_status, classify_turn,
     should_retry,
