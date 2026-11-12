@@ -110,7 +110,7 @@ tool_call_completed → exit_code, output_artifact, duration
 | `shell` (read-only классифицированные) | idempotent | повторить |
 | `shell` (mutating) | unknown | **не повторять**; probe: состояние рабочего дерева, наличие ожидаемого файла |
 | `git commit` | unknown | probe: искать коммит по nonce в сообщении (`[attempt:<uuid>]`) |
-| `start_process` | unknown | probe: поиск процесса по маркеру в env |
+| `start_process` | unknown | probe: поиск процесса по маркеру в командной строке (D-061) |
 | `escalate` | idempotent по ключу | дедуп по `escalation_key` |
 | `delegate` | unknown | probe: есть ли отчёт субагента по id |
 

@@ -473,7 +473,7 @@ fn wrap_command(command: &str, marker: &Path) -> String {
     )
 }
 
-fn read_env(args: &Args) -> Result<Vec<(String, String)>, ToolError> {
+pub(crate) fn read_env(args: &Args) -> Result<Vec<(String, String)>, ToolError> {
     let Some(value) = args.raw().get("env") else {
         return Ok(Vec::new());
     };

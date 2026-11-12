@@ -465,7 +465,7 @@ fn first_lines(text: &str, count: usize) -> String {
 /// The permission bits of an existing file are preserved: replacing an executable script with a
 /// 0600 file would break `cargo` build scripts and git hooks in ways that look like the agent
 /// "randomly" broke the build.
-fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), ToolError> {
+pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), ToolError> {
     let directory = path.parent().filter(|parent| !parent.as_os_str().is_empty());
     let temp = temp_path(path);
     if let Some(directory) = directory {

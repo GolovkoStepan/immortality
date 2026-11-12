@@ -56,7 +56,7 @@ pub trait Tool {
 | `git add/commit/checkout/branch/worktree/stash` | параметры git | commit → Unknown (probe по nonce) |
 | `update_state` | `file`, `content` или `patch` | ByContent |
 | `shell` (mutating) | `command`, `timeout_secs`, `cwd` | Unknown |
-| `start_process` | `command`, `cwd`, `env`, `name` | Unknown (probe по маркеру env) |
+| `start_process` | `command`, `cwd`, `env`, `name` | Unknown (probe по маркеру в командной строке, D-061) |
 | `kill_process` | `handle` | Idempotent |
 
 `edit_file` — точная замена строки, по образцу read-tool'ов: если `old` не найден или
