@@ -21,7 +21,7 @@ pub use clock::Clock;
 pub use fakefs::{FlakyFs, Fs, FsReader, MemFs, Op, StdFs};
 pub use fault::{Action, Fault, Faults, Hook};
 pub use golden::{Check, GoldenDir};
-pub use mock::{MockServer, ReceivedRequest, Reply};
+pub use mock::{MockServer, ReceivedRequest, Reply, script_from_trace};
 
 /// A recorded exchange with the backend, used to drive the mock.
 ///

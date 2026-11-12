@@ -27,6 +27,8 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
+
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -35,7 +37,8 @@ use tokio::net::{TcpListener, TcpStream};
 /// The variants are the shapes that break clients, not the shapes a model produces: everything
 /// here was either observed on the live backend or is the failure mode the retry policy exists
 /// for.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Reply {
     /// A complete SSE stream: role delta, then `chunks` as `data:` payloads, then a finish
     /// chunk and `[DONE]`.
@@ -62,6 +65,39 @@ pub enum Reply {
     HangUp,
     /// Wait `delay` and then answer with `then`.
     Slow { delay: Duration, then: Box<Self> },
+}
+
+/// Turn a recorded trace into a script.
+///
+/// # Why the mock can be driven by a fixture
+///
+/// The seven S1 traces are what the backend really said. Feeding them back through the client is
+/// the closest a test can get to the live system without one — and unlike a hand-written reply it
+/// cannot drift away from the protocol, because it *is* the protocol as captured.
+///
+/// A step marked `fatal` becomes an in-band error: that is how the spike recorded a failing
+/// request, and it is deliberately not a status code — the traces do not record one, and inventing
+/// a `500` would be a claim the fixture does not support.
+///
+/// # Errors
+/// A malformed trace line, or a step with neither a response nor a fault and therefore nothing to
+/// serve. The second is an error rather than a skip because a script that silently drops a step
+/// makes the following request answer with the wrong reply, which is a confusing way to fail.
+pub fn script_from_trace(text: &str) -> Result<Vec<Reply>, serde_json::Error> {
+    let steps: Vec<crate::TraceStep> = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(serde_json::from_str)
+        .collect::<Result<_, _>>()?;
+
+    Ok(steps
+        .into_iter()
+        .map(|step| match (step.fatal, step.resp) {
+            (Some(fault), _) => Reply::in_band_error(&fault),
+            (None, Some(resp)) => Reply::from_trace_response(&resp),
+            (None, None) => Reply::HangUp,
+        })
+        .collect())
 }
 
 impl Reply {
@@ -152,6 +188,86 @@ impl Reply {
             ],
             finish_reason: "stop".to_string(),
         }
+    }
+
+    /// Render one recorded `resp` object as the stream the backend would have sent.
+    ///
+    /// The shape is the measured one, widened to whole-payload chunks: the per-character chunking
+    /// the live backend really does is covered by the unit tests and by `Reply::streamed_text`,
+    /// while a replayed trace wants to fail on its *data*, not on its chunking.
+    #[must_use]
+    pub fn from_trace_response(resp: &serde_json::Value) -> Self {
+        let mut payloads = Vec::new();
+
+        if let Some(reasoning) = resp
+            .get("reasoning_content")
+            .or_else(|| resp.get("reasoning"))
+            .and_then(serde_json::Value::as_str)
+            && !reasoning.is_empty()
+        {
+            payloads.push(
+                serde_json::json!({"choices":[{"index":0,"delta":{"reasoning_content":reasoning}}]})
+                    .to_string(),
+            );
+        }
+        if let Some(content) = resp.get("content").and_then(serde_json::Value::as_str)
+            && !content.is_empty()
+        {
+            payloads
+                .push(serde_json::json!({"choices":[{"index":0,"delta":{"content":content}}]}).to_string());
+        }
+        for (index, call) in resp
+            .get("tool_calls")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .enumerate()
+        {
+            payloads.push(
+                serde_json::json!({"choices":[{"index":0,"delta":{"tool_calls":[{
+                    "index": index,
+                    "id": call.get("id").and_then(serde_json::Value::as_str).unwrap_or(""),
+                    "type": "function",
+                    "function": {
+                        "name": call.get("function").and_then(|f| f.get("name"))
+                            .and_then(serde_json::Value::as_str).unwrap_or(""),
+                        "arguments": call.get("function").and_then(|f| f.get("arguments"))
+                            .and_then(serde_json::Value::as_str).unwrap_or(""),
+                    }
+                }]}}]})
+                .to_string(),
+            );
+        }
+
+        let finish_reason = resp
+            .get("finish_reason")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("stop")
+            .to_string();
+        Self::Sse {
+            payloads,
+            finish_reason,
+        }
+    }
+
+    /// The same tool call, forever.
+    ///
+    /// Detector D1 fires on the third identical `(name, args)`; this reply exists so that test has
+    /// a backend which never gets bored. It is the one scripted shape that must *not* be finite:
+    /// a loop detector that is fed a script which runs out would pass by the script ending rather
+    /// than by the detector working.
+    #[must_use]
+    pub fn looping_tool_call(name: &str, arguments: &str) -> Self {
+        Self::streamed_tool_call("call_loop", name, arguments)
+    }
+
+    /// The same sentence, repeated until the caller stops reading.
+    ///
+    /// Reasoning-loop detection (D4) has the same requirement as D1: the backend must keep
+    /// producing, or a detector that never fires looks identical to one that fired.
+    #[must_use]
+    pub fn looping_text(sentence: &str, repeats: usize) -> Self {
+        Self::streamed_text(&sentence.repeat(repeats))
     }
 }
 
