@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Security advisories appear without any push; a weekly audit finds them.
+    - cron: "0 6 * * 1"
+
+env:
+  CARGO_TERM_COLOR: always
+  # Deliberately no global `RUSTFLAGS="-D warnings"`: that applies to dependency build
+  # scripts too, and a warning in a transitive crate would fail a build nobody can fix.
+  # Warnings are denied for this workspace by `workspace.lints` and by `clippy -D warnings`.
+
+jobs:
+  # The project only supports macOS, but a Linux job keeps the core and llm crates
+  # honest: they must not depend on anything macOS-specific, and Linux CI runs in a
+  # fraction of the time.
+  test-linux:
+    name: test (linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.99.1"
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Test
+        run: cargo test --workspace --all-features
+
+  test-macos:
+    name: test (macos)
+    runs-on: macos-latest
+    # The supported platform: run on every push to main, and on pull requests only when
+    # they touch code that can behave differently here (paths, sockets, `df` parsing).
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'macos')
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.99.1"
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        run: cargo test --workspace --all-features
+
+  deny:
+    name: dependencies
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories bans licenses sources
+
+  # A property the project actually relies on: `immortality-core` must stay free of async
+  # runtimes and HTTP clients, otherwise the recovery protocol can no longer be tested
+  # synchronously. Enforced here because a dependency added at M4 would be noticed too late.
+  layering:
+    name: crate layering
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: core must not depend on tokio, reqwest or any daemon crate
+        run: |
+          if grep -E '^(tokio|reqwest|hyper|immortality-daemon|immortality-tools)' crates/core/Cargo.toml; then
+            echo "::error file=crates/core/Cargo.toml::core must stay free of async/HTTP dependencies"
+            exit 1
+          fi

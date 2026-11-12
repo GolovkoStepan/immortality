@@ -1,0 +1,36 @@
+# release-plz: changelog and version bumps from Conventional Commits.
+#
+# Deliberately no automatic release: this is a single binary that humans install and run
+# against their own repositories, and a surprise tag is not a service to them. Releases are
+# prepared as pull requests and published by a human.
+
+[workspace]
+changelog_update = true
+dependencies_update = false
+git_release_enable = true
+git_tag_enable = true
+publish = false
+allow_dirty = false
+semver_check = false
+pr_name = "chore: release"
+pr_labels = ["release"]
+
+[changelog]
+header = """
+# Changelog
+
+Все значимые изменения проекта документируются в этом файле.
+
+Формат основан на [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/),
+проект следует [Semantic Versioning](https://semver.org/lang/ru/).
+"""
+commit_parsers = [
+    { message = "^feat", group = "### Добавлено" },
+    { message = "^fix", group = "### Исправлено" },
+    { message = "^perf", group = "### Производительность" },
+    { message = "^refactor", group = "### Изменено" },
+    { message = "^docs", group = "### Документация" },
+    { message = "^test", group = "### Тесты" },
+    { message = "^chore", group = "### Служебное" },
+    { message = "^ci", group = "### CI" },
+]

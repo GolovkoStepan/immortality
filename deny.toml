@@ -1,0 +1,59 @@
+# cargo-deny configuration.
+#
+# The threat model that matters here: this binary runs shell commands written by a model and
+# lives for days. A compromised dependency is not a supply-chain footnote, it is remote code
+# execution with the user's full permissions. Hence advisories are errors, unknown licences
+# are errors, and registry sources are pinned.
+
+[graph]
+all-features = true
+
+[advisories]
+# A yanked version is an error, not a warning: it means the maintainers withdrew it.
+yanked = "deny"
+# `all` (the default) fails the build over any unmaintained crate anywhere in the tree,
+# including transitive ones nobody can replace. `workspace` limits the failure to crates we
+# actually depend on, which is the actionable set.
+unmaintained = "workspace"
+# Unsound advisories are real memory-safety bugs, but a transitive one with no fixed
+# release would block all work; warn on those, fail on direct dependencies.
+unsound = "workspace"
+ignore = []
+
+[licenses]
+# MIT OR Apache-2.0 is what this project ships under; dependencies must be compatible.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    # `webpki-roots` ships Mozilla's CA bundle under this licence. It is permissive and
+    # unavoidable when using rustls, so it is listed rather than suppressed.
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.9
+
+[licenses.private]
+# Workspace crates are unpublished, so they need no licence file of their own.
+ignore = true
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+deny = [
+    # A second TLS stack would mean platform-specific build pain; rustls is chosen
+    # deliberately in the workspace manifest.
+    { name = "openssl" },
+    { name = "openssl-sys" },
+    # `cmake` cannot be built on macOS without an extra toolchain install, and nothing here
+    # needs it.
+    { name = "cmake" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
