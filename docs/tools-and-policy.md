@@ -43,8 +43,8 @@ pub trait Tool {
 | `read_file` | `path`, `offset`, `limit` | Нумерация строк; отказ на бинарных файлах с подсказкой |
 | `glob` | `pattern`, `path` | Сортировка по mtime, лимит результатов |
 | `grep` | `pattern`, `glob`, `path`, `-A/-B`, `limit` | Регексы; поиск идёт только по текстовым файлам |
-| `read_state` | `section` | Читает `PLAN.md` / `TASKS.json` / `NOTES.md` / `DECISIONS.md` |
-| `grep_journal` | `query`, `since_seq`, `limit` | Поиск по журналу задачи; возвращает сводку |
+| `read_state` | `file`, `offset`, `limit` | Пять документов `PLAN.md` / `ACCEPTANCE.md` / `TASKS.json` / `DECISIONS.md` / `NOTES.md` (D-065) |
+| `grep_journal` | `query`, `since_seq`, `kind`, `limit` | Поиск по журналу; `next_seq` — курсор для следующей страницы (D-066) |
 | `git` с `subcommand` = `status`/`diff`/`log`/`show`/`rev_parse` | `args` — массив argv | Только чтение |
 
 ### Изменение (Effect::Mutate)
@@ -54,7 +54,7 @@ pub trait Tool {
 | `write_file` | `path`, `content` | ByContent |
 | `edit_file` | `path`, `old`, `new`, `replace_all` | ByContent |
 | `git` с `subcommand` = `add`/`commit`/`branch`/`worktree`/`stash` | `args`, `message`, `path`, `reason` | commit → Unknown (probe по `Immortality-Call` trailer) |
-| `update_state` | `file`, `content` или `patch` | ByContent |
+| `update_state` | `file`, `content`, `replace` | ByContent; отказ создать отсутствующий файл и урезать вдвое без `replace` (D-065) |
 | `shell` (mutating) | `command`, `timeout_secs`, `cwd` | Unknown |
 | `start_process` | `command`, `cwd`, `env`, `name` | Unknown (probe по маркеру в командной строке, D-061) |
 | `kill_process` | `handle` | Idempotent |

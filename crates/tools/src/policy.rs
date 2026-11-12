@@ -239,7 +239,13 @@ impl Escalation {
 /// Separate from the configurable `deny_write_globs` because these are not preferences: a hook
 /// written into `.git/hooks` executes on the next commit, and a rewritten global config is how an
 /// agent escapes every other rule at once. A config file should not be able to open them.
-const BUILTIN_DENY_WRITE: &[&str] = &["**/.git/**", "**/.agent/config.toml"];
+///
+/// The journal is here for the same reason. It is the audit trail recovery reads to answer "what
+/// happened before the crash", so an agent that could rewrite it could make a crashed step look
+/// like it never ran — and the `prev` chain, which exists to detect exactly that, would be
+/// rewritten along with it. `TASKS.json` and `DECISIONS.md` are deliberately *not* here: those are
+/// the agent's own working state and the `update_state` tool is how it edits them.
+const BUILTIN_DENY_WRITE: &[&str] = &["**/.git/**", "**/.agent/config.toml", "**/.agent/JOURNAL*"];
 
 /// The gate. Construct once per task; the worktree decides where writes may land.
 #[derive(Debug, Clone)]
@@ -757,6 +763,38 @@ mod tests {
     fn the_project_config_cannot_be_rewritten() {
         let verdict = gate().check(Effect::Mutate, &[PathUse::write(".agent/config.toml")]);
         assert!(verdict.is_denied(), "{verdict:?}");
+    }
+
+    #[test]
+    fn the_journal_cannot_be_rewritten_or_rotated_away() {
+        // The journal is the audit trail recovery trusts. An agent that could rewrite it could
+        // hide a crashed step, and the `prev` chain that exists to detect exactly that would be
+        // rewritten too. Both the live segment and a rotated one are covered.
+        for path in [
+            ".agent/JOURNAL.jsonl",
+            ".agent/JOURNAL.2026-11-12T10-00-00.jsonl",
+            "sub/.agent/JOURNAL.jsonl",
+        ] {
+            let verdict = gate().check(Effect::Mutate, &[PathUse::write(path)]);
+            assert!(verdict.is_denied(), "{path}: {verdict:?}");
+            assert!(
+                verdict.observation().unwrap().contains("built-in"),
+                "{path}: {verdict:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_agents_own_state_files_stay_writable() {
+        // The deny list above must not take `update_state` with it: those files are the agent's
+        // working memory, not the audit trail.
+        for path in [".agent/TASKS.json", ".agent/DECISIONS.md", ".agent/NOTES.md"] {
+            assert_eq!(
+                gate().check(Effect::Mutate, &[PathUse::write(path)]),
+                Verdict::Allowed,
+                "{path}"
+            );
+        }
     }
 
     #[test]

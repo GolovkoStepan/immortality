@@ -106,6 +106,7 @@ tool_call_completed → exit_code, output_artifact, duration
 | Инструмент | Класс | Действие при обрыве после `started` |
 | --- | --- | --- |
 | `read_file`, `glob`, `grep`, `read_state`, `grep_journal` | idempotent | повторить молча |
+| `update_state` | by-content | перечитать файл; совпал — считать выполненным (D-065) |
 | `write_file`, `edit_file` | idempotent-by-content | перечитать файл; если контент совпал — считать выполненным |
 | `shell` (read-only классифицированные) | idempotent | повторить |
 | `shell` (mutating) | unknown | **не повторять**; probe: состояние рабочего дерева, наличие ожидаемого файла |

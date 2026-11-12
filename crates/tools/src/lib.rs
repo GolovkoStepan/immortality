@@ -16,6 +16,7 @@ pub mod processes;
 pub mod read;
 pub mod search;
 pub mod shell;
+pub mod state;
 pub mod tool;
 pub mod write;
 
@@ -29,6 +30,7 @@ pub use processes::{KillProcess, Liveness, ProcessRecord, ProcessRegistry, ReadP
 pub use read::ReadFile;
 pub use search::Grep;
 pub use shell::{Shell, ShellState};
+pub use state::{GrepJournal, ReadState, StateFile, UpdateState};
 pub use tool::{OutputBudget, Registry, RegistryError, Tool, ToolCtx, ToolError, ToolResult};
 pub use write::{EditFile, WriteFile};
 

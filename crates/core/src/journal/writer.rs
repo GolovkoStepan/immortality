@@ -371,26 +371,31 @@ impl JournalReader {
     /// name sorts correctly because it is zero-padded and date-first.
     pub fn open(dir: impl AsRef<Path>, task: &TaskId) -> crate::Result<Self> {
         let dir = dir.as_ref().to_path_buf();
-        let mut segments = Vec::new();
-        if dir.is_dir() {
-            let entries = std::fs::read_dir(&dir).map_err(|e| crate::Error::io(&dir, e))?;
-            for entry in entries {
-                let entry = entry.map_err(|e| crate::Error::io(&dir, e))?;
-                let name = entry.file_name();
-                let Some(name) = name.to_str() else { continue };
-                if is_segment_name(name) {
-                    segments.push(entry.path());
-                }
-            }
-        }
-        // NOT plain lexicographic order. `JOURNAL.jsonl` vs `JOURNAL.2026-...`: at the
-        // position after `JOURNAL` one name has `.` (0x2E) and the other has `j` (0x6A), so
-        // the un-stamped initial segment would sort *last* — reading the journal backwards.
-        // The initial segment is ordered first explicitly, the rest by their parsed stamp.
-        segments.sort_by_key(|path| segment_order(path));
+        let segments = collect_segments(&dir)?;
         Ok(Self {
             dir,
             task: task.clone(),
+            segments,
+        })
+    }
+
+    /// Read a journal directory without naming a task.
+    ///
+    /// The `task` field is only used by [`Self::task`]; every record carries its own id. A
+    /// caller that has a directory and no id — `grep_journal`, whose argument is the `.agent`
+    /// directory — would otherwise have to invent an id to open a file it can already name, and
+    /// an invented id in a journal tool is one more thing that can disagree with the records.
+    ///
+    /// The task stored here is an empty tag, never written and never compared.
+    ///
+    /// # Errors
+    /// The directory could not be listed.
+    pub fn open_unnamed(dir: impl AsRef<Path>) -> crate::Result<Self> {
+        let dir = dir.as_ref().to_path_buf();
+        let segments = collect_segments(&dir)?;
+        Ok(Self {
+            dir,
+            task: TaskId::from_suffix(""),
             segments,
         })
     }
@@ -568,6 +573,29 @@ impl JournalReader {
     pub fn segments(&self) -> &[PathBuf] {
         &self.segments
     }
+}
+
+/// Every segment in `dir`, oldest first.
+///
+/// NOT plain lexicographic order. `JOURNAL.jsonl` vs `JOURNAL.2026-...`: at the position after
+/// `JOURNAL` one name has `.` (0x2E) and the other has `j` (0x6A), so the un-stamped initial
+/// segment would sort *last* — reading the journal backwards. The initial segment is ordered
+/// first explicitly, the rest by their parsed stamp.
+fn collect_segments(dir: &Path) -> crate::Result<Vec<PathBuf>> {
+    let mut segments = Vec::new();
+    if dir.is_dir() {
+        let entries = std::fs::read_dir(dir).map_err(|e| crate::Error::io(dir, e))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| crate::Error::io(dir, e))?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if is_segment_name(name) {
+                segments.push(entry.path());
+            }
+        }
+    }
+    segments.sort_by_key(|path| segment_order(path));
+    Ok(segments)
 }
 
 /// Whether a file in the journal directory is one of ours.
