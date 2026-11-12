@@ -50,6 +50,11 @@ pub enum Error {
     #[error("journal schema version {found} is not supported; this build reads version {expected}")]
     JournalVersion { found: u16, expected: u16 },
 
+    /// A caller broke the tool-call protocol: wrong order, duplicate id, verdict for an
+    /// unknown call. Always a programming error, never a runtime condition.
+    #[error("tool-call protocol violation: {0}")]
+    Protocol(String),
+
     /// An artifact's bytes do not match the digest that names it.
     ///
     /// Never papered over: the digest is the only reason to trust the content, and a model

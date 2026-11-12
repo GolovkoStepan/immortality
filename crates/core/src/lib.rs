@@ -25,6 +25,7 @@ pub mod ids;
 pub mod journal;
 pub mod logging;
 pub mod paths;
+pub mod protocol;
 pub mod time;
 
 pub use error::{Error, Result};

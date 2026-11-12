@@ -170,6 +170,21 @@ impl Journal {
         self.append(fields, JournalEvent::with_payload(payload))
     }
 
+    /// Append a fully built event with a given kind.
+    ///
+    /// Unlike [`Self::append_event`], this accepts a [`JournalEvent`] so that an artifact
+    /// reference survives. `fields` supplies addressing; `seq` and `prev` are still assigned
+    /// here, because those are the writer's business and no caller may set them.
+    pub fn append_full(
+        &mut self,
+        at: Timestamp,
+        kind: Kind,
+        event: JournalEvent,
+    ) -> crate::Result<JournalRecord> {
+        let fields = RecordFields::new(self.next_seq, at, self.task.clone(), kind);
+        self.append(fields, event)
+    }
+
     /// Flush and sync the active segment.
     ///
     /// Appends already sync; this exists for the shutdown path so the last record is
