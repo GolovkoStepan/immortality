@@ -17,6 +17,7 @@
 #[macro_use]
 mod macros;
 
+pub mod artifacts;
 pub mod config;
 pub mod domain;
 pub mod error;

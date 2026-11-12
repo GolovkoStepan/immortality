@@ -49,6 +49,13 @@ pub enum Error {
 
     #[error("journal schema version {found} is not supported; this build reads version {expected}")]
     JournalVersion { found: u16, expected: u16 },
+
+    /// An artifact's bytes do not match the digest that names it.
+    ///
+    /// Never papered over: the digest is the only reason to trust the content, and a model
+    /// that is served a fabricated tool result will act on it.
+    #[error("artifact is corrupt: {0}")]
+    ArtifactCorrupt(String),
 }
 
 impl Error {
