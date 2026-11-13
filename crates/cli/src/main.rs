@@ -89,11 +89,22 @@ enum Command {
         /// One task, instead of every task this daemon knows.
         task: Option<String>,
     },
-    /// Show the plan as the daemon reads it.
+    /// Show the plan as the daemon reads it, or build one from a goal.
+    ///
+    /// Without `--goal` this reports the tree already on disk. With it, the planner is asked to
+    /// decompose the goal and the three files are written — after which a human may edit them
+    /// before the run starts.
     Plan {
         /// A registered project path. Defaults to the current directory.
         #[arg(long)]
         project: Option<String>,
+        /// Ask the planner to build a plan for this goal.
+        #[arg(long)]
+        goal: Option<String>,
+        /// Replace an existing plan. Without this, a plan that is already there is left alone,
+        /// because a human may have edited it.
+        #[arg(long)]
+        force: bool,
     },
     /// List pending escalations. (M3)
     Escalations {
@@ -165,7 +176,7 @@ async fn main() -> Result<()> {
             }
             not_yet("start", "M5.8")
         }
-        Command::Plan { project } => plan_command(project, cli.json).await,
+        Command::Plan { project, goal, force } => plan_command(project, goal, force, cli.json).await,
         Command::Attach { task, since_seq } => attach_command(task, since_seq, cli.json).await,
         Command::Status { task } => status_command(task, cli.json).await,
         Command::Log { task } => log_command(task, cli.json).await,
@@ -306,12 +317,25 @@ async fn status_command(task: Option<String>, json: bool) -> Result<()> {
     Ok(())
 }
 
-/// `plan`: the tree as the scheduler reads it.
+/// `plan`: the tree as the scheduler reads it, or a tree built from a goal.
 ///
 /// The project defaults to the current directory, which is what a human means when they type
 /// `immortality plan` inside a repository. An unregistered directory is an error rather than a
 /// guess: the daemon has no task there, so there is no tree for it to read.
-async fn plan_command(project: Option<String>, json: bool) -> Result<()> {
+///
+/// The goal is sent rather than planned here, because the plan must be validated against the
+/// daemon's depth limit and written by the process that owns the inference slot (D-088). This
+/// client's only extra job is to say which repository it is standing in.
+async fn plan_command(project: Option<String>, goal: Option<String>, force: bool, json: bool) -> Result<()> {
+    // Refused before the socket is opened: an empty goal is a usage error, and asking a daemon
+    // that is not running would report the wrong problem. The daemon refuses it too — it answers
+    // other clients — but a human at a terminal should get the answer that is about what they
+    // typed.
+    if let Some(goal) = &goal
+        && goal.trim().is_empty()
+    {
+        anyhow::bail!("the goal must not be empty; say what the task should accomplish");
+    }
     let mut client = connect().await?;
     // The daemon cannot see this process's working directory, and its own is meaningless under
     // launchd, so the client always says which repository it means.
@@ -319,10 +343,16 @@ async fn plan_command(project: Option<String>, json: bool) -> Result<()> {
         Some(project) => PathBuf::from(project),
         None => std::env::current_dir().context("cannot read the current directory")?,
     };
-    let params = serde_json::json!({ "project": project });
+    let mut params = serde_json::json!({ "project": project });
+    if let Some(goal) = goal {
+        params["goal"] = serde_json::json!(goal);
+        params["force"] = serde_json::json!(force);
+    }
     let result = take(client.request("plan", params).await?)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&result)?);
+    } else if result.get("created").and_then(serde_json::Value::as_bool) == Some(true) {
+        print!("{}", render::planned(&result, style()));
     } else {
         print!("{}", render::plan(&result, style()));
     }

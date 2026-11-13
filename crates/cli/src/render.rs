@@ -242,6 +242,39 @@ pub fn plan(result: &Value, style: Style) -> String {
     out
 }
 
+/// A plan the planner has just written: the files it touched, then the tree.
+///
+/// Same tree rendering as [`plan`], with the files and the goal above it. A human who just spent
+/// minutes of prefill on this needs to see *where* it landed — the roadmap's contract is that
+/// they may open those files and rewrite them before the run starts.
+#[must_use]
+pub fn planned(result: &Value, style: Style) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "{}",
+        style.green(&format!("planned: {}", text(result, "goal")))
+    );
+    let root = text(result, "root");
+    for name in result
+        .get("written")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(Value::as_str)
+    {
+        let _ = writeln!(out, "  wrote {root}/.agent/{name}");
+    }
+    // The tree itself through the same renderer as `immortality plan`, because it *is* the same
+    // tree: a human who has seen one should not have to learn to read the other.
+    out.push_str(&plan(result, style));
+    out.push_str("\nedit these files before `immortality start` if the plan is not what you meant.\n");
+    out
+}
+
 /// One subtask and its children, indented by depth.
 fn render_subtask_line(out: &mut String, subtask: &Value, depth: usize, style: Style) {
     use std::fmt::Write as _;
@@ -1554,6 +1587,45 @@ mod tests {
             assert_ne!(out, String::new(), "every report prints something");
             assert!(!out.contains('\u{1b}'), "{out:?}");
         }
+    }
+
+    #[test]
+    fn a_freshly_written_plan_names_the_goal_and_the_files_it_touched() {
+        // The roadmap's contract: a human may edit these three files before the run. A
+        // confirmation that did not say where they landed would leave them hunting for them.
+        let out = planned(
+            &json!({
+                "project": "p", "root": "/repo", "max_subtask_depth": 2,
+                "goal": "add a parser",
+                "created": true,
+                "written": ["PLAN.md", "ACCEPTANCE.md", "TASKS.json"],
+                "subtasks": [{"id": "sub_01", "state": "pending", "title": "write it", "children": []}],
+            }),
+            PLAIN,
+        );
+        assert!(out.contains("add a parser"), "{out}");
+        for name in ["PLAN.md", "ACCEPTANCE.md", "TASKS.json"] {
+            assert!(
+                out.contains(&format!("/repo/.agent/{name}")),
+                "{name} missing: {out}"
+            );
+        }
+        // The tree comes through the same renderer as `immortality plan`.
+        assert!(out.contains("sub_01"), "{out}");
+        assert!(out.contains("immortality start"), "{out}");
+    }
+
+    #[test]
+    fn a_freshly_written_plan_emits_no_escape_bytes_in_a_pipe() {
+        let out = planned(
+            &json!({
+                "project": "p", "root": "/repo", "max_subtask_depth": 2, "goal": "g",
+                "created": true, "written": ["PLAN.md"],
+                "subtasks": [{"id": "sub_01", "state": "pending", "title": "t", "children": []}],
+            }),
+            PLAIN,
+        );
+        assert!(!out.contains('\u{1b}'), "{out:?}");
     }
 
     #[test]

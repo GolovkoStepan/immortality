@@ -114,6 +114,21 @@ pub enum PlanError {
 
     #[error("`ACCEPTANCE.md` is missing; the task has no gate to pass")]
     NoAcceptance,
+
+    #[error("the goal is empty; there is nothing to plan")]
+    EmptyGoal,
+
+    #[error("the plan has no acceptance criterion; a task with no bar to meet cannot finish")]
+    EmptyAcceptance,
+
+    #[error("two subtasks are named `{name}`; names must be unique so dependencies can refer to them")]
+    DuplicateName { name: String },
+
+    #[error("the planner's answer is unusable: {reason}")]
+    BadProposal { reason: String },
+
+    #[error("a plan is already here ({files}); edit it by hand, or pass --force to replace it")]
+    AlreadyPlanned { files: String },
 }
 
 /// The parsed task tree, ready to execute.

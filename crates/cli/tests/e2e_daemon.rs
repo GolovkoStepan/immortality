@@ -43,6 +43,25 @@ struct Daemon {
     socket: PathBuf,
     token_path: PathBuf,
     global_config: PathBuf,
+    /// What the planner should answer, when a test sets one.
+    model: Option<std::sync::Arc<Answer>>,
+}
+
+/// A model that answers with a fixed string.
+///
+/// Lives in this file rather than in production because it has no reason to exist there: the
+/// seam it satisfies is [`immortality_daemon::runner::Model`], and a fake belongs on the test
+/// side of it.
+#[derive(Debug)]
+struct Answer(String);
+
+impl immortality_daemon::runner::Model for Answer {
+    fn complete(
+        &self,
+        _request: &immortality_daemon::runner::ModelRequest,
+    ) -> Result<immortality_daemon::runner::Reply, String> {
+        Ok(immortality_daemon::runner::Reply::text(self.0.clone()))
+    }
 }
 
 impl Daemon {
@@ -80,7 +99,14 @@ impl Daemon {
             socket,
             token_path,
             global_config,
+            model: None,
         }
+    }
+
+    /// Answer the next planner call with `answer`.
+    fn answering(mut self, answer: &str) -> Self {
+        self.model = Some(std::sync::Arc::new(Answer(answer.to_string())));
+        self
     }
 
     /// Where a task's machine-local state lives.
@@ -136,6 +162,7 @@ impl Daemon {
     fn serve(&self) {
         let socket = self.socket.clone();
         let state_root = self.state_root.clone();
+        let model = self.model.clone();
         let (ready, wait) = std::sync::mpsc::channel::<Result<(), String>>();
         std::thread::spawn(move || {
             let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
@@ -162,6 +189,10 @@ impl Daemon {
                         let _ = ready.send(Err(error.to_string()));
                         return;
                     }
+                };
+                let state = match model {
+                    Some(model) => state.with_model(model),
+                    None => state,
                 };
                 // Sent after `bind`: the listening socket exists, so the test's connect is
                 // queued by the kernel even before `accept` runs.
@@ -617,4 +648,111 @@ fn init_registers_the_repository_so_the_daemon_can_find_it_later() {
         .expect("the repository must be registered after init");
     assert!(found.path.ends_with("fresh"));
     assert!(!daemon.token_path().as_os_str().is_empty());
+}
+
+// ── plan --goal, end to end ──────────────────────────────────────────────────
+
+/// A planner answer the compiler accepts.
+fn plan_answer() -> String {
+    serde_json::json!({
+        "plan": "# Plan\n\nAdd the parser.",
+        "acceptance": "`cargo test` passes and `parser::parse` exists.",
+        "subtasks": [{
+            "name": "parse",
+            "title": "write the parser",
+            "goal": "add `parser::parse`",
+            "dod": {
+                "statement": "the parser handles the cases",
+                "checks": [{ "id": "test", "command": "cargo test" }],
+                "review": false,
+            },
+        }],
+    })
+    .to_string()
+}
+
+#[test]
+fn plan_goal_writes_the_three_files_and_prints_them() {
+    // The whole chain over a real socket: the CLI sends its cwd, the daemon resolves the project,
+    // asks the model, validates against its own depth limit, and writes. Every step here has a
+    // unit test; this one proves the two ends agree about the request and the answer.
+    let daemon = Daemon::new().answering(&plan_answer());
+    daemon.serve();
+
+    daemon
+        .cli()
+        .current_dir(&daemon.repo)
+        .args(["plan", "--goal", "add a parser"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("add a parser"))
+        .stdout(predicate::str::contains("TASKS.json"))
+        .stdout(predicate::str::contains("write the parser"));
+
+    for name in ["PLAN.md", "ACCEPTANCE.md", "TASKS.json"] {
+        assert!(
+            daemon.repo.join(".agent").join(name).exists(),
+            "{name} was not written"
+        );
+    }
+}
+
+#[test]
+fn plan_goal_json_is_machine_readable() {
+    let daemon = Daemon::new().answering(&plan_answer());
+    daemon.serve();
+
+    let output = daemon
+        .cli()
+        .current_dir(&daemon.repo)
+        .args(["plan", "--goal", "add a parser", "--json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["count"], 1);
+    assert_eq!(value["created"], true);
+    assert_eq!(value["subtasks"][0]["state"], "pending");
+    assert_eq!(value["max_subtask_depth"], 2);
+}
+
+#[test]
+fn a_second_plan_goal_refuses_to_overwrite_without_force() {
+    // The roadmap's contract, proven over the wire: a human may rewrite these files before the
+    // run, and a second `plan` must not quietly discard that.
+    let daemon = Daemon::new().answering(&plan_answer());
+    daemon.serve();
+    daemon
+        .cli()
+        .current_dir(&daemon.repo)
+        .args(["plan", "--goal", "add a parser"])
+        .assert()
+        .success();
+
+    let edited = "# my own plan\n";
+    std::fs::write(daemon.repo.join(".agent").join("PLAN.md"), edited).unwrap();
+
+    daemon
+        .cli()
+        .current_dir(&daemon.repo)
+        .args(["plan", "--goal", "add a parser"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--force"))
+        .stderr(predicate::str::contains("PLAN.md"));
+
+    assert_eq!(
+        std::fs::read_to_string(daemon.repo.join(".agent").join("PLAN.md")).unwrap(),
+        edited,
+        "the human's edit must survive a refused plan"
+    );
+
+    daemon
+        .cli()
+        .current_dir(&daemon.repo)
+        .args(["plan", "--goal", "add a parser", "--force"])
+        .assert()
+        .success();
+    let replaced = std::fs::read_to_string(daemon.repo.join(".agent").join("PLAN.md")).unwrap();
+    assert!(!replaced.contains("my own plan"), "{replaced}");
 }

@@ -56,7 +56,7 @@ fn internal(error: String) -> RpcError {
 /// The task is not registered, or the path is not a registered project. Guessing from the
 /// daemon's own directory would make the answer depend on where launchd happened to start it,
 /// which is the one directory a human never chose.
-fn project_for(state: &ServerState, params: &serde_json::Value) -> Result<Project, RpcError> {
+pub fn project_for(state: &ServerState, params: &serde_json::Value) -> Result<Project, RpcError> {
     let registry = Registry::open(state.registry_path()).map_err(|error| internal(error.to_string()))?;
     if let Some(task) = params.get("task").and_then(serde_json::Value::as_str) {
         let task = TaskId::parse(task).map_err(|error| bad_params(error.to_string()))?;

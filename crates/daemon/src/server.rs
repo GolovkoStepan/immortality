@@ -57,6 +57,13 @@ pub struct ServerState {
     /// invented its own defaults would answer differently from the scheduler about the same tree.
     /// That disagreement shows up as "it ran yesterday".
     pub config: immortality_core::config::Config,
+    /// The model a handler should use, when one was injected.
+    ///
+    /// `None` is production: the handler builds an [`crate::runner::LlmModel`] from the config,
+    /// inside a blocking task (see [`crate::planner`]). `Some` is a test's fake, which is what
+    /// makes every model-touching method testable without a server — the same seam
+    /// [`crate::runner::Model`] gives the loop.
+    pub model: Option<std::sync::Arc<dyn crate::runner::Model>>,
 }
 
 impl ServerState {
@@ -82,6 +89,7 @@ impl ServerState {
             state_root,
             token,
             config: immortality_core::config::Config::default(),
+            model: None,
         })
     }
 
@@ -93,6 +101,17 @@ impl ServerState {
     #[must_use]
     pub fn with_config(mut self, config: &immortality_core::config::Config) -> Self {
         self.config = config.clone();
+        self
+    }
+
+    /// The same state, answering model calls with `model` instead of the backend.
+    ///
+    /// The seam exists so a test can prove what a handler *asks* and what it does with the
+    /// answer, without a server: the alternative is either an untested handler or a suite that
+    /// needs the network, and this project refuses both.
+    #[must_use]
+    pub fn with_model(mut self, model: std::sync::Arc<dyn crate::runner::Model>) -> Self {
+        self.model = Some(model);
         self
     }
 
@@ -346,7 +365,7 @@ async fn connection(stream: UnixStream, state: &ServerState, events: &Events) ->
             None
         };
 
-        let response = match dispatch(&request, state) {
+        let response = match dispatch(&request, state).await {
             Ok(result) => Response::ok(request.id, result),
             Err(error) => Response::failed(request.id, error),
         };
@@ -589,13 +608,23 @@ fn hello(id: u64, params: &Value) -> Response {
     )
 }
 
-fn dispatch(request: &Request, state: &ServerState) -> Result<Value, RpcError> {
+async fn dispatch(request: &Request, state: &ServerState) -> Result<Value, RpcError> {
     match request.method.as_str() {
         "status" => status(state, &request.params),
         "escalations" => escalations(state, &request.params),
         "approve" => approve(state, &request.params),
         "attach" => attach(state, &request.params),
-        "plan" => crate::commands::plan(state, &request.params),
+        // One method, two shapes: without `goal` it reports the tree already on disk (D-088);
+        // with one it asks the planner to write that tree. A separate `plan_new` method would
+        // make the CLI choose between two names for the same question, and the check for "is
+        // there already a plan" is the same in both.
+        "plan" => {
+            if request.params.get("goal").is_some() {
+                crate::planner::write_plan(state, &request.params).await
+            } else {
+                crate::commands::plan(state, &request.params)
+            }
+        }
         "log" => crate::commands::log(state, &request.params),
         "gc" => crate::commands::collect_garbage(state, &request.params),
         "merge" => crate::commands::merge(state, &request.params),

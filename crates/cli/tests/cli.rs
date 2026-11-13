@@ -254,6 +254,56 @@ fn every_command_without_a_daemon_says_so_and_changes_nothing() {
 }
 
 #[test]
+fn plan_without_a_goal_still_reads_the_tree() {
+    // One method, two shapes. `--goal` absent must mean the M5.5 read-only report, not a
+    // planning request with an empty goal — which the daemon refuses.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = dead_backend_config(dir.path());
+
+    binary()
+        .arg("--global-config")
+        .arg(&config)
+        .arg("plan")
+        .assert()
+        .failure()
+        // The socket error, not "the goal is required": the request reached the point of
+        // connecting, which is what a read-only `plan` does.
+        .stderr(predicate::str::contains("daemon.sock"));
+}
+
+#[test]
+fn plan_with_an_empty_goal_is_refused_before_connecting() {
+    // The answer must be about what the human typed, not about a daemon that happens not to be
+    // running: a usage error reported as a connection error sends them to start a server.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = dead_backend_config(dir.path());
+
+    binary()
+        .arg("--global-config")
+        .arg(&config)
+        .args(["plan", "--goal", "   "])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("goal must not be empty"))
+        .stderr(predicate::str::contains("daemon.sock").not());
+}
+
+#[test]
+fn plan_with_a_goal_needs_a_daemon_and_says_so() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = dead_backend_config(dir.path());
+
+    binary()
+        .arg("--global-config")
+        .arg(&config)
+        .args(["plan", "--goal", "add a parser"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("daemon.sock"))
+        .stderr(predicate::str::contains("nothing was changed"));
+}
+
+#[test]
 fn empty_goal_is_rejected() {
     let dir = tempfile::tempdir().expect("tempdir");
     let config = dead_backend_config(dir.path());

@@ -63,6 +63,13 @@ use immortality_core::scheduler::Piece;
 use immortality_core::time::Clock;
 use immortality_llm::turn::AssistantTurn;
 use immortality_llm::wire::ChatRequest;
+
+/// The request type [`Model`] is given, re-exported.
+///
+/// A test fake in another crate has to name this type in its signature. Without a re-export, every
+/// such crate would add `immortality-llm` as a dependency purely to spell a parameter it never
+/// reads — and a dependency added for a signature is one more thing to keep in step.
+pub use immortality_llm::wire::ChatRequest as ModelRequest;
 use immortality_llm::{Backend, ToolDef};
 use immortality_tools::{Args, PolicyGate, Registry, ToolCtx, ToolError};
 

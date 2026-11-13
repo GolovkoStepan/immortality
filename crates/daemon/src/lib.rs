@@ -13,6 +13,7 @@ pub mod checkpoints;
 pub mod commands;
 pub mod doctor;
 pub mod gates;
+pub mod planner;
 pub mod recovery;
 pub mod rpc;
 pub mod runner;
