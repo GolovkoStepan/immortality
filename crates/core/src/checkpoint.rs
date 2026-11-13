@@ -290,6 +290,21 @@ impl GitRepo {
         task_branch: &str,
         reason: &str,
     ) -> Result<Option<Checkpoint>, GitError> {
+        let safety = self.hidden_checkpoint(task_branch, reason)?;
+        self.reset_hard(sha)?;
+        Ok(safety)
+    }
+
+    /// Move the tree to `sha` and delete what the reset would otherwise leave behind.
+    ///
+    /// No safety checkpoint: this is the second half of [`Self::rollback_to`], and the caller
+    /// that takes its own snapshot first — the daemon's L3 path does, because the snapshot has to
+    /// be journaled *before* the tree is destroyed — would otherwise take it twice.
+    ///
+    /// # Errors
+    /// `sha` is not a commit, or git refuses the reset. A refusal is reported and not retried:
+    /// the tree may be half-moved, and continuing is how a run builds on a state nobody knows.
+    pub fn reset_hard(&self, sha: &str) -> Result<(), GitError> {
         if self
             .git(&["cat-file", "-e", &format!("{sha}^{{commit}}")])
             .is_err()
@@ -299,12 +314,11 @@ impl GitRepo {
                 "checkpoint commit does not exist",
             ));
         }
-        let safety = self.hidden_checkpoint(task_branch, reason)?;
         self.git(&["reset", "--hard", sha])?;
         // Untracked files are not touched by `reset --hard`, and they are exactly the leftovers
         // that make the next attempt fail for reasons nobody understands.
         self.git(&["clean", "-fd"])?;
-        Ok(safety)
+        Ok(())
     }
 
     /// Commit exists and is reachable from any ref, used by the post-crash probe for `git commit`.
@@ -697,6 +711,41 @@ mod tests {
             .output()
             .unwrap();
         assert_eq!(String::from_utf8_lossy(&out.stdout), "precious");
+    }
+
+    #[test]
+    fn reset_hard_moves_the_tree_without_taking_a_second_snapshot() {
+        // The daemon snapshots first (so the discarded work can be journaled before it is gone)
+        // and then calls this. A second safety checkpoint here would journal two SHAs for one
+        // rollback and leave the caller reading a branch pointer that moved twice.
+        let fixture = Fixture::new();
+        fixture.write("work.txt", "good");
+        let checkpoint = fixture
+            .repo
+            .hidden_checkpoint("agent/tsk_1", "good state")
+            .unwrap()
+            .unwrap();
+        let branch_before = fixture.repo.git(&["rev-parse", "agent-ckpt/tsk_1"]).unwrap();
+
+        fixture.write("work.txt", "broken");
+        fixture.repo.reset_hard(&checkpoint.sha).unwrap();
+
+        assert_eq!(fixture.read("work.txt"), "good");
+        let branch_after = fixture.repo.git(&["rev-parse", "agent-ckpt/tsk_1"]).unwrap();
+        assert_eq!(branch_before, branch_after, "the checkpoint ref must not move");
+    }
+
+    #[test]
+    fn reset_hard_refuses_a_missing_sha_and_leaves_the_tree_alone() {
+        let fixture = Fixture::new();
+        fixture.write("work.txt", "keep me");
+        assert!(
+            fixture
+                .repo
+                .reset_hard("0000000000000000000000000000000000000000")
+                .is_err()
+        );
+        assert_eq!(fixture.read("work.txt"), "keep me");
     }
 
     #[test]

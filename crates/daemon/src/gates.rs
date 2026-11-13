@@ -88,8 +88,14 @@ impl RealGates {
 }
 
 impl Gates for RealGates {
-    fn diff(&self) -> Result<Diff, String> {
-        let base = self.base.clone().unwrap_or_else(|| "HEAD".to_string());
+    fn diff(&self, base: Option<&str>) -> Result<Diff, String> {
+        // The caller's base wins: it is the checkpoint this attempt rolled back to, and only the
+        // caller knows it. `Self::base` is the task-level fallback for an attempt that never
+        // restarted.
+        let base = base
+            .map(str::to_string)
+            .or_else(|| self.base.clone())
+            .unwrap_or_else(|| "HEAD".to_string());
         let tracked = self
             .repo
             .git(&["diff", "--no-color", &base])
@@ -288,7 +294,7 @@ mod tests {
     fn a_tracked_modification_reaches_the_diff() {
         let (dir, _) = repo();
         std::fs::write(dir.path().join("a.txt"), "one\ntwo\n").expect("write");
-        let diff = gates(dir.path()).diff().expect("diff");
+        let diff = gates(dir.path()).diff(None).expect("diff");
         assert_eq!(diff.files.len(), 1);
         assert_eq!(diff.files[0].path, PathBuf::from("a.txt"));
         assert!(diff.files[0].added_lines.iter().any(|line| line == "two"));
@@ -300,7 +306,7 @@ mod tests {
         // ignored it would approve exactly the file nobody reviewed.
         let (dir, _) = repo();
         std::fs::write(dir.path().join("new.rs"), "fn new() {}\n").expect("write");
-        let diff = gates(dir.path()).diff().expect("diff");
+        let diff = gates(dir.path()).diff(None).expect("diff");
         let file = diff
             .files
             .iter()
@@ -317,7 +323,7 @@ mod tests {
     fn an_untracked_binary_is_flagged_rather_than_dropped() {
         let (dir, _) = repo();
         std::fs::write(dir.path().join("logo.png"), b"\x89PNG\r\n\x1a\n\0\0").expect("write");
-        let diff = gates(dir.path()).diff().expect("diff");
+        let diff = gates(dir.path()).diff(None).expect("diff");
         let file = diff
             .files
             .iter()
@@ -329,7 +335,7 @@ mod tests {
     #[test]
     fn a_clean_tree_has_an_empty_diff() {
         let (dir, _) = repo();
-        let diff = gates(dir.path()).diff().expect("diff");
+        let diff = gates(dir.path()).diff(None).expect("diff");
         assert!(diff.is_empty(), "{diff:?}");
     }
 
@@ -342,7 +348,7 @@ mod tests {
         std::fs::write(dir.path().join("a.txt"), "one\ntwo\n").expect("write");
         let mut scoped = gates(dir.path());
         scoped.base = Some(base);
-        assert_eq!(scoped.diff().expect("diff").files.len(), 1);
+        assert_eq!(scoped.diff(None).expect("diff").files.len(), 1);
     }
 
     #[test]

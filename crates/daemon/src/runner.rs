@@ -52,11 +52,12 @@ use immortality_core::context::{
     Budget, Context, Entry, StableLayers, TokenCounter, ToolCall, Verdict, artifact_hint, truncate_output,
 };
 use immortality_core::detect::{Detector, Level, Reaction, Signals, Stream, StreamVerdict, Thresholds};
-use immortality_core::domain::{Attempt, AttemptTrigger, FailureReason, Subtask, SubtaskReport};
+use immortality_core::domain::{Attempt, AttemptTrigger, FailureReason, Subtask, SubtaskId, SubtaskReport};
 use immortality_core::gate::{GateRecord, GateVerdict, Gates, Reviewer, evaluate};
 use immortality_core::ids::TaskId;
 use immortality_core::journal::{Journal, Kind, Scope};
 use immortality_core::protocol::{CallId, Intent, ToolCallLog};
+use immortality_core::restart::{self, Allowance, Cause, Checkpoints, Decision, Ended, Limit, Stop};
 use immortality_core::scheduler::Piece;
 use immortality_llm::turn::AssistantTurn;
 use immortality_llm::wire::ChatRequest;
@@ -377,6 +378,8 @@ pub struct RunOutcome {
     /// the tree belongs to the plan, and a runner that wrote `done` into a tree it cannot see
     /// would be deciding what the next subtask is.
     pub gates: Option<GateVerdict>,
+    /// The checkpoint the attempt's tree came from, if a restart rolled it back.
+    pub base_checkpoint: Option<String>,
 }
 
 impl RunOutcome {
@@ -390,6 +393,36 @@ impl RunOutcome {
     #[must_use]
     pub fn verified(&self) -> bool {
         self.gates.as_ref().is_some_and(GateVerdict::is_passed)
+    }
+
+    /// What ended the attempt, in the restart vocabulary.
+    ///
+    /// The translation lives here rather than in [`Cause`] because only the outcome knows both
+    /// why the loop stopped and what the gates said about it — and the claim is not a failure
+    /// until the gates speak.
+    #[must_use]
+    pub fn ended(&self) -> Ended {
+        match (&self.ending, &self.gates) {
+            // A claim is only a failure when the gates say so. `None` means nothing could check
+            // it, which is also a closure: the runner never certifies a claim it did not see.
+            (Ending::Claimed, None | Some(GateVerdict::Passed)) => Ended::Verified,
+            (Ending::Claimed, Some(GateVerdict::Failed { reason, why })) => Ended::Failed(Cause::Gate {
+                reason: *reason,
+                why: why.clone(),
+            }),
+            (Ending::Steps, _) => Ended::Failed(Cause::Limit(Limit::Steps)),
+            (Ending::Tokens, _) => Ended::Failed(Cause::Limit(Limit::Tokens)),
+            (Ending::Time, _) => Ended::Failed(Cause::Limit(Limit::Time)),
+            (Ending::Stalled, _) => Ended::Failed(Cause::Stalled),
+            (Ending::Empty, _) => Ended::Failed(Cause::EmptyReply),
+            (Ending::UnknownTool { name }, _) => Ended::Failed(Cause::UnknownTool { name: name.clone() }),
+            (Ending::Backend { .. }, _) => Ended::Abandoned,
+            (Ending::Looped(reaction), _) => Ended::Failed(Cause::Detector {
+                detector: reaction.detector,
+                metric: reaction.metric,
+            }),
+            (Ending::SplitRequested(_), _) => Ended::Split,
+        }
     }
 }
 
@@ -438,6 +471,12 @@ pub struct Runner {
     /// The runner does not enforce it — the scheduler does — but the brief has to know whether
     /// offering a split would be an offer the tree is going to refuse.
     pub max_subtask_depth: u8,
+    /// The tree a restart rolls back to.
+    ///
+    /// `None` means "a restart cannot be done": the decision to roll back is still made (it is
+    /// pure), but acting on it without this would claim an L3 that never happened. The session
+    /// then stops instead of starting an attempt on a tree nobody put back.
+    pub checkpoints: Option<Arc<dyn Checkpoints + Send + Sync>>,
 }
 
 impl std::fmt::Debug for Runner {
@@ -469,12 +508,35 @@ impl Runner {
         strategy: &str,
         journal: &mut Journal,
     ) -> immortality_core::Result<RunOutcome> {
+        self.run_with_base(subtask, attempt_number, strategy, None, journal)
+    }
+
+    /// [`Self::run`], recording which checkpoint the attempt's tree came from.
+    ///
+    /// `base_checkpoint` is the SHA a restart rolled back to, and it is written onto the attempt so
+    /// that a later gate evaluation can diff against it instead of against `HEAD`: a reviewer that
+    /// reads the whole task on every claim cannot tell this attempt's work from the previous
+    /// one's, and approving the sum of two attempts is not approving either.
+    ///
+    /// # Errors
+    /// See [`Self::run`].
+    pub fn run_with_base(
+        &self,
+        subtask: &Subtask,
+        attempt_number: u32,
+        strategy: &str,
+        base_checkpoint: Option<&str>,
+        journal: &mut Journal,
+    ) -> immortality_core::Result<RunOutcome> {
         let mut attempt = Attempt::start(
             subtask.id.clone(),
             attempt_number,
             strategy,
             immortality_core::time::now(),
         );
+        if let Some(sha) = base_checkpoint {
+            attempt.base_checkpoint = Some(sha.to_string());
+        }
         journal.append_scoped(
             immortality_core::time::now(),
             Kind::AttemptStarted,
@@ -492,9 +554,10 @@ impl Runner {
 
         attempt.steps_used = state.steps;
         attempt.tokens_used = state.tokens;
+        let base = attempt.base_checkpoint.clone();
         let report = state.report(&ending);
         if ending == Ending::Claimed {
-            return self.settle_claim(subtask, attempt, report, state.steps, journal);
+            return self.settle_claim(subtask, attempt, report, state.steps, base, journal);
         }
 
         let trigger = match &ending {
@@ -533,7 +596,18 @@ impl Runner {
             report,
             steps: state.steps,
             gates: None,
+            base_checkpoint: base,
         })
+    }
+
+    /// A session that runs attempts at `subtask` until one ends it.
+    ///
+    /// The entry point the daemon uses. [`Self::run`] stays public because a single attempt is
+    /// what most tests need, and because a caller that already applied the ladder itself — the
+    /// recovery path, which has no allowance to spend — should not have to fake a session.
+    #[must_use]
+    pub fn session<'a>(&'a self, subtask: &'a Subtask, attempt_number: u32) -> AttemptSession<'a> {
+        AttemptSession::new(self, subtask, attempt_number)
     }
 
     /// Turn a claim into a closed attempt, if and only if the gates are green.
@@ -559,9 +633,10 @@ impl Runner {
         mut attempt: Attempt,
         mut report: SubtaskReport,
         steps: u32,
+        base: Option<String>,
         journal: &mut Journal,
     ) -> immortality_core::Result<RunOutcome> {
-        let verdict = self.evaluate_gates(subtask, attempt.number, journal)?;
+        let verdict = self.evaluate_gates(subtask, attempt.number, base.as_deref(), journal)?;
         match &verdict {
             GateVerdict::Passed => {
                 attempt
@@ -607,6 +682,7 @@ impl Runner {
             report,
             steps,
             gates: Some(verdict),
+            base_checkpoint: base,
         })
     }
 
@@ -620,6 +696,7 @@ impl Runner {
         &self,
         subtask: &Subtask,
         attempt_number: u32,
+        base: Option<&str>,
         journal: &mut Journal,
     ) -> immortality_core::Result<GateVerdict> {
         let scope = Scope::attempt(subtask.id.clone(), attempt_number);
@@ -644,7 +721,9 @@ impl Runner {
         // `Option<&dyn A + B>` does not coerce to `Option<&dyn A>`; the map is what lets the
         // `Send + Sync` bounds stay on the field without leaking into the pure signature.
         let reviewer = self.reviewer.as_deref().map(|it| it as &dyn Reviewer);
-        let report = evaluate(&subtask.dod, gates, reviewer).map_err(|why| {
+        // The base narrows the diff to this attempt's work. `Gates` decides what a base means;
+        // the runner only knows which checkpoint it rolled back to.
+        let report = evaluate(&subtask.dod, gates, reviewer, base).map_err(|why| {
             immortality_core::Error::Protocol(format!("the gate diff could not be produced: {why}"))
         })?;
         for record in GateRecord::of(&report) {
@@ -659,6 +738,345 @@ fn record_gate(journal: &mut Journal, scope: &Scope, record: &GateRecord) -> imm
     let payload =
         serde_json::to_value(record).map_err(|error| immortality_core::Error::Protocol(error.to_string()))?;
     journal.append_scoped(immortality_core::time::now(), Kind::GateResult, payload, scope)?;
+    Ok(())
+}
+
+/// Run a subtask until it closes, splits, or spends its budget.
+///
+/// # Why this is a session and not one call to [`Runner::run`]
+///
+/// The design's attempt budget is not one number: attempts under one strategy, then a change of
+/// strategy and, when the ladder says the attempt is going nowhere, a restart with a rollback
+/// (D-080). Putting that in the scheduler would put the ladder into the one component that must
+/// not know *why* an attempt failed. So the loop lives next to the thing it loops over:
+/// [`Runner::run`] runs one attempt, [`AttemptSession::drive`] decides what the next one is.
+///
+/// # What a session owns, and what it does not
+///
+/// It owns the attempt counter, the accumulated report and the checkpoint the tree started from.
+/// It does not own the tree: rolling back is a [`Checkpoints`] call, journalled here because the
+/// journal is where a restart's safety snapshot has to appear *before* git deletes it.
+///
+/// # The ordering rule
+///
+/// Snapshot, journal, then move. A crash after the journal record leaves a SHA a human can find
+/// and a tree that was never touched; a crash after the reset leaves a tree that is back at the
+/// base and a record saying so. The other order — reset, then journal — loses the name of the work
+/// the reset destroyed, which is the thing the milestone forbids.
+pub struct AttemptSession<'a> {
+    runner: &'a Runner,
+    subtask: &'a Subtask,
+    /// Number of the next attempt to start; 1-based, and the caller chooses the first because a
+    /// resumed subtask does not start at 1.
+    next: u32,
+    /// The most recent report. Each attempt starts from it and replaces it, which is how a
+    /// rejected idea reaches the following brief.
+    report: SubtaskReport,
+    /// The checkpoint the current attempt's tree came from.
+    base: Option<restart::Snapshot>,
+    /// The strategy the caller started the subtask with, quoted by every restart.
+    ///
+    /// Deliberately the *initial* one and never the generated text: quoting a generated strategy
+    /// back at the model nests the same advice inside itself on every attempt. What actually
+    /// changes between attempts is the accumulated list of failures below.
+    seed: String,
+    /// Why the last attempt ended. Kept beside the report because the strategy is built from
+    /// both, and rebuilding it from the `RunOutcome` after the fact re-derives what is here.
+    last: Option<Cause>,
+}
+
+impl std::fmt::Debug for AttemptSession<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AttemptSession")
+            .field("subtask", &self.subtask.id)
+            .field("next", &self.next)
+            .field("base", &self.base)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'a> AttemptSession<'a> {
+    /// A session for `subtask`, whose next attempt is `attempt_number`.
+    #[must_use]
+    pub fn new(runner: &'a Runner, subtask: &'a Subtask, attempt_number: u32) -> Self {
+        Self {
+            runner,
+            subtask,
+            next: attempt_number,
+            report: SubtaskReport::default(),
+            base: None,
+            seed: String::new(),
+            last: None,
+        }
+    }
+
+    /// Start from the strategy the caller chose for this subtask.
+    ///
+    /// Empty for "no strategy given", which is the common case: the plan says what to do and the
+    /// runner only reacts when it has to.
+    #[must_use]
+    pub fn with_strategy(mut self, strategy: impl Into<String>) -> Self {
+        self.seed = strategy.into();
+        self
+    }
+
+    /// Start from the report a previous process left behind.
+    ///
+    /// A resumed subtask inherits what its last attempt learned; without this its first new brief
+    /// would be as blind as the very first one, and the rejected ideas the restart exists to carry
+    /// would be lost with the process.
+    #[must_use]
+    pub fn resuming_from(mut self, report: SubtaskReport) -> Self {
+        self.report = report;
+        self
+    }
+
+    /// Run attempts until one ends the session.
+    ///
+    /// `allowance` is read once and decremented here: attempts and restarts are two budgets, and a
+    /// caller that recomputed them from config per attempt would count a restart as an attempt
+    /// and stop a subtask after one rollback.
+    ///
+    /// # Errors
+    /// The journal cannot be written. Everything else — a failed attempt, a red gate, a refused
+    /// rollback — is a [`SessionEnd`], because a run that failed is exactly when the next attempt
+    /// most needs to know why.
+    pub fn drive(
+        &mut self,
+        allowance: Allowance,
+        journal: &mut Journal,
+    ) -> immortality_core::Result<SessionEnd> {
+        let mut left = allowance;
+        loop {
+            let number = self.next;
+            let strategy = self.strategy();
+            let outcome = self.runner.run_with_base(
+                self.subtask,
+                number,
+                &strategy,
+                self.base.as_ref().map(|base| base.sha.as_str()),
+                journal,
+            )?;
+            self.absorb(&outcome.report);
+            let cause = Self::cause_of(&outcome);
+            self.remember(number, &cause);
+            self.last = Some(cause);
+
+            // The attempt just run has spent one of the budget, whichever way it ended: a stop is
+            // evaluated against what is left *after* it, or a two-attempt budget would run three.
+            left.attempts_left = left.attempts_left.saturating_sub(1);
+            match restart::decide(outcome.ended(), left) {
+                // Nothing is started, so nothing is written: the stop is the caller's to act on,
+                // and the scheduler owns what a subtask becomes.
+                Decision::Stop(stop) => return Ok(SessionEnd { outcome, stop }),
+                Decision::Retry(_) => {
+                    // The tree stays: a rejected claim is evidence about the work on disk, and
+                    // rolling it away throws away the closest thing to a finished subtask.
+                    self.next = self.next.saturating_add(1);
+                }
+                Decision::Restart(cause) => {
+                    left.restarts_left = left.restarts_left.saturating_sub(1);
+                    match self.roll_back(&outcome, &cause, journal)? {
+                        RollBack::Done => {}
+                        // A tree that could not be put back is not a tree to build on. The
+                        // attempt is already closed, so the caller gets a stop naming git
+                        // rather than a restart that lied about rolling back.
+                        RollBack::Blocked(reason) => {
+                            return Ok(SessionEnd {
+                                outcome,
+                                stop: Stop::Blocked(reason),
+                            });
+                        }
+                    }
+                    self.next = self.next.saturating_add(1);
+                }
+            }
+        }
+    }
+
+    /// The strategy for the attempt about to start.
+    fn strategy(&self) -> String {
+        let Some(cause) = self.last.clone() else {
+            return self.seed.clone();
+        };
+        restart::strategy(&cause, &self.seed, &self.report.rejected_ideas)
+    }
+
+    /// Take the attempt's report, keeping the failures the previous attempts named.
+    ///
+    /// The attempt's own report replaces the summary — it is the newest account of the work — but
+    /// `rejected_ideas` is cumulative: the whole reason it exists is to outlive the context that
+    /// produced it (D-074), and a restart that dropped the earlier failures would let a model
+    /// rediscover them one attempt at a time.
+    fn absorb(&mut self, report: &SubtaskReport) {
+        let inherited = std::mem::take(&mut self.report.rejected_ideas);
+        self.report = report.clone();
+        for idea in inherited {
+            if !self.report.rejected_ideas.contains(&idea) {
+                self.report.rejected_ideas.insert(0, idea);
+            }
+        }
+    }
+
+    /// Remember why an attempt failed, for the briefs that follow it.
+    ///
+    /// The gate path already records its own reason in `settle_claim`, so only the other endings
+    /// are added here: it is the same sentence the cause prints, and a brief that listed it twice
+    /// would look like two failures.
+    fn remember(&mut self, number: u32, cause: &Cause) {
+        if matches!(cause, Cause::Gate { .. }) {
+            return;
+        }
+        self.report
+            .rejected_ideas
+            .push(format!("attempt {number}: {}", cause.observation()));
+    }
+
+    /// Why an outcome ended, as the strategy text needs it.
+    fn cause_of(outcome: &RunOutcome) -> Cause {
+        match outcome.ended() {
+            Ended::Failed(cause) => cause,
+            // A verified claim, a split or an abandonment end the session; the cause is only read
+            // when a restart happens, so this value is never used for a brief.
+            Ended::Verified | Ended::Split | Ended::Abandoned => Cause::Stalled,
+        }
+    }
+
+    /// Snapshot, journal, then move the tree back to the base.
+    ///
+    /// The base is the checkpoint taken before the *first* attempt of the session, not the last
+    /// one: L3 gets back to the last state that was green, and an attempt that started on a broken
+    /// tree must not make that broken tree the new base.
+    fn roll_back(
+        &mut self,
+        outcome: &RunOutcome,
+        cause: &Cause,
+        journal: &mut Journal,
+    ) -> immortality_core::Result<RollBack> {
+        let Some(checkpoints) = self.runner.checkpoints.as_deref() else {
+            return Ok(RollBack::Blocked(
+                "a restart needs a checkpoint world, and none is wired".to_string(),
+            ));
+        };
+        let closed = outcome.attempt.number;
+        let reason = format!("L3 restart after attempt {closed}: {}", cause.observation());
+        if self.base.is_none() {
+            let taken = match checkpoint_snapshot(
+                checkpoints,
+                &format!("base for a restart of `{}`", self.subtask.title),
+            ) {
+                Ok(Some(taken)) => taken,
+                Ok(None) => {
+                    return Ok(RollBack::Blocked(
+                        "the worktree has no commits, so a restart has nothing to roll back to".to_string(),
+                    ));
+                }
+                Err(why) => return Ok(RollBack::Blocked(why)),
+            };
+            record_checkpoint(journal, &self.subtask.id, closed, &taken, "base")?;
+            self.base = Some(taken);
+        }
+        let Some(base) = self.base.clone() else {
+            // Unreachable: the branch above fills it or returns. Written as a branch rather than
+            // an `expect` because the workspace forbids panicking in library code.
+            return Ok(RollBack::Blocked(
+                "no base checkpoint was recorded, so there is nothing to roll back to".to_string(),
+            ));
+        };
+        // Taken first so the discarded work has a name before git deletes it. `None` means the
+        // tree was clean: there was nothing to preserve.
+        match checkpoint_snapshot(checkpoints, &reason) {
+            Ok(Some(safety)) => {
+                record_checkpoint(journal, &self.subtask.id, closed, &safety, "discarded")?;
+            }
+            Ok(None) => {}
+            Err(why) => return Ok(RollBack::Blocked(why)),
+        }
+        // The marker is what makes the crash window between the move and the record below
+        // recoverable: it says "the tree is about to be reset to this SHA", and a journal that
+        // stops after it is a rollback recovery can finish (see `recover`, plan step 4).
+        journal.append_scoped(
+            immortality_core::time::now(),
+            Kind::CheckpointCreated,
+            serde_json::json!({
+                "sha": base.sha,
+                "branch": base.branch,
+                "role": "rollback",
+                "attempt": closed,
+            }),
+            &Scope::attempt(self.subtask.id.clone(), closed),
+        )?;
+        if let Err(why) = checkpoints.restore(&base.sha) {
+            return Ok(RollBack::Blocked(why));
+        }
+        journal.append_scoped(
+            immortality_core::time::now(),
+            Kind::AttemptRestarted,
+            serde_json::json!({
+                "number": closed,
+                "next": closed.saturating_add(1),
+                "cause": cause.as_str(),
+                "why": cause.observation(),
+                "base": base.sha,
+            }),
+            // D-027: `attempt` names the attempt being **closed**; the replacement's number is in
+            // the payload, so every record's `attempt` field means the same thing.
+            &Scope::attempt(self.subtask.id.clone(), closed),
+        )?;
+        Ok(RollBack::Done)
+    }
+}
+
+/// What a session stopped on.
+///
+/// Both fields are mandatory: every stop is reached after an attempt ran, and a stop without the
+/// attempt that caused it is a message a human cannot act on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionEnd {
+    /// The attempt that ended the loop.
+    pub outcome: RunOutcome,
+    /// Why no further attempt is started.
+    pub stop: Stop,
+}
+
+/// What putting the tree back produced.
+enum RollBack {
+    /// The tree is at the base checkpoint.
+    Done,
+    /// The tree could not be put back, and the string is why.
+    Blocked(String),
+}
+
+/// Take a snapshot through the seam, turning a git failure into a reason to stop.
+///
+/// A restart whose snapshot failed must not proceed: the tree is about to be reset, and a reset
+/// that nothing recorded is the one outcome the milestone forbids.
+fn checkpoint_snapshot(
+    checkpoints: &(dyn Checkpoints + Send + Sync),
+    reason: &str,
+) -> Result<Option<restart::Snapshot>, String> {
+    checkpoints.snapshot(reason)
+}
+
+/// Append a `checkpoint_created` record for one attempt's tree state.
+fn record_checkpoint(
+    journal: &mut Journal,
+    subtask: &SubtaskId,
+    attempt: u32,
+    snapshot: &restart::Snapshot,
+    role: &str,
+) -> immortality_core::Result<()> {
+    journal.append_scoped(
+        immortality_core::time::now(),
+        Kind::CheckpointCreated,
+        serde_json::json!({
+            "sha": snapshot.sha,
+            "branch": snapshot.branch,
+            "role": role,
+            "attempt": attempt,
+        }),
+        &Scope::attempt(subtask.clone(), attempt),
+    )?;
     Ok(())
 }
 
@@ -1714,6 +2132,9 @@ mod tests {
             // failed its own gates would make every claim test assert a failure instead.
             gates: Some(Arc::new(FakeGates::green())),
             reviewer: Some(Arc::new(FakeReviewer::approving())),
+            // No git repository in the loop fixtures: a restart that needs a rollback now stops
+            // with a named reason instead of silently pretending it rolled back.
+            checkpoints: None,
         };
         (dir, runner)
     }
@@ -1769,7 +2190,7 @@ mod tests {
     }
 
     impl Gates for FakeGates {
-        fn diff(&self) -> Result<immortality_core::gate::Diff, String> {
+        fn diff(&self, _base: Option<&str>) -> Result<immortality_core::gate::Diff, String> {
             Ok(self.diff.lock().map(|diff| diff.clone()).unwrap_or_default())
         }
 
@@ -3111,5 +3532,574 @@ mod tests {
             assert_eq!(record.fields.subtask.as_ref(), Some(&subtask.id));
             assert_eq!(record.fields.attempt, Some(3));
         }
+    }
+
+    // ── M4.7: the session, restarts, and the strategy they carry ──────────────────────────
+
+    /// A checkpoint world that records what happened instead of running git.
+    ///
+    /// The point of the fake is that the *decisions* of a restart — what is snapshotted, what is
+    /// journalled, in which order — are testable without a repository. The real git path has its
+    /// own tests in `checkpoints.rs`, so a bug in `git reset` cannot hide behind this.
+    #[derive(Debug, Default)]
+    struct FakeCheckpoints {
+        /// Shas handed out, in order.
+        taken: Mutex<Vec<String>>,
+        /// Shas the tree was moved to, in order.
+        restored: Mutex<Vec<String>>,
+        /// Every call, in the order it was made, as `snapshot:<n>` / `restore:<sha>`.
+        calls: Mutex<Vec<String>>,
+        /// When set, `restore` fails with this reason.
+        refuse: Mutex<Option<String>>,
+        /// When true, `snapshot` reports a clean tree (no SHA to record).
+        clean: Mutex<bool>,
+        /// Journal directory to read at `restore` time, when the test is about durability.
+        ///
+        /// The ordering rule is "journal, then move", and the only way to test it is to look at
+        /// what is *on disk* at the instant the move happens. Reading the in-memory `Journal`
+        /// would be blind to the `fsync` the rule is actually about.
+        watching: Mutex<Option<std::path::PathBuf>>,
+        /// Whether the rollback marker was already on disk when `restore` was called.
+        marker_seen: Mutex<Option<bool>>,
+    }
+
+    impl FakeCheckpoints {
+        fn new() -> Arc<Self> {
+            Arc::new(Self::default())
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().map(|calls| calls.clone()).unwrap_or_default()
+        }
+
+        fn restored(&self) -> Vec<String> {
+            self.restored.lock().map(|shas| shas.clone()).unwrap_or_default()
+        }
+
+        fn refusing(reason: &str) -> Arc<Self> {
+            let fake = Self::new();
+            if let Ok(mut refuse) = fake.refuse.lock() {
+                *refuse = Some(reason.to_string());
+            }
+            fake
+        }
+
+        fn watching(journal_dir: impl Into<std::path::PathBuf>) -> Arc<Self> {
+            let fake = Self::new();
+            if let Ok(mut watching) = fake.watching.lock() {
+                *watching = Some(journal_dir.into());
+            }
+            fake
+        }
+
+        fn marker_seen(&self) -> Option<bool> {
+            self.marker_seen.lock().ok().and_then(|seen| *seen)
+        }
+
+        fn snapshot_count(&self) -> usize {
+            self.calls.lock().map_or(0, |calls| {
+                calls.iter().filter(|call| call.starts_with("snapshot:")).count()
+            })
+        }
+    }
+
+    impl Checkpoints for FakeCheckpoints {
+        fn snapshot(&self, reason: &str) -> Result<Option<restart::Snapshot>, String> {
+            let clean = self.clean.lock().is_ok_and(|clean| *clean);
+            if let Ok(mut calls) = self.calls.lock() {
+                calls.push(format!("snapshot:{reason}"));
+            }
+            if clean {
+                return Ok(None);
+            }
+            let sha = self.taken.lock().map_or(0, |taken| taken.len());
+            let sha = format!("ckpt-{sha}");
+            if let Ok(mut taken) = self.taken.lock() {
+                taken.push(sha.clone());
+            }
+            Ok(Some(restart::Snapshot {
+                sha,
+                branch: "agent-ckpt/tsk".to_string(),
+            }))
+        }
+
+        fn restore(&self, sha: &str) -> Result<(), String> {
+            if let Ok(mut calls) = self.calls.lock() {
+                calls.push(format!("restore:{sha}"));
+            }
+            // Snapshot the journal as it is right now, before anything else changes.
+            if let Ok(watching) = self.watching.lock()
+                && let Some(dir) = watching.as_ref()
+            {
+                let seen = std::fs::read_dir(dir).is_ok_and(|entries| {
+                    entries.filter_map(Result::ok).any(|entry| {
+                        std::fs::read_to_string(entry.path()).is_ok_and(|text| {
+                            text.contains("\"role\":\"rollback\"") || text.contains("\"role\": \"rollback\"")
+                        })
+                    })
+                });
+                if let Ok(mut marker) = self.marker_seen.lock() {
+                    *marker = Some(seen);
+                }
+            }
+            if let Ok(refuse) = self.refuse.lock()
+                && let Some(reason) = refuse.as_ref()
+            {
+                return Err(reason.clone());
+            }
+            if let Ok(mut restored) = self.restored.lock() {
+                restored.push(sha.to_string());
+            }
+            Ok(())
+        }
+    }
+
+    fn with_checkpoints(mut runner: Runner, fake: Arc<FakeCheckpoints>) -> Runner {
+        runner.checkpoints = Some(fake);
+        runner
+    }
+
+    fn allowance(attempts: u32, restarts: u32) -> Allowance {
+        Allowance {
+            attempts_left: attempts,
+            restarts_left: restarts,
+        }
+    }
+
+    /// A model that spends its whole step budget without claiming anything.
+    fn looping_replies(count: usize) -> Vec<Result<Reply, String>> {
+        (0..count)
+            .map(|index| Ok(Reply::call(format!("call_{index}"), "touch", r#"{"path":"a"}"#)))
+            .collect()
+    }
+
+    #[test]
+    fn a_restart_rolls_the_tree_back_and_journals_both_checkpoints() {
+        // The milestone's core claim: rollback plus retry happens, and what was thrown away has a
+        // name in the journal *before* the tree moves. The call order is the assertion — a
+        // snapshot after the restore would name a tree that no longer exists.
+        let checkpoints = FakeCheckpoints::new();
+        let mut replies = looping_replies(2);
+        replies.push(Ok(finish()));
+        let (dir, mut runner) = runner(Scripted::new(replies), registry(vec![Arc::new(Touch)]));
+        runner.limits.max_steps = 2;
+        runner = with_checkpoints(runner, Arc::clone(&checkpoints));
+        let mut journal = journal(&dir);
+        let end = runner
+            .session(&subtask(), 1)
+            .drive(allowance(3, 1), &mut journal)
+            .expect("session");
+
+        assert_eq!(checkpoints.restored(), vec!["ckpt-0".to_string()]);
+        // base, then the discarded work, then the move: no snapshot after the restore.
+        let calls = checkpoints.calls();
+        assert_eq!(calls.len(), 3, "{calls:?}");
+        assert!(calls[0].starts_with("snapshot:base for a restart"), "{calls:?}");
+        assert!(calls[1].starts_with("snapshot:L3 restart"), "{calls:?}");
+        assert_eq!(calls[2], "restore:ckpt-0");
+        // And the second attempt inherited the base it was rolled back to.
+        let outcome = end.outcome;
+        assert_eq!(outcome.attempt.number, 2, "{:?}", outcome.attempt);
+        assert!(end.stop == Stop::Done || matches!(end.stop, Stop::Done));
+    }
+
+    #[test]
+    fn the_restart_record_names_the_closed_attempt_and_its_replacement() {
+        // D-027's convention: `attempt` is the attempt being closed, the replacement is in the
+        // payload. Recovery keys attempts by that field, so a swapped pair would close the wrong
+        // one and leave the real attempt running forever.
+        let checkpoints = FakeCheckpoints::new();
+        let mut replies = looping_replies(2);
+        replies.push(Ok(finish()));
+        let (dir, mut runner) = runner(Scripted::new(replies), registry(vec![Arc::new(Touch)]));
+        runner.limits.max_steps = 2;
+        runner = with_checkpoints(runner, Arc::clone(&checkpoints));
+        let mut journal = journal(&dir);
+        runner
+            .session(&subtask(), 1)
+            .drive(allowance(3, 1), &mut journal)
+            .expect("session");
+
+        let restart = journal_records(&dir)
+            .into_iter()
+            .find(|record| record.fields.kind == Kind::AttemptRestarted)
+            .expect("a restart record");
+        assert_eq!(restart.fields.attempt, Some(1), "the attempt being closed");
+        assert_eq!(restart.event.payload["next"], serde_json::json!(2));
+        assert_eq!(restart.event.payload["cause"], serde_json::json!("steps"));
+        assert!(
+            restart.event.payload["why"]
+                .as_str()
+                .is_some_and(|why| !why.is_empty())
+        );
+    }
+
+    #[test]
+    fn the_checkpoint_records_name_the_base_and_the_discarded_work() {
+        // A human told "your work was rolled back" must be able to find it. The two records carry
+        // different roles for exactly that reason.
+        let checkpoints = FakeCheckpoints::new();
+        let mut replies = looping_replies(2);
+        replies.push(Ok(finish()));
+        let (dir, mut runner) = runner(Scripted::new(replies), registry(vec![Arc::new(Touch)]));
+        runner.limits.max_steps = 2;
+        runner = with_checkpoints(runner, Arc::clone(&checkpoints));
+        let mut journal = journal(&dir);
+        runner
+            .session(&subtask(), 1)
+            .drive(allowance(3, 1), &mut journal)
+            .expect("session");
+
+        let roles: Vec<String> = journal_records(&dir)
+            .into_iter()
+            .filter(|record| record.fields.kind == Kind::CheckpointCreated)
+            .filter_map(|record| record.event.payload["role"].as_str().map(str::to_string))
+            .collect();
+        // The third record is the marker written *before* the move, which is what makes a crash
+        // between the move and the `attempt_restarted` record recoverable.
+        assert_eq!(
+            roles,
+            vec![
+                "base".to_string(),
+                "discarded".to_string(),
+                "rollback".to_string(),
+            ],
+            "{roles:?}"
+        );
+        let shas: Vec<String> = journal_records(&dir)
+            .into_iter()
+            .filter(|record| record.fields.kind == Kind::CheckpointCreated)
+            .filter_map(|record| record.event.payload["sha"].as_str().map(str::to_string))
+            .collect();
+        assert_eq!(
+            shas,
+            vec!["ckpt-0".to_string(), "ckpt-1".to_string(), "ckpt-0".to_string(),],
+            "the marker repeats the base it is about to move to"
+        );
+    }
+
+    #[test]
+    fn a_restarted_attempt_gets_a_strategy_that_forbids_the_previous_one() {
+        // The whole reason a restart is worth a rollback: the next brief is not the same brief.
+        // The assertion reads the brief the model actually received, not the function's output.
+        let checkpoints = FakeCheckpoints::new();
+        let mut replies = looping_replies(2);
+        replies.push(Ok(finish()));
+        let model = Scripted::new(replies);
+        let (dir, mut runner) = runner(
+            Arc::clone(&model) as Arc<dyn Model>,
+            registry(vec![Arc::new(Touch)]),
+        );
+        runner.limits.max_steps = 2;
+        runner = with_checkpoints(runner, Arc::clone(&checkpoints));
+        let mut journal = journal(&dir);
+        runner
+            .session(&subtask(), 1)
+            .drive(allowance(3, 1), &mut journal)
+            .expect("session");
+
+        let requests = model.requests();
+        let second_attempt = requests.last().expect("a second attempt ran");
+        let system = second_attempt.messages[0].content.as_deref().unwrap_or("");
+        assert!(system.contains("## Strategy for this attempt"), "{system}");
+        assert!(system.contains("fresh attempt"), "{system}");
+        assert!(system.contains("ran out of steps"), "{system}");
+        // The first attempt had no strategy section at all.
+        let first = requests[1].messages[0].content.as_deref().unwrap_or("");
+        assert!(!first.contains("## Strategy for this attempt"), "{first}");
+    }
+
+    #[test]
+    fn a_rejected_claim_retries_without_rolling_the_tree_back() {
+        // The gate read the diff and named what is wrong. Rolling it away throws away the closest
+        // thing to a finished subtask; the retry must keep the tree.
+        let checkpoints = FakeCheckpoints::new();
+        let model = Scripted::new(vec![Ok(finish()), Ok(finish()), Ok(finish())]);
+        let (dir, mut runner) = runner(model, registry(vec![Arc::new(Touch)]));
+        runner = with_checkpoints(runner, Arc::clone(&checkpoints));
+        runner.gates = Some(Arc::new(FakeGates::default()));
+        runner.reviewer = Some(Arc::new(FakeReviewer::rejecting("the error branch is untested")));
+        let mut journal = journal(&dir);
+        let end = runner
+            .session(&subtask(), 1)
+            .drive(allowance(2, 2), &mut journal)
+            .expect("session");
+
+        assert_eq!(end.outcome.attempt.number, 2, "{:?}", end.outcome.attempt);
+        assert_eq!(
+            checkpoints.restored(),
+            Vec::<String>::new(),
+            "a rejected claim must not roll back"
+        );
+        // The second attempt's brief quotes the gate's own words.
+        assert_eq!(end.outcome.attempt.failure, Some(FailureReason::ReviewRejected));
+    }
+
+    #[test]
+    fn a_restart_that_cannot_move_the_tree_stops_instead_of_lying() {
+        // A git failure after the attempt was closed cannot be papered over: the next attempt
+        // would build on a tree nobody put back.
+        let checkpoints = FakeCheckpoints::refusing("the tree is locked by another process");
+        let mut replies = looping_replies(2);
+        replies.push(Ok(finish()));
+        let (dir, mut runner) = runner(Scripted::new(replies), registry(vec![Arc::new(Touch)]));
+        runner.limits.max_steps = 2;
+        runner = with_checkpoints(runner, Arc::clone(&checkpoints));
+        let mut journal = journal(&dir);
+        let end = runner
+            .session(&subtask(), 1)
+            .drive(allowance(3, 2), &mut journal)
+            .expect("session");
+
+        let Stop::Blocked(reason) = &end.stop else {
+            panic!("expected a block, got {:?}", end.stop);
+        };
+        assert!(reason.contains("locked"), "{reason}");
+        // The failed attempt is the last one that ran; nothing was started on top of it.
+        assert_eq!(end.outcome.attempt.number, 1);
+    }
+
+    #[test]
+    fn the_restart_is_journalled_before_the_replacement_attempt_starts() {
+        // Recovery reads this order: the marker, then the confirmation, then the next attempt. A
+        // crash between any two of these is a case the journal has to be able to describe, and an
+        // `attempt_restarted` written after the new attempt started would leave a window in which
+        // two attempts look live at once.
+        let checkpoints = FakeCheckpoints::new();
+        let mut replies = looping_replies(2);
+        replies.push(Ok(finish()));
+        let (dir, mut runner) = runner(Scripted::new(replies), registry(vec![Arc::new(Touch)]));
+        runner.limits.max_steps = 2;
+        runner = with_checkpoints(runner, Arc::clone(&checkpoints));
+        let mut journal = journal(&dir);
+        runner
+            .session(&subtask(), 1)
+            .drive(allowance(3, 1), &mut journal)
+            .expect("session");
+
+        let kinds: Vec<&'static str> = journal_records(&dir)
+            .into_iter()
+            .map(|record| record.fields.kind.as_str())
+            .collect();
+        let marker = kinds
+            .iter()
+            .position(|kind| *kind == "checkpoint_created")
+            .expect("a checkpoint");
+        let restarted = kinds
+            .iter()
+            .position(|kind| *kind == "attempt_restarted")
+            .expect("a restart");
+        let second = kinds
+            .iter()
+            .rposition(|kind| *kind == "attempt_started")
+            .expect("the second attempt");
+        assert!(marker < restarted, "{kinds:?}");
+        assert!(restarted < second, "{kinds:?}");
+    }
+
+    #[test]
+    fn a_second_restart_does_not_quote_the_generated_strategy_back_at_the_model() {
+        // The seed is quoted, never the generated text. Quoting the generated text nests the same
+        // advice inside itself once per attempt, and after three restarts the brief is mostly its
+        // own previous advice — the exact token waste the restart was meant to avoid.
+        let checkpoints = FakeCheckpoints::new();
+        let model = Scripted::new(looping_replies(3));
+        let (dir, mut runner) = runner(
+            Arc::clone(&model) as Arc<dyn Model>,
+            registry(vec![Arc::new(Touch)]),
+        );
+        runner.limits.max_steps = 1;
+        runner = with_checkpoints(runner, Arc::clone(&checkpoints));
+        let mut journal = journal(&dir);
+        runner
+            .session(&subtask(), 1)
+            .with_strategy("write the parser bottom-up")
+            .drive(allowance(3, 3), &mut journal)
+            .expect("session");
+
+        let last = model.requests().last().expect("a third attempt").clone();
+        let system = last.messages[0].content.as_deref().unwrap_or("");
+        assert_eq!(
+            system.matches("This is a fresh attempt").count(),
+            1,
+            "the generated strategy must not be nested: {system}"
+        );
+        assert_eq!(
+            system.matches("write the parser bottom-up").count(),
+            1,
+            "the seed is quoted once: {system}"
+        );
+        // Both earlier attempts' failures are still carried: the accumulated list is the part
+        // that changes between attempts.
+        assert!(system.contains("attempt 1:"), "{system}");
+        assert!(system.contains("attempt 2:"), "{system}");
+    }
+
+    #[test]
+    fn the_rollback_marker_is_on_disk_before_the_tree_moves() {
+        // The durability half of the ordering rule. A marker buffered in memory would leave a
+        // crash between the reset and the flush with a moved tree and no record of where it came
+        // from; the fake reads the journal directory at `restore` time to prove it is not.
+        let mut replies = looping_replies(2);
+        replies.push(Ok(finish()));
+        let (dir, mut runner) = runner(Scripted::new(replies), registry(vec![Arc::new(Touch)]));
+        runner.limits.max_steps = 2;
+        let watcher = FakeCheckpoints::watching(dir.path().join("journal"));
+        runner = with_checkpoints(runner, Arc::clone(&watcher));
+        let mut journal = journal(&dir);
+        runner
+            .session(&subtask(), 1)
+            .drive(allowance(3, 1), &mut journal)
+            .expect("session");
+
+        assert_eq!(
+            watcher.marker_seen(),
+            Some(true),
+            "the rollback marker must be on disk before git is asked to move the tree"
+        );
+        let markers = journal_records(&dir)
+            .into_iter()
+            .filter(|record| record.fields.kind == Kind::CheckpointCreated)
+            .filter(|record| record.event.payload["role"] == serde_json::json!("rollback"))
+            .count();
+        assert_eq!(markers, 1, "one marker per restart");
+    }
+
+    #[test]
+    fn a_restart_without_a_checkpoint_world_stops_with_a_named_reason() {
+        // `checkpoints: None` is "nothing can put the tree back". Claiming an L3 anyway would be
+        // the exact bypass the seam exists to prevent.
+        let mut replies = looping_replies(2);
+        replies.push(Ok(finish()));
+        let (dir, mut runner) = runner(Scripted::new(replies), registry(vec![Arc::new(Touch)]));
+        runner.limits.max_steps = 2;
+        let mut journal = journal(&dir);
+        let end = runner
+            .session(&subtask(), 1)
+            .drive(allowance(3, 2), &mut journal)
+            .expect("session");
+
+        assert!(
+            matches!(&end.stop, Stop::Blocked(reason) if reason.contains("checkpoint world")),
+            "{:?}",
+            end.stop
+        );
+    }
+
+    #[test]
+    fn the_attempt_budget_stops_the_session_and_burns_no_tokens_on_a_last_try() {
+        // Three attempts exist, the fourth must not start: the session may not spend a step after
+        // the budget is gone, and the stop must say the budget ran out.
+        let checkpoints = FakeCheckpoints::new();
+        let replies = looping_replies(10);
+        let model = Scripted::new(replies);
+        let (dir, mut runner) = runner(
+            Arc::clone(&model) as Arc<dyn Model>,
+            registry(vec![Arc::new(Touch)]),
+        );
+        runner.limits.max_steps = 1;
+        runner = with_checkpoints(runner, Arc::clone(&checkpoints));
+        let mut journal = journal(&dir);
+        let end = runner
+            .session(&subtask(), 1)
+            .drive(allowance(2, 5), &mut journal)
+            .expect("session");
+
+        assert_eq!(end.outcome.attempt.number, 2);
+        assert!(matches!(end.stop, Stop::Exhausted(_)), "{:?}", end.stop);
+        // Two attempts ran, so the third step was never asked for.
+        assert_eq!(model.requests().len(), 2, "{:?}", end.stop);
+    }
+
+    #[test]
+    fn a_verified_claim_ends_the_session_without_a_restart() {
+        let checkpoints = FakeCheckpoints::new();
+        let (dir, mut runner) = runner(Scripted::new(vec![Ok(finish())]), registry(vec![Arc::new(Touch)]));
+        runner = with_checkpoints(runner, Arc::clone(&checkpoints));
+        let mut journal = journal(&dir);
+        let end = runner
+            .session(&subtask(), 1)
+            .drive(allowance(3, 2), &mut journal)
+            .expect("session");
+
+        assert_eq!(end.stop, Stop::Done);
+        assert!(end.outcome.verified(), "{:?}", end.outcome.gates);
+        assert_eq!(checkpoints.snapshot_count(), 0, "nothing to snapshot");
+    }
+
+    #[test]
+    fn an_interrupted_attempt_ends_the_session_rather_than_spending_a_restart() {
+        // A backend outage is D-027's case: the same attempt resumes later, with its conversation
+        // replayed from the journal, and no restart budget is spent.
+        let checkpoints = FakeCheckpoints::new();
+        let (dir, mut runner) = runner(
+            Scripted::new(vec![Err("connection refused".to_string())]),
+            registry(vec![Arc::new(Touch)]),
+        );
+        runner = with_checkpoints(runner, Arc::clone(&checkpoints));
+        let mut journal = journal(&dir);
+        let end = runner
+            .session(&subtask(), 1)
+            .drive(allowance(3, 2), &mut journal)
+            .expect("session");
+
+        assert_eq!(end.stop, Stop::Abandoned);
+        assert_eq!(end.outcome.attempt.state, AttemptState::Abandoned);
+        assert_eq!(checkpoints.restored(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_restarted_attempt_records_the_checkpoint_it_was_rolled_back_to() {
+        // The gate evaluation narrows its diff to this attempt's base, so the attempt has to
+        // carry the SHA. Without it every restarted attempt is reviewed on the whole task.
+        let checkpoints = FakeCheckpoints::new();
+        let mut replies = looping_replies(2);
+        replies.push(Ok(finish()));
+        let (dir, mut runner) = runner(Scripted::new(replies), registry(vec![Arc::new(Touch)]));
+        runner.limits.max_steps = 2;
+        runner = with_checkpoints(runner, Arc::clone(&checkpoints));
+        let mut journal = journal(&dir);
+        let end = runner
+            .session(&subtask(), 1)
+            .drive(allowance(3, 1), &mut journal)
+            .expect("session");
+
+        assert_eq!(end.outcome.base_checkpoint.as_deref(), Some("ckpt-0"));
+        assert_eq!(end.outcome.attempt.base_checkpoint.as_deref(), Some("ckpt-0"));
+    }
+
+    #[test]
+    fn a_resumed_subtask_starts_from_the_report_it_inherited() {
+        // A restart after a daemon crash must not make the model re-propose what was already
+        // rejected: the report is the only channel between attempts.
+        let checkpoints = FakeCheckpoints::new();
+        let mut replies = looping_replies(2);
+        replies.push(Ok(finish()));
+        let model = Scripted::new(replies);
+        let (dir, mut runner) = runner(
+            Arc::clone(&model) as Arc<dyn Model>,
+            registry(vec![Arc::new(Touch)]),
+        );
+        runner.limits.max_steps = 2;
+        runner = with_checkpoints(runner, Arc::clone(&checkpoints));
+        let mut journal = journal(&dir);
+        let mut report = SubtaskReport::new("nothing yet");
+        report
+            .rejected_ideas
+            .push("regenerating the parser from scratch".to_string());
+        runner
+            .session(&subtask(), 2)
+            .resuming_from(report)
+            .drive(allowance(3, 1), &mut journal)
+            .expect("session");
+
+        let requests = model.requests();
+        let second = requests.last().expect("a second attempt");
+        let system = second.messages[0].content.as_deref().unwrap_or("");
+        assert!(
+            system.contains("regenerating the parser from scratch"),
+            "{system}"
+        );
+        assert!(system.contains("Do not propose them again"), "{system}");
     }
 }

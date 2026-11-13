@@ -422,6 +422,11 @@ pub fn plan(input: &RecoveryInput<'_>, prober: &impl Prober) -> RecoveryReport {
     let mut calls = Vec::new();
     let mut actions = Vec::new();
     let mut rollbacks = Vec::new();
+    // Goes first in the rollback list because it describes a rollback the runner had already
+    // decided on before the crash: it is not speculation about an unfinished call.
+    if let Some(step) = interrupted_rollback(input, &mut verdict) {
+        rollbacks.push(step);
+    }
     for FoundOpenCall { open, .. } in crate::protocol::open_calls(&input.journal.records) {
         let recovered = reclaim_call(&open, prober, input, &mut actions, &mut rollbacks, &mut verdict);
         calls.push(recovered);
@@ -614,6 +619,61 @@ fn reclaim_call(
     }
 
     CallRecovery { call, action, effect }
+}
+
+/// The rollback an interrupted L3 restart had already committed to, if there is one.
+///
+/// An L3 restart writes a marker before it moves the tree and `attempt_restarted` after. A crash
+/// between the two leaves the tree in one of two states — the failed attempt's work, or the base —
+/// and both are acceptable only if the next attempt starts from the base. Returns `None` when
+/// there is nothing to restore, which is not an error: it is the normal case.
+fn interrupted_rollback(input: &RecoveryInput<'_>, verdict: &mut Verdict) -> Option<RecoveryStep> {
+    let sha = interrupted_restart(input)?;
+    *verdict = Verdict::Repaired;
+    Some(RecoveryStep::RollbackToCheckpoint {
+        sha,
+        reason: "an L3 restart was interrupted before it recorded the rollback".to_string(),
+    })
+}
+
+/// The base of an L3 restart that was journalled but never completed.
+///
+/// The runner writes `checkpoint_created {role: "rollback", sha: <base>}` before it moves the
+/// tree and `attempt_restarted` after. A crash between the two leaves a `reset` whose outcome
+/// nobody knows, and the pair is the only evidence of it: the marker names the tree to restore,
+/// and the missing `attempt_restarted` is what says the move was never confirmed.
+///
+/// Only the latest marker for an attempt can be interrupted — an earlier one whose restart *did*
+/// complete has its `attempt_restarted` record after it — so the search walks backwards and stops
+/// at the first `attempt_restarted`.
+fn interrupted_restart(input: &RecoveryInput<'_>) -> Option<String> {
+    // Walked backwards, so an `attempt_restarted` is seen before the marker it confirms.
+    let mut confirmed = BTreeSet::new();
+    for record in input.journal.records.iter().rev() {
+        let (Some(subtask), Some(attempt)) = (record.fields.subtask.clone(), record.fields.attempt) else {
+            continue;
+        };
+        let key = (subtask, attempt);
+        match record.fields.kind {
+            Kind::AttemptRestarted => {
+                confirmed.insert(key);
+            }
+            Kind::CheckpointCreated
+                if record.event.payload.get("role").and_then(|role| role.as_str()) == Some("rollback") =>
+            {
+                if confirmed.contains(&key) {
+                    continue;
+                }
+                // A marker without a SHA names nothing to restore, so it is not evidence of a
+                // rollback: the runner writes the SHA in the same record.
+                if let Some(sha) = record.event.payload.get("sha").and_then(|sha| sha.as_str()) {
+                    return Some(sha.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Attempts the journal started and never closed.
@@ -1988,5 +2048,166 @@ mod tests {
         };
         assert!(summary.contains("blocked"), "{summary}");
         assert!(summary.contains("chain broken"), "{summary}");
+    }
+
+    // ── interrupted L3 restarts ───────────────────────────────────────────────────────────
+
+    fn checkpoint_record(seq: u64, attempt: u32, role: &str, sha: &str) -> JournalRecord {
+        scoped(
+            seq,
+            attempt,
+            Kind::CheckpointCreated,
+            serde_json::json!({ "sha": sha, "branch": "agent-ckpt/tsk_01", "role": role }),
+        )
+    }
+
+    fn restarted(seq: u64, attempt: u32, next: u32) -> JournalRecord {
+        scoped(
+            seq,
+            attempt,
+            Kind::AttemptRestarted,
+            serde_json::json!({ "number": attempt, "next": next, "cause": "d3" }),
+        )
+    }
+
+    #[test]
+    fn a_marker_without_its_restart_record_plans_the_rollback() {
+        // The crash window the marker exists for: the journal names the tree to restore, and the
+        // missing `attempt_restarted` says the move was never confirmed.
+        let journal = outcome(vec![
+            scoped(0, 1, Kind::AttemptStarted, serde_json::json!({})),
+            checkpoint_record(1, 1, "base", "base-1"),
+            checkpoint_record(2, 1, "rollback", "base-1"),
+        ]);
+        let report = plan(
+            &input(
+                &journal,
+                WorkspaceFacts::healthy("agent/tsk_01", "abc123").dirty(),
+                PersistedState::default(),
+            ),
+            &NoProbe,
+        );
+
+        let sha = report
+            .steps
+            .iter()
+            .find_map(|step| match step {
+                RecoveryStep::RollbackToCheckpoint { sha, .. } => Some(sha.clone()),
+                _ => None,
+            })
+            .expect("a rollback");
+        assert_eq!(sha, "base-1");
+        assert_eq!(report.verdict, Verdict::Repaired);
+    }
+
+    #[test]
+    fn a_confirmed_restart_is_not_planned_again() {
+        // The record after the move is the confirmation. Rolling back a second time would take the
+        // new attempt's own work away from it, from a SHA it has already been reset to.
+        let journal = outcome(vec![
+            scoped(0, 1, Kind::AttemptStarted, serde_json::json!({})),
+            checkpoint_record(1, 1, "rollback", "base-1"),
+            restarted(2, 1, 2),
+        ]);
+        let report = plan(
+            &input(
+                &journal,
+                WorkspaceFacts::healthy("agent/tsk_01", "abc123"),
+                PersistedState::default(),
+            ),
+            &NoProbe,
+        );
+        assert!(
+            !report
+                .steps
+                .iter()
+                .any(|step| matches!(step, RecoveryStep::RollbackToCheckpoint { .. })),
+            "{:?}",
+            report.steps
+        );
+    }
+
+    #[test]
+    fn only_the_newest_unconfirmed_marker_is_restored() {
+        // Two restarts, the first confirmed. The second attempt's marker is the one the crash
+        // left behind, and restoring the first one would replay work an attempt has already
+        // superseded.
+        let journal = outcome(vec![
+            scoped(0, 1, Kind::AttemptStarted, serde_json::json!({})),
+            checkpoint_record(1, 1, "rollback", "base-1"),
+            restarted(2, 1, 2),
+            scoped(3, 2, Kind::AttemptStarted, serde_json::json!({})),
+            checkpoint_record(4, 2, "rollback", "base-2"),
+        ]);
+        let report = plan(
+            &input(
+                &journal,
+                WorkspaceFacts::healthy("agent/tsk_01", "abc123"),
+                PersistedState::default(),
+            ),
+            &NoProbe,
+        );
+        let shas: Vec<String> = report
+            .steps
+            .iter()
+            .filter_map(|step| match step {
+                RecoveryStep::RollbackToCheckpoint { sha, .. } => Some(sha.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(shas, vec!["base-2".to_string()]);
+    }
+
+    #[test]
+    fn a_marker_without_a_sha_is_not_a_rollback() {
+        // A malformed record must not become a reason to reset the tree to nowhere.
+        let journal = outcome(vec![scoped(
+            0,
+            1,
+            Kind::CheckpointCreated,
+            serde_json::json!({ "role": "rollback" }),
+        )]);
+        let report = plan(
+            &input(
+                &journal,
+                WorkspaceFacts::healthy("agent/tsk_01", "abc123"),
+                PersistedState::default(),
+            ),
+            &NoProbe,
+        );
+        assert!(
+            !report
+                .steps
+                .iter()
+                .any(|step| matches!(step, RecoveryStep::RollbackToCheckpoint { .. })),
+            "{:?}",
+            report.steps
+        );
+    }
+
+    #[test]
+    fn an_interrupted_restart_also_closes_the_attempt_it_closed() {
+        // The attempt was ended by the restart, so the rollback implies abandoning it. Leaving it
+        // `Running` is exactly the state recovery exists to clear.
+        let journal = outcome(vec![
+            scoped(0, 1, Kind::AttemptStarted, serde_json::json!({})),
+            checkpoint_record(1, 1, "rollback", "base-1"),
+        ]);
+        let report = plan(
+            &input(
+                &journal,
+                WorkspaceFacts::healthy("agent/tsk_01", "abc123"),
+                PersistedState::default(),
+            ),
+            &NoProbe,
+        );
+        assert!(
+            report
+                .steps
+                .iter()
+                .any(|step| matches!(step, RecoveryStep::AbandonAttempt { number: 1, .. })),
+            "{:?}",
+            report.steps
+        );
     }
 }

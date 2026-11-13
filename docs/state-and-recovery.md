@@ -89,7 +89,7 @@ logs/2026-10.log.gz      # архивы по месяцам
 | `plan_written`, `plan_edited`, `plan_approved` | планирование |
 | `subtask_state` | смена состояния подзадачи |
 | `subtask_split` | дробление: родитель в `Skipped`, дети в `Pending`; пишется **после** `TASKS.json`, чтобы крах между записями оставлял корректное дерево, а не журнал о несуществующих детях (D-078) |
-| `attempt_started`, `attempt_failed`, `attempt_restarted` | попытки |
+| `attempt_started`, `attempt_failed`, `attempt_restarted` | попытки; у `attempt_restarted` поле `attempt` — закрываемая попытка, номер замены в payload (`next`), там же `cause`, `why`, `base` (D-027, D-080) |
 | `model_request`, `model_response`, `model_stream_aborted` | инференс (метаданные; тело — в artifacts) |
 | `native_toolcall`, `text_fallback`, `invalid_toolcall` | качество протокола |
 | `tool_call_intent` | **до** исполнения: имя, аргументы, idempotency, ожидаемый эффект |
@@ -97,7 +97,7 @@ logs/2026-10.log.gz      # архивы по месяцам
 | `tool_call_completed` / `tool_call_failed` | результат (тело — в artifact) |
 | `tool_call_unknown` | процесс умер, эффект неизвестен |
 | `effect_verified` / `effect_absent` | результат probe после сбоя |
-| `checkpoint_created` | git-чекпоинт и его SHA |
+| `checkpoint_created` | git-чекпоинт, его SHA и `role` (`base` / `discarded` / `rollback`); `rollback` без последующего `attempt_restarted` — незавершённый откат (D-080) |
 | `detector_fired` | `d1`…`d5`, уровень `l1`…`l3`, счётчик-метрика; одна запись на шаг (D-077) |
 | `compaction` | компактация контекста |
 | `gate_result` | один гейт: тег `gate` — `sanity` (находки), `check` (id, команда, код, длительность, required), `review` (одобрено, проблемы) или `verdict` (прошло, причина, почему). Вердикт всегда последний; `gate: verdict` + `passed: true` закрывает попытку и в recovery (D-079) |
@@ -174,8 +174,20 @@ tool_call_completed → exit_code, output_artifact, duration
 Откат (L3) = `git reset --hard <ckpt-sha>` в worktree задачи + восстановление состояния
 подзадачи к последнему консистентному снимку. Мгновенно и без мусора в истории.
 
-Перед `git reset --hard` незакоммиченные изменения складываются в `git stash` с меткой
-попытки, чтобы не потерять данные, которые могут пригодиться.
+Незакоммиченная работа **не теряется**: перед `reset --hard` раннер пишет её в скрытый
+чекпоинт и записывает SHA в журнал. Порядок жёсткий — **снимок, журнал, перемещение**:
+
+| `role` в `checkpoint_created` | Когда | Что значит |
+| --- | --- | --- |
+| `base` | перед первым откатом подзадачи | дерево, к которому возвращаются все последующие откаты |
+| `discarded` | перед `reset` | работа, которую откат вот-вот выбросит |
+| `rollback` | перед `reset`, после `discarded` | маркер: «дерево сейчас будет сброшено на этот SHA» |
+
+`attempt_restarted` пишется **после** `reset`. Если на диске есть `rollback` и нет
+`attempt_restarted` для той же пары `(subtask, attempt)`, крах случился внутри откатa:
+recovery планирует `RollbackToCheckpoint` на названный SHA, а `rolling_back` добавляет
+`AbandonAttempt`. Так окно «маркер записан — дерево не переехало или переехало» перестаёт
+быть невидимым.
 
 ## 5. Восстановление после креша
 
@@ -194,9 +206,14 @@ tool_call_completed → exit_code, output_artifact, duration
 4. **Проверить worktree**: существует ли, на каком SHA, есть ли незакоммиченные изменения.
    Если worktree потерян — пересоздать из `agent/<task>`; если ветки нет — из базовой ветки
    и `checkpoint_created` последнего чекпоинта.
-5. **Сверить состояние подзадач** с файлами: `attempts.json` vs журнал. Победитель — журнал.
-6. **Записать** `daemon_recovered` с описанием, что именно пришлось чинить.
-7. Продолжить с места остановки: следующая подзадача или новая попытка текущей.
+5. **Найти незавершённый откат L3**: `checkpoint_created {role:"rollback"}` без
+   последующего `attempt_restarted` для той же `(subtask, attempt)`. Такой SHA ставится
+   первым в список откатов (он описывает решение, уже принятое раннером, а не догадку о
+   незакрытом вызове), а попытка закрывается `AbandonAttempt`. Маркер без `sha` — не
+   доказательство откатa: сбрасывать дерево «в никуда» нельзя.
+6. **Сверить состояние подзадач** с файлами: `attempts.json` vs журнал. Победитель — журнал.
+7. **Записать** `daemon_recovered` с описанием, что именно пришлось чинить.
+8. Продолжить с места остановки: следующая подзадача или новая попытка текущей.
 
 Всё это покрыто тестами-симуляторами с инъекцией падения в каждой точке протокола
 (между `intent` и `started`, между `started` и `completed`, во время записи журнала,

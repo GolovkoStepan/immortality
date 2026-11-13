@@ -45,8 +45,14 @@ impl CommandRun {
 /// and the worktree, not about whether the machine happens to be able to execute it, and keeping
 /// them apart is what makes "a refused check is not a passing check" expressible.
 pub trait Gates {
-    /// The change under review.
-    fn diff(&self) -> Result<Diff, String>;
+    /// The change under review, against `base`.
+    ///
+    /// `base` is the commit a restarted attempt rolled back to, when the caller knows it. `None`
+    /// means "against `HEAD`", which is broader and therefore safe: an over-wide diff costs a
+    /// reviewer some reading, an under-wide one approves work nobody saw. The parameter is here
+    /// rather than on the implementation because it changes *per attempt*, and a gate world built
+    /// once per task would otherwise have to be rebuilt after every restart just to move a SHA.
+    fn diff(&self, base: Option<&str>) -> Result<Diff, String>;
 
     /// Whether the policy allows this command, or why not.
     fn authorise(&self, command: &str) -> Result<(), String>;
@@ -75,8 +81,13 @@ pub trait Reviewer {
 /// Only when the diff cannot be produced. Everything after that is a `GateReport`, because "the
 /// command failed" and "the reviewer said no" are verdicts, not errors — and a caller that treats
 /// them as errors ends up with a subtask that neither closes nor fails.
-pub fn evaluate(dod: &Dod, gates: &dyn Gates, reviewer: Option<&dyn Reviewer>) -> Result<GateReport, String> {
-    let diff = gates.diff()?;
+pub fn evaluate(
+    dod: &Dod,
+    gates: &dyn Gates,
+    reviewer: Option<&dyn Reviewer>,
+    base: Option<&str>,
+) -> Result<GateReport, String> {
+    let diff = gates.diff(base)?;
     let findings = sanity(&diff);
     if !findings.is_empty() {
         // Nothing else can change the verdict, and the cheapest gate is the one that already

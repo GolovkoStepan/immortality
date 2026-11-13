@@ -37,6 +37,7 @@ pub mod plan;
 pub mod protocol;
 pub mod recover;
 pub mod registry;
+pub mod restart;
 pub mod scheduler;
 pub mod time;
 pub mod worktree;

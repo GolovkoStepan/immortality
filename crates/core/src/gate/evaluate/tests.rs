@@ -43,7 +43,7 @@ impl World {
 }
 
 impl Gates for World {
-    fn diff(&self) -> Result<Diff, String> {
+    fn diff(&self, _base: Option<&str>) -> Result<Diff, String> {
         Ok(self.diff.borrow().clone())
     }
 
@@ -148,6 +148,7 @@ fn every_green_gate_passes() {
         &dod(vec![check("build", true), check("test", true)], true),
         &world,
         Some(&reviewer),
+        None,
     )
     .expect("evaluate");
 
@@ -161,7 +162,13 @@ fn a_broken_diff_stops_before_any_command_or_review() {
     // The whole point of the order: no test suite, no model call, when the change already fails.
     let world = World::new(broken_diff());
     let reviewer = ScriptedReviewer::answering(r#"{"verdict":"approve"}"#);
-    let report = evaluate(&dod(vec![check("build", true)], true), &world, Some(&reviewer)).expect("evaluate");
+    let report = evaluate(
+        &dod(vec![check("build", true)], true),
+        &world,
+        Some(&reviewer),
+        None,
+    )
+    .expect("evaluate");
 
     assert!(!report.is_green());
     assert_eq!(world.ran(), Vec::<String>::new(), "no command should run");
@@ -179,6 +186,7 @@ fn a_red_required_check_stops_the_remaining_commands() {
         &dod(vec![check("build", true), check("test", true)], true),
         &world,
         Some(&reviewer),
+        None,
     )
     .expect("evaluate");
 
@@ -196,6 +204,7 @@ fn a_red_optional_check_does_not_stop_anything() {
         &dod(vec![check("outdated", false), check("test", true)], true),
         &world,
         Some(&reviewer),
+        None,
     )
     .expect("evaluate");
 
@@ -206,7 +215,7 @@ fn a_red_optional_check_does_not_stop_anything() {
 #[test]
 fn a_refused_command_is_a_red_check_and_nothing_runs() {
     let world = World::refusing("run-build");
-    let report = evaluate(&dod(vec![check("build", true)], false), &world, None).expect("evaluate");
+    let report = evaluate(&dod(vec![check("build", true)], false), &world, None, None).expect("evaluate");
 
     assert!(!report.is_green());
     let outcome = &report.checks[0];
@@ -228,7 +237,7 @@ fn a_timeout_is_a_failure_even_with_a_zero_exit_code() {
             output_tail: "still running".to_string(),
         },
     );
-    let report = evaluate(&dod(vec![check("test", true)], false), &world, None).expect("evaluate");
+    let report = evaluate(&dod(vec![check("test", true)], false), &world, None, None).expect("evaluate");
     assert!(!report.is_green());
     assert_eq!(report.checks[0].exit_code, Some(0));
     assert!(!report.checks[0].passed);
@@ -238,8 +247,13 @@ fn a_timeout_is_a_failure_even_with_a_zero_exit_code() {
 fn a_dod_without_a_review_never_calls_the_reviewer() {
     let world = World::new(Diff::default());
     let reviewer = ScriptedReviewer::answering(r#"{"verdict":"request_changes","issues":["no"]}"#);
-    let report =
-        evaluate(&dod(vec![check("build", true)], false), &world, Some(&reviewer)).expect("evaluate");
+    let report = evaluate(
+        &dod(vec![check("build", true)], false),
+        &world,
+        Some(&reviewer),
+        None,
+    )
+    .expect("evaluate");
 
     assert!(report.is_green());
     assert!(reviewer.seen.borrow().is_empty());
@@ -250,7 +264,7 @@ fn a_dod_without_a_review_never_calls_the_reviewer() {
 fn a_required_review_with_no_reviewer_fails_closed() {
     // The unwired path is the one that would otherwise approve everything it saw.
     let world = World::new(Diff::default());
-    let report = evaluate(&dod(Vec::new(), true), &world, None).expect("evaluate");
+    let report = evaluate(&dod(Vec::new(), true), &world, None, None).expect("evaluate");
 
     assert!(!report.is_green());
     assert_eq!(
@@ -264,7 +278,7 @@ fn a_required_review_with_no_reviewer_fails_closed() {
 fn a_reviewer_outage_is_a_rejection_rather_than_an_approval() {
     let world = World::new(Diff::default());
     let reviewer = ScriptedReviewer::failing();
-    let report = evaluate(&dod(Vec::new(), true), &world, Some(&reviewer)).expect("evaluate");
+    let report = evaluate(&dod(Vec::new(), true), &world, Some(&reviewer), None).expect("evaluate");
 
     assert!(!report.is_green());
     match report.review.expect("a verdict") {
@@ -285,7 +299,7 @@ fn the_reviewer_sees_only_the_statement_and_the_diff() {
         truncated: false,
     });
     let reviewer = ScriptedReviewer::answering(r#"{"verdict":"approve"}"#);
-    evaluate(&dod(Vec::new(), true), &world, Some(&reviewer)).expect("evaluate");
+    evaluate(&dod(Vec::new(), true), &world, Some(&reviewer), None).expect("evaluate");
 
     let seen = reviewer.seen.borrow();
     let request = seen.first().expect("a request");
@@ -298,7 +312,7 @@ fn a_diff_that_cannot_be_produced_is_the_only_error() {
     #[derive(Debug)]
     struct Broken;
     impl Gates for Broken {
-        fn diff(&self) -> Result<Diff, String> {
+        fn diff(&self, _base: Option<&str>) -> Result<Diff, String> {
             Err("git is gone".to_string())
         }
         fn authorise(&self, _command: &str) -> Result<(), String> {
@@ -308,7 +322,7 @@ fn a_diff_that_cannot_be_produced_is_the_only_error() {
             Ok(ok())
         }
     }
-    let error = evaluate(&dod(Vec::new(), false), &Broken, None).expect_err("no diff");
+    let error = evaluate(&dod(Vec::new(), false), &Broken, None, None).expect_err("no diff");
     assert!(error.contains("git is gone"), "{error}");
 }
 
@@ -317,7 +331,7 @@ fn a_command_that_cannot_start_is_a_red_check() {
     #[derive(Debug)]
     struct Unstartable;
     impl Gates for Unstartable {
-        fn diff(&self) -> Result<Diff, String> {
+        fn diff(&self, _base: Option<&str>) -> Result<Diff, String> {
             Ok(Diff::default())
         }
         fn authorise(&self, _command: &str) -> Result<(), String> {
@@ -327,7 +341,8 @@ fn a_command_that_cannot_start_is_a_red_check() {
             Err("no such binary".to_string())
         }
     }
-    let report = evaluate(&dod(vec![check("test", true)], false), &Unstartable, None).expect("evaluate");
+    let report =
+        evaluate(&dod(vec![check("test", true)], false), &Unstartable, None, None).expect("evaluate");
     assert!(!report.is_green());
     assert!(report.checks[0].output_tail.contains("could not be started"));
 }
@@ -340,6 +355,7 @@ fn the_checks_keep_the_order_the_dod_declared() {
     evaluate(
         &dod(vec![check("build", true), check("test", true)], false),
         &world,
+        None,
         None,
     )
     .expect("evaluate");
