@@ -1,0 +1,22 @@
+{
+  "v": 1,
+  "subtasks": [
+    {
+      "id": "sub_01M7A5K55R00014D2PF28AQKFJ",
+      "depth": 1,
+      "title": "replace the seen-words vector with a set",
+      "goal": "Change unique_words in src/count.rs to collect normalised words into a std::collections::BTreeSet<String> instead of a Vec<String> plus a linear contains check. The returned count and every observable behaviour must stay identical, so all existing tests must pass without being edited. Add one test proving that words differing only by surrounding punctuation still collapse to one, because that behaviour is the whole point of the normalisation and a container swap must not quietly change it.",
+      "dod": {
+        "statement": "the container is a set, every pre-existing assertion is untouched and green, and a test pins that punctuation-only differences still collapse",
+        "checks": [
+          { "id": "test", "command": "cargo test --offline", "required": true }
+        ],
+        "review": false
+      },
+      "state": "pending",
+      "depends_on": [],
+      "created_at": "2026-11-13T10:00:00Z",
+      "updated_at": "2026-11-13T10:00:00Z"
+    }
+  ]
+}

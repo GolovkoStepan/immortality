@@ -1,0 +1,14 @@
+# A package of its own: the dogfood repository is what the agent edits, so it must not be a
+# workspace member of the tool it is being edited by. Without this table cargo walks up to the
+# immortality workspace and refuses to build a package it cannot find in the members list.
+[workspace]
+
+[package]
+name = "tally"
+version = "0.1.0"
+edition = "2021"
+description = "Count words, lines and unique words in a file."
+
+# No dependencies on purpose: the dogfood repository has to build and test with no network,
+# because a run that needs crates.io is a run that fails at the first gate.
+[dependencies]

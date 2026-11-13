@@ -1,0 +1,22 @@
+{
+  "v": 1,
+  "subtasks": [
+    {
+      "id": "sub_01M7A5K46G00014D2PF28AQKFH",
+      "depth": 1,
+      "title": "make the trailing newline not count as a line",
+      "goal": "Fix count::lines in src/count.rs. A text that ends with a newline has as many lines as it has newline characters, not one more; a text without a trailing newline has as many lines as it has newlines plus one. The empty string stays at zero. Add regression tests in the existing tests module: lines(\"a\\nb\\n\") is 2, lines(\"a\\nb\") is 2, lines(\"a\\n\") is 1, and the empty case still returns 0.",
+      "dod": {
+        "statement": "the trailing newline no longer adds a phantom line, and a regression test pins both spellings of a two-line file to the same answer",
+        "checks": [
+          { "id": "test", "command": "cargo test --offline", "required": true }
+        ],
+        "review": false
+      },
+      "state": "pending",
+      "depends_on": [],
+      "created_at": "2026-11-13T10:00:00Z",
+      "updated_at": "2026-11-13T10:00:00Z"
+    }
+  ]
+}

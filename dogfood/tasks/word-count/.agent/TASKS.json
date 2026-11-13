@@ -1,0 +1,40 @@
+{
+  "v": 1,
+  "subtasks": [
+    {
+      "id": "sub_01M7A5K28000014D2PF28AQKFF",
+      "depth": 1,
+      "title": "count words that appear exactly once",
+      "goal": "Add a function to src/count.rs that returns how many whitespace-separated words appear exactly once in the text, comparing words case-insensitively and ignoring surrounding punctuation the same way unique_words does. Add unit tests in the existing tests module: an empty text has zero, 'a b a' has one, 'a b c' has three, and 'The the' has zero because both spellings are the same word.",
+      "dod": {
+        "statement": "the new counting rule is implemented and covered by unit tests that pin both the positive and the duplicate case",
+        "checks": [
+          { "id": "test", "command": "cargo test --offline", "required": true }
+        ],
+        "review": false
+      },
+      "state": "pending",
+      "depends_on": [],
+      "created_at": "2026-11-13T10:00:00Z",
+      "updated_at": "2026-11-13T10:00:00Z"
+    },
+    {
+      "id": "sub_01M7A5K37800014D2PF28AQKFG",
+      "depth": 1,
+      "title": "print the unique count and add the flag",
+      "goal": "In src/main.rs print a line 'unique: N' after the existing three lines, using the function added by the previous subtask. Also accept a --unique flag as the first argument that, when present, prints only that number and nothing else. Keep the usage message and the existing behaviour of printing all four lines unchanged.",
+      "dod": {
+        "statement": "the binary prints the unique count, the flag prints only it, and the project still builds and tests green",
+        "checks": [
+          { "id": "build", "command": "cargo build --offline", "required": true },
+          { "id": "test", "command": "cargo test --offline", "required": true }
+        ],
+        "review": false
+      },
+      "state": "pending",
+      "depends_on": ["sub_01M7A5K28000014D2PF28AQKFF"],
+      "created_at": "2026-11-13T10:00:00Z",
+      "updated_at": "2026-11-13T10:00:00Z"
+    }
+  ]
+}
