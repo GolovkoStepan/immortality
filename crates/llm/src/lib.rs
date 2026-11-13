@@ -33,6 +33,7 @@
 pub mod client;
 pub mod extract;
 pub mod failure;
+pub mod prompt;
 pub mod schema;
 pub mod sse;
 pub mod stream;
@@ -46,6 +47,7 @@ pub use failure::{
     Failure, MAX_ATTEMPTS, MAX_BACKOFF, ModelFault, RetryKind, backoff, classify_status, classify_turn,
     should_retry,
 };
+pub use prompt::{messages, stable_prefix_len};
 pub use schema::{
     ArgError, Defect, MAX_PROBLEMS, Problem, parse_arguments, render_observation, schema_defects, summarise,
     validate,

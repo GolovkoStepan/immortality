@@ -1,0 +1,169 @@
+//! Turning an assembled [`Context`] into the messages that go on the wire.
+//!
+//! # Why this lives in `immortality-llm` and not in `core`
+//!
+//! `core` owns the context and the token budget, but it must not know `Message`: the dependency
+//! arrow is `llm → core`, and a `Message` type in `core` would make the protocol a dependency of
+//! the domain. So the conversion sits here, next to the wire types it produces.
+//!
+//! # Why the append-only property is asserted *through* this function
+//!
+//! `Context` keeping its prefix stable is necessary but not sufficient: a converter that rebuilt
+//! the system message from the history — or that put the tool results before the assistant turn
+//! that asked for them — would defeat the cache while every `Context` test stayed green. The
+//! test here compares the *serialised* prefix, which is what the server actually keys on.
+//!
+//! # Message order the protocol requires
+//!
+//! `assistant` with `tool_calls` must be followed by one `tool` message per call id, in the same
+//! order. Servers vary in how strictly they check, but the ones that are lenient render a wrong
+//! order as a result belonging to the wrong call, which the model cannot tell from the truth.
+
+use immortality_core::context::{Context, Entry, ToolCall};
+
+use crate::turn;
+use crate::wire::Message;
+
+/// Build the message list for one step.
+///
+/// One system message carrying the stable prefix, then the history in order.
+#[must_use]
+pub fn messages(context: &Context) -> Vec<Message> {
+    let mut messages = Vec::with_capacity(1 + context.steps());
+    messages.push(Message::system(context.system()));
+    for entry in context.history() {
+        match entry {
+            Entry::Assistant { text, calls } => {
+                if calls.is_empty() {
+                    messages.push(Message::assistant(text.clone()));
+                } else {
+                    // The prose and the calls can coexist in one assistant turn. Dropping the
+                    // prose would lose the model's stated reasoning; dropping the calls would
+                    // make the following tool messages reference nothing.
+                    let mut message = Message::assistant_tool_calls(calls.iter().map(to_wire_call).collect());
+                    if !text.is_empty() {
+                        message.content = Some(text.clone());
+                    }
+                    messages.push(message);
+                }
+            }
+            Entry::Tool {
+                call_id,
+                name,
+                output,
+            } => {
+                messages.push(Message::tool_result(
+                    call_id.clone(),
+                    name.clone(),
+                    output.clone(),
+                ));
+            }
+        }
+    }
+    messages
+}
+
+/// How many bytes of messages precede the history, for a cache probe.
+///
+/// Only the system message is stable across steps, so this is the length the cache can be
+/// expected to cover on a warm prefix. Used by `doctor` and by the cache-stats assertion.
+#[must_use]
+pub fn stable_prefix_len(messages: &[Message]) -> usize {
+    messages
+        .first()
+        .and_then(|message| message.content.as_ref())
+        .map_or(0, String::len)
+}
+
+fn to_wire_call(call: &ToolCall) -> turn::ToolCall {
+    turn::ToolCall::function(call.call_id.clone(), call.name.clone(), call.arguments.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use immortality_core::context::StableLayers;
+
+    use super::*;
+
+    fn context() -> Context {
+        Context::new(&StableLayers {
+            system: "You are an agent.".to_string(),
+            brief: "Add `serve`.".to_string(),
+            notes: "The socket is 0600.".to_string(),
+            state: "0/1 done.".to_string(),
+        })
+    }
+
+    #[test]
+    fn the_system_message_is_the_whole_prefix() {
+        let context = context();
+        let messages = messages(&context);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, "system");
+        assert_eq!(messages[0].content.as_deref(), Some(context.system()));
+        assert_eq!(stable_prefix_len(&messages), context.system().len());
+    }
+
+    #[test]
+    fn the_serialised_prefix_is_unchanged_as_the_history_grows() {
+        // The property that decides whether the backend's prefix cache hits. Asserted on the
+        // JSON, which is what is actually sent.
+        let mut context = context();
+        let prefix = serde_json::to_string(&messages(&context)[0]).expect("serialise");
+        for step in 0..5 {
+            context.push_assistant(format!("thinking {step}"), vec![]);
+            context.push_entry(Entry::tool("call", "read_file", "fn main() {}"));
+        }
+        let later = serde_json::to_string(&messages(&context)[0]).expect("serialise");
+        assert_eq!(later, prefix);
+    }
+
+    #[test]
+    fn an_assistant_turn_with_calls_and_prose_keeps_both() {
+        let mut context = context();
+        context.push_assistant(
+            "checking the config",
+            vec![ToolCall {
+                call_id: "call_1".to_string(),
+                name: "read_file".to_string(),
+                arguments: r#"{"path":"Cargo.toml"}"#.to_string(),
+            }],
+        );
+        context.push_entry(Entry::tool("call_1", "read_file", "[package]"));
+
+        let messages = messages(&context);
+        assert_eq!(messages.len(), 3);
+        let assistant = &messages[1];
+        assert_eq!(assistant.role, "assistant");
+        assert_eq!(assistant.content.as_deref(), Some("checking the config"));
+        let calls = assistant.tool_calls.as_ref().expect("calls");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "call_1");
+        assert_eq!(calls[0].function.name, "read_file");
+        assert_eq!(calls[0].function.arguments, r#"{"path":"Cargo.toml"}"#);
+
+        let tool = &messages[2];
+        assert_eq!(tool.role, "tool");
+        assert_eq!(tool.tool_call_id.as_deref(), Some("call_1"));
+        assert_eq!(tool.name.as_deref(), Some("read_file"));
+        assert_eq!(tool.content.as_deref(), Some("[package]"));
+    }
+
+    #[test]
+    fn a_prose_only_turn_has_no_tool_calls_field() {
+        let mut context = context();
+        context.push_assistant("done", vec![]);
+        let messages = messages(&context);
+        assert_eq!(messages[1].role, "assistant");
+        assert_eq!(messages[1].tool_calls, None);
+    }
+
+    #[test]
+    fn every_history_entry_becomes_exactly_one_message() {
+        let mut context = context();
+        context.push_assistant("a", vec![]);
+        context.push_entry(Entry::tool("c1", "grep", "hit"));
+        context.push_assistant("b", vec![]);
+        assert_eq!(messages(&context).len(), 1 + context.steps());
+    }
+}

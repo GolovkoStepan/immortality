@@ -208,6 +208,18 @@ impl Estimator {
     }
 }
 
+/// The calibrated estimate, as the budget sees it.
+///
+/// The trait lives in `immortality-core` so that context assembly can ask for a token count
+/// without depending on this crate; the arrow is `llm → core`, so the implementation belongs
+/// here. Delegating to [`Estimator::estimate`] rather than re-deriving the arithmetic keeps one
+/// definition of "how many tokens is this text".
+impl immortality_core::context::TokenCounter for Estimator {
+    fn count(&self, text: &str) -> u32 {
+        self.estimate(text)
+    }
+}
+
 /// Characters in `text`, saturating rather than wrapping.
 #[must_use]
 pub fn char_count(text: &str) -> u64 {
@@ -453,6 +465,24 @@ mod tests {
             "{}",
             estimator.report()
         );
+    }
+
+    #[test]
+    fn the_estimator_is_a_token_counter_with_the_same_answer() {
+        // The budget in `core` asks through the trait; a divergence between the two methods
+        // would make the estimate that triggers compaction differ from the one that is logged.
+        use immortality_core::context::TokenCounter;
+
+        let mut estimator = Estimator::new();
+        let text = "fn main() { println!(\"hello\"); }";
+        assert_eq!(TokenCounter::count(&estimator, text), estimator.estimate(text));
+
+        // Calibrated: the trait must follow the measurement, not the default divisor.
+        estimator.observe(Some(10_000), None, &usage(5_000, 0));
+        // 10 000 characters cost 5 000 tokens, so the divisor is 2.0 and 1 000 characters are
+        // 500 tokens — not the 286 the default 3.5 would give.
+        assert_eq!(TokenCounter::count(&estimator, &"x".repeat(1000)), 500);
+        assert_eq!(estimator.estimate_chars(1000), 500);
     }
 
     #[test]
