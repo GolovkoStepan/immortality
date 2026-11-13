@@ -19,6 +19,12 @@
 //!    "nothing is accepting connections on it". A socket left by `kill -9` is already handled by
 //!    [`server::bind`], which removes a stale file before binding.
 //!
+//! 4. **Recovery, before accepting a single client.** A daemon that starts accepting requests
+//!    before it has closed the previous process's open tool calls is a daemon whose first `status`
+//!    lies about what is running. The pass is per task, it is ordered (read the journal, plan,
+//!    then open for writing), and it is the reason `serve` starts the way it does. See
+//!    [`immortality_daemon::startup`].
+//!
 //! # Why the lock is a file rather than the socket
 //!
 //! Binding the socket is *already* exclusive, so the second daemon would fail on `bind`. But it
@@ -31,13 +37,20 @@
 #![allow(unreachable_pub)]
 
 use std::io::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context as _, Result, bail};
 
-use immortality_core::ids::Ulid;
+use immortality_core::config::{self, Config, Overrides};
+use immortality_core::ids::{TaskId, Ulid};
 use immortality_core::paths::StatePaths;
+use immortality_core::registry::Registry;
+use immortality_core::time::{Clock as _, SystemClock};
+use immortality_core::worktree::WorktreeManager;
 use immortality_daemon::server::{self, Events, ServerState};
+use immortality_daemon::startup::{self, RecoveryRequest};
+use immortality_daemon::toolset::{self, ToolsetDeps};
 
 mod lock {
     //! The single-instance lock, kept apart so the guard type is impossible to misplace.
@@ -190,6 +203,12 @@ pub async fn run() -> Result<()> {
         .map_err(|error| anyhow::anyhow!("{error}"))
         .context("the daemon cannot start")?;
 
+    // Recovery runs before the socket is bound, so no client can observe a task mid-repair. It is
+    // blocking work (journals, git, the filesystem) with nothing else competing for the runtime —
+    // `bind` has not happened yet — so a plain call is the honest shape rather than a
+    // `spawn_blocking` that would only move the wait to another thread.
+    let touched = recover_all(&root);
+
     let socket = state.daemon_socket();
     let listener = server::bind(&socket).map_err(|error| anyhow::anyhow!("{error}"))?;
     // Printed to stderr and not stdout: this line is diagnostics, and stdout is reserved for
@@ -213,11 +232,103 @@ pub async fn run() -> Result<()> {
             Ok(())
         }
     };
+    // Every task the pass touched gets a `daemon_stopped`, so its journal brackets the session
+    // instead of ending at `daemon_started`. Best-effort: a shutdown is not the moment to fail.
+    startup::stopped(&touched, SystemClock.now());
     // Removed before the lock is released: a start that waited for the lock must not observe a
     // moment in which the lock is free and a dead socket is still there.
     let _ = std::fs::remove_file(&socket);
     drop(lock);
     outcome.context("the daemon stopped")
+}
+
+/// Recover every unfinished task, returning what was touched so shutdown can bracket it.
+///
+/// A task that fails to recover does not stop the daemon. The alternative — refusing to start
+/// because one task's journal is unreadable — would make a single bad task unobservable through
+/// every command, including the ones a human needs to inspect it. A blocked task is a *result* of
+/// recovery, not a failure of it; only an error that leaves no marker anywhere is logged loudly.
+fn recover_all(root: &Path) -> Vec<(TaskId, PathBuf)> {
+    let registry_path = root.join(immortality_core::registry::FILE_NAME);
+    let registry = match Registry::open(&registry_path) {
+        Ok(registry) => registry,
+        Err(error) => {
+            tracing::warn!("cannot read {}: {error}", registry_path.display());
+            return Vec::new();
+        }
+    };
+    let known = match registry.tasks(root) {
+        Ok(known) => known,
+        Err(error) => {
+            tracing::warn!("cannot list tasks: {error}");
+            return Vec::new();
+        }
+    };
+    // The global config is read once: every task's policy gate has to be built from the same
+    // rules, and a per-task reload would let a file edited mid-start make two tasks disagree.
+    let config = match config::load(&Overrides {
+        base_url: None,
+        model: None,
+        log_level: None,
+        global_config: None,
+        project_config: None,
+    }) {
+        Ok(loaded) => loaded.config,
+        Err(error) => {
+            tracing::warn!("cannot read the global config, using defaults: {error}");
+            Config::default()
+        }
+    };
+
+    let mut touched = Vec::new();
+    for (project, task, task_dir) in known {
+        match recover_one(&config, root, &project, &task, &task_dir) {
+            Ok(Some(recovered)) => {
+                eprintln!(
+                    "recovered {task}: {} ({})",
+                    recovered.summary,
+                    recovered.executed.summary()
+                );
+                touched.push((task, toolset::journal_dir(&project.path)));
+            }
+            Ok(None) => {}
+            Err(error) => tracing::warn!("cannot recover {task}: {error}"),
+        }
+    }
+    touched
+}
+
+/// Recover one task, or report that it needs none.
+///
+/// `Ok(None)` is the common case in a healthy daemon: a task whose journal ends in a terminal
+/// state, or one that was never started. The distinction matters because only ids for which a pass
+/// actually opened the journal get a `daemon_stopped` on shutdown.
+fn recover_one(
+    config: &Config,
+    root: &Path,
+    project: &immortality_core::registry::Project,
+    task: &TaskId,
+    task_dir: &Path,
+) -> Result<Option<startup::Recovered>> {
+    let worktree = WorktreeManager::new(&project.path).path_for(task.as_str());
+    let deps = ToolsetDeps::for_task(config, root, task_dir, &worktree, task.clone())
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let registry = toolset::build(&deps).map_err(|error| anyhow::anyhow!("{error}"))?;
+    let request = RecoveryRequest {
+        task: task.clone(),
+        repository: project.path.clone(),
+        journal_dir: toolset::journal_dir(&project.path),
+        task_dir: task_dir.to_path_buf(),
+        registry: Arc::new(registry),
+        gate: Arc::clone(&deps.gate),
+        artifacts: deps.artifacts.clone(),
+        clock: Arc::new(SystemClock),
+    };
+    let recovered = startup::recover_task(&request).map_err(|error| anyhow::anyhow!("{error}"))?;
+    // A task whose journal this pass never opened is not bracketed: `daemon_started` was not
+    // written, and a `daemon_stopped` without it would describe a session that never began. The
+    // pass answers this itself rather than leaving `serve` to infer it from the summary text.
+    Ok(recovered.session_open.then_some(recovered))
 }
 
 /// Resolve on `SIGTERM` or `SIGINT`, naming which arrived.

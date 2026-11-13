@@ -16,6 +16,8 @@ pub mod recovery;
 pub mod rpc;
 pub mod runner;
 pub mod server;
+pub mod startup;
+pub mod toolset;
 
 /// Version of the daemon<->client protocol.
 ///

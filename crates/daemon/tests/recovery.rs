@@ -58,7 +58,6 @@ struct Fixture {
     journal_root: PathBuf,
     /// Machine-local state for this task.
     task_dir: PathBuf,
-    state_root: PathBuf,
     task: TaskId,
     clock: Arc<FixedClock>,
 }
@@ -119,7 +118,6 @@ impl Fixture {
             worktree,
             journal_root,
             task_dir,
-            state_root,
             task,
             clock: Arc::new(FixedClock::fixture()),
         }
@@ -159,7 +157,8 @@ impl Fixture {
         RecoveryDeps {
             task: self.task.clone(),
             task_dir: self.task_dir.clone(),
-            state_root: self.state_root.clone(),
+            // The fixture's only git repository is the worktree itself.
+            repository: self.worktree.clone(),
             worktree: self.worktree.clone(),
             branch: exec::expected_branch(&self.task),
             gate: self.gate(),
@@ -186,7 +185,9 @@ impl Fixture {
         ToolProbe {
             gate,
             repo,
-            state_root: &self.state_root,
+            // `DelegationStore::for_task` appends the task id, so the probe takes the directory
+            // *containing* the task's state directory.
+            delegation_root: self.task_dir.parent().expect("the task dir has a parent"),
             task: &self.task,
             task_dir: &self.task_dir,
         }
@@ -242,7 +243,7 @@ impl Fixture {
             "the plan must address every open call"
         );
         let deps = self.deps();
-        let mut executor = exec::Executor::new(&deps, &mut journal, records.clone(), &report);
+        let mut executor = exec::Executor::new(&deps, Some(&mut journal), records.clone(), &report);
         let executed = executor.run(&report.steps).expect("execution");
         journal.sync().expect("sync");
         (records, report, executed)
@@ -619,7 +620,7 @@ fn a_dirty_worktree_is_snapshotted_with_a_journalled_sha() {
     assert!(workspace.dirty, "the fixture must actually be dirty");
     let report = recover::plan(&fixture.input(&records, workspace), &fixture.probe());
     let deps = fixture.deps();
-    let mut executor = exec::Executor::new(&deps, &mut journal, records, &report);
+    let mut executor = exec::Executor::new(&deps, Some(&mut journal), records, &report);
     executor.run(&report.steps).expect("execution");
     journal.sync().expect("sync");
 
@@ -702,7 +703,7 @@ fn an_open_attempt_is_closed_when_a_rollback_supersedes_it() {
     );
     let deps = fixture.deps();
     let mut journal = fixture.journal();
-    let mut executor = exec::Executor::new(&deps, &mut journal, records, &report);
+    let mut executor = exec::Executor::new(&deps, Some(&mut journal), records, &report);
     executor.run(&report.steps).expect("execution");
     journal.sync().expect("sync");
 
@@ -749,7 +750,7 @@ fn a_corrupt_journal_blocks_the_task_and_asks_a_human() {
     let mut journal = Journal::open(&scratch, fixture.task.clone()).expect("scratch journal");
     journal.set_clock(Arc::clone(&fixture.clock) as Arc<dyn immortality_core::time::Clock>);
     let deps = fixture.deps();
-    let mut executor = exec::Executor::new(&deps, &mut journal, records, &report);
+    let mut executor = exec::Executor::new(&deps, Some(&mut journal), records, &report);
     let executed = executor.run(&report.steps).expect("execution");
     journal.sync().expect("sync");
     assert!(

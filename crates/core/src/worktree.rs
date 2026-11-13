@@ -212,6 +212,13 @@ impl WorktreeManager {
             return self.put_on_branch(existing, branch);
         }
         let path = self.path_for(task);
+        // A worktree whose *directory* vanished leaves its registration behind in
+        // `.git/worktrees/<name>`, and `git worktree add` then refuses the path as "a missing but
+        // already registered worktree". That is the normal shape of the crash this function
+        // repairs — the task directory was removed, or the whole agent directory was — so the
+        // stale record is cleared before the add. `prune` only drops registrations whose gitdir is
+        // gone; a live worktree of this repository is untouched.
+        Self::git_in(&self.repository, &["worktree", "prune"])?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|error| WorktreeError::Occupied {
                 path: parent.display().to_string(),
@@ -536,6 +543,24 @@ mod tests {
         );
         assert!(!worktree.dirty);
         assert!(worktree.head.is_some());
+    }
+
+    #[test]
+    fn a_worktree_whose_directory_vanished_is_recreated() {
+        // The exact shape a crash leaves: the directory is gone but git still has the
+        // registration, and a plain `worktree add` fails with "a missing but already registered
+        // worktree". Recovery's whole job is to repair this, so `ensure` has to clear the record.
+        let fixture = Fixture::new();
+        let first = fixture.manager.ensure("tsk_01", "agent/tsk_01", None).unwrap();
+        std::fs::remove_dir_all(&first.path).unwrap();
+        assert!(!first.path.exists());
+
+        let recreated = fixture
+            .manager
+            .ensure("tsk_01", "agent/tsk_01", None)
+            .expect("a lost worktree must be recreated");
+        assert!(recreated.path.join("README.md").exists());
+        assert_eq!(recreated.branch.as_deref(), Some("agent/tsk_01"));
     }
 
     #[test]

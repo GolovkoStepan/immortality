@@ -56,8 +56,12 @@ pub struct ToolProbe<'a> {
     pub gate: &'a PolicyGate,
     /// The task worktree, for `git` probes.
     pub repo: &'a GitRepo,
-    /// The machine-local state root, for `delegate` reports.
-    pub state_root: &'a Path,
+    /// The directory holding per-task state, so `delegate` reports resolve where the tool
+    /// writes them: `<root>/<task>/delegations`. This is the task directory's parent, not the
+    /// machine state root — `DelegationStore::for_task` appends the task id to whatever it is
+    /// given, so passing the state root would look for `<state>/<task>` while the tool writes
+    /// `<state>/state/<project>/<task>`.
+    pub delegation_root: &'a Path,
     /// The task the call belongs to.
     pub task: &'a TaskId,
     /// The task's state directory, for the escalation queue.
@@ -77,7 +81,7 @@ impl Prober for ToolProbe<'_> {
             "edit_file" => self.probe_edit(arguments),
             "git" => self.probe_git(intent, arguments),
             "start_process" => self.probe_start(arguments),
-            "delegate" => probe_delegated(self.state_root, self.task, intent.call.as_str()),
+            "delegate" => probe_delegated(self.delegation_root, self.task, intent.call.as_str()),
             "escalate" => self.probe_escalation(arguments),
             // Reads are `Idempotent` and never reach a probe; `read_process` is `ByContent` but
             // re-reading a process's output loses nothing, so re-running it is safe.
@@ -266,9 +270,13 @@ pub struct RecoveryDeps {
     pub task: TaskId,
     /// Its directory under the state root.
     pub task_dir: PathBuf,
-    /// The machine-local state root.
-    pub state_root: PathBuf,
-    /// The task worktree.
+    /// The project's main checkout, where `git worktree add` has to run.
+    ///
+    /// Not the same as `worktree`: recreating a lost worktree means asking the repository to
+    /// recreate one of its own, and a `WorktreeManager` built on the (now deleted) worktree would
+    /// look for `<deleted>/../<deleted>-agent` and create nothing.
+    pub repository: PathBuf,
+    /// The task worktree, whether or not it currently exists.
     pub worktree: PathBuf,
     /// The branch the worktree must be on, `agent/<task>`.
     pub branch: String,
@@ -307,7 +315,13 @@ impl Executed {
 /// would apply steps to a world that no longer matches the assumptions the plan was built on.
 pub struct Executor<'a> {
     deps: &'a RecoveryDeps,
-    journal: &'a mut Journal,
+    /// `None` when the journal could not be opened for writing.
+    ///
+    /// The only plan that can run without a journal is a blocked one: it is reached exactly when
+    /// the chain is broken or a `seq` is missing, and `Journal::open` refuses such a file. A step
+    /// that needs the journal then reports an error naming that, rather than the executor making
+    /// the caller fabricate a writable journal over a broken one.
+    journal: Option<&'a mut Journal>,
     /// The journal as recovery read it, for deriving caches and for scope lookup.
     outcome: ReadOutcome,
     /// The scope each unfinished call was written in.
@@ -331,7 +345,7 @@ impl<'a> Executor<'a> {
     #[must_use]
     pub fn new(
         deps: &'a RecoveryDeps,
-        journal: &'a mut Journal,
+        journal: Option<&'a mut Journal>,
         outcome: ReadOutcome,
         report: &RecoveryReport,
     ) -> Self {
@@ -372,6 +386,8 @@ impl<'a> Executor<'a> {
             // Already applied by `Journal::open`, which truncated the file and journalled the
             // repair. Reporting it keeps the plan's account honest about what changed on disk.
             RecoveryStep::DropTornTail { bytes } => Ok(format!("dropped {bytes} bytes of torn tail")),
+            // The one arm that must work without a journal: it is the reason a plan can arrive
+            // here with none.
             RecoveryStep::BlockTask { reason } => self.block(reason),
             RecoveryStep::RecreateWorktree { branch, sha } => self.recreate(branch, sha.as_deref()),
             RecoveryStep::RestoreBranch { branch } => self.restore_branch(branch),
@@ -405,43 +421,16 @@ impl<'a> Executor<'a> {
     /// journal is left exactly as the crash left it: silently repairing a broken chain would erase
     /// the evidence of whatever broke it.
     fn block(&self, reason: &str) -> Result<String, String> {
-        let marker = self.deps.task_dir.join("panic.json");
-        let body = serde_json::json!({
-            "v": 1,
-            "state": "blocked",
-            "cause": "journal_corrupt",
-            "reason": reason,
-            "blocked_at": self.clock.now().to_rfc3339(),
-            "task": self.deps.task.as_str(),
-        });
-        let mut text = serde_json::to_string_pretty(&body)
-            .map_err(|error| format!("cannot encode the block marker: {error}"))?;
-        text.push('\n');
-        immortality_core::atomic::write_atomically(&marker, text.as_bytes())
-            .map_err(|error| format!("cannot write {}: {error}", marker.display()))?;
-
-        let mut store = EscalationStore::open(&self.deps.task_dir, self.deps.task.clone())
-            .map_err(|error| format!("cannot open the escalation queue: {error}"))?;
-        let entry = Entry::new(
-            self.deps.task.clone(),
-            "recovery:journal_corrupt",
-            EscalationKind::JournalCorrupt,
-            format!(
-                "The journal for {} cannot be trusted: {reason}. The task is blocked. Inspect \
-                 the journal and the state directory before it runs again.",
-                self.deps.task
-            ),
-            Vec::new(),
-            self.clock.now(),
-        );
-        store
-            .ask(entry)
-            .map_err(|error| format!("cannot open the escalation: {error}"))?;
-        Ok(format!("blocked the task: {reason}"))
+        BlockReason {
+            task: self.deps.task.clone(),
+            task_dir: self.deps.task_dir.clone(),
+            clock: Arc::clone(&self.clock),
+        }
+        .apply(reason)
     }
 
     fn recreate(&self, branch: &str, sha: Option<&str>) -> Result<String, String> {
-        let manager = immortality_core::worktree::WorktreeManager::new(&self.deps.worktree);
+        let manager = immortality_core::worktree::WorktreeManager::new(&self.deps.repository);
         // `ensure` refuses to guess a base: when the branch does not exist and no SHA was
         // recorded, it reports that rather than creating the branch from whatever `HEAD` is.
         manager
@@ -479,7 +468,7 @@ impl<'a> Executor<'a> {
         let Some(checkpoint) = checkpoint else {
             return Ok("nothing to preserve".into());
         };
-        self.journal
+        need(&mut self.journal)?
             .append_scoped(
                 self.clock.now(),
                 Kind::CheckpointCreated,
@@ -498,7 +487,7 @@ impl<'a> Executor<'a> {
     /// The effect happened: tell the model so, without running the call again.
     fn synthesize(&mut self, call: &CallId, observation: &str) -> Result<String, String> {
         let scope = self.scope_of(call);
-        let mut log = immortality_core::protocol::ToolCallLog::recovering(self.journal, scope);
+        let mut log = immortality_core::protocol::ToolCallLog::recovering(need(&mut self.journal)?, scope);
         log.effect(call, Probe::Applied, serde_json::json!({ "by": "recovery" }))
             .map_err(|error| format!("cannot record the probe verdict for {call}: {error}"))?;
         log.completed(
@@ -537,7 +526,7 @@ impl<'a> Executor<'a> {
             .with_call(call.as_str().to_string())
             .with_task(self.deps.task.clone());
 
-        let mut log = immortality_core::protocol::ToolCallLog::recovering(self.journal, scope);
+        let mut log = immortality_core::protocol::ToolCallLog::recovering(need(&mut self.journal)?, scope);
         let result = tool.execute(&ctx, args);
         match result {
             Ok(result) => {
@@ -566,7 +555,7 @@ impl<'a> Executor<'a> {
     /// Close a call that must not be re-run, with a reason the model can read.
     fn abandon(&mut self, call: &CallId, reason: &str) -> Result<String, String> {
         let scope = self.scope_of(call);
-        let mut log = immortality_core::protocol::ToolCallLog::recovering(self.journal, scope);
+        let mut log = immortality_core::protocol::ToolCallLog::recovering(need(&mut self.journal)?, scope);
         log.failed(
             call,
             serde_json::json!({
@@ -595,7 +584,7 @@ impl<'a> Executor<'a> {
             .hidden_checkpoint(&self.deps.branch, reason)
             .map_err(|error| format!("cannot snapshot before the rollback: {error}"))?;
         if let Some(safety) = &safety {
-            self.journal
+            need(&mut self.journal)?
                 .append_scoped(
                     self.clock.now(),
                     Kind::CheckpointCreated,
@@ -609,7 +598,7 @@ impl<'a> Executor<'a> {
                 )
                 .map_err(|error| format!("cannot journal the safety snapshot: {error}"))?;
         }
-        self.journal
+        need(&mut self.journal)?
             .append_scoped(
                 self.clock.now(),
                 Kind::CheckpointCreated,
@@ -633,7 +622,7 @@ impl<'a> Executor<'a> {
     /// model did nothing wrong, and spending its failure budget on a reboot is how a task dies
     /// of an unrelated crash.
     fn abandon_attempt(&mut self, subtask: &SubtaskId, number: u32) -> Result<String, String> {
-        self.journal
+        need(&mut self.journal)?
             .append_scoped(
                 self.clock.now(),
                 Kind::AttemptRestarted,
@@ -669,7 +658,7 @@ impl<'a> Executor<'a> {
         Cache::new(&self.deps.task_dir)
             .write(&state)
             .map_err(|error| format!("cannot rewrite the state cache: {error}"))?;
-        self.journal
+        need(&mut self.journal)?
             .append_event(
                 self.clock.now(),
                 Kind::DaemonRecovered,
@@ -678,7 +667,7 @@ impl<'a> Executor<'a> {
             .map_err(|error| format!("cannot journal the recovery: {error}"))?;
         // Flushed before the caller returns: the whole point of the record is that a *later*
         // crash finds it.
-        self.journal
+        need(&mut self.journal)?
             .sync()
             .map_err(|error| format!("cannot flush the journal: {error}"))?;
         Ok("recorded the recovery".into())
@@ -691,6 +680,75 @@ impl<'a> Executor<'a> {
             .find(|(candidate, _)| candidate == call)
             .map_or_else(Scope::task, |(_, scope)| scope.clone())
     }
+}
+
+/// Persisting "this task is blocked" without touching the journal.
+///
+/// Separate from the executor because it must also run when there is no plan and no readable
+/// journal at all: a journal whose *parse* fails produces an error rather than a `ReadOutcome`, and
+/// that is a task a human has to be told about on the first start, not after a successful read.
+#[derive(Debug)]
+pub struct BlockReason {
+    /// The task to block.
+    pub task: TaskId,
+    /// Its machine-local state directory.
+    pub task_dir: PathBuf,
+    /// The clock the marker is stamped from.
+    pub clock: Arc<dyn Clock>,
+}
+
+impl BlockReason {
+    /// Write the marker and open the blocking question.
+    ///
+    /// # Errors
+    /// The marker or the escalation file cannot be written.
+    pub fn apply(&self, reason: &str) -> Result<String, String> {
+        let marker = self.task_dir.join("panic.json");
+        let body = serde_json::json!({
+            "v": 1,
+            "state": "blocked",
+            "cause": "journal_corrupt",
+            "reason": reason,
+            "blocked_at": self.clock.now().to_rfc3339(),
+            "task": self.task.as_str(),
+        });
+        let mut text = serde_json::to_string_pretty(&body)
+            .map_err(|error| format!("cannot encode the block marker: {error}"))?;
+        text.push('\n');
+        immortality_core::atomic::write_atomically(&marker, text.as_bytes())
+            .map_err(|error| format!("cannot write {}: {error}", marker.display()))?;
+
+        let mut store = EscalationStore::open(&self.task_dir, self.task.clone())
+            .map_err(|error| format!("cannot open the escalation queue: {error}"))?;
+        let entry = Entry::new(
+            self.task.clone(),
+            "recovery:journal_corrupt",
+            EscalationKind::JournalCorrupt,
+            format!(
+                "The journal for {} cannot be trusted: {reason}. The task is blocked. Inspect \
+                 the journal and the state directory before it runs again.",
+                self.task
+            ),
+            Vec::new(),
+            self.clock.now(),
+        );
+        store
+            .ask(entry)
+            .map_err(|error| format!("cannot open the escalation: {error}"))?;
+        Ok(format!("blocked the task: {reason}"))
+    }
+}
+
+/// The writer, or an error naming why this plan cannot run.
+///
+/// Takes the field rather than `&mut self` so a caller can still read `self.deps` while a
+/// [`ToolCallLog`] holds the journal: they are independent fields, and a method on `self` would
+/// borrow the whole struct.
+fn need<'s>(slot: &'s mut Option<&mut Journal>) -> Result<&'s mut Journal, String> {
+    slot.as_mut().map_or_else(
+        || Err("the journal cannot be opened, so only a block can be recorded".to_string()),
+        |journal| Ok(&mut **journal),
+    )
 }
 
 /// A tool's failure, as text the model can act on.
@@ -734,6 +792,25 @@ pub fn daemon_stopped(journal_dir: &Path, task: TaskId, at: Timestamp) -> std::r
     journal
         .sync()
         .map_err(|error| format!("cannot flush the journal: {error}"))
+}
+
+/// Whether a task has ever begun, judged by its journal alone.
+///
+/// A task becomes real when a process journals something *inside an attempt*: that is the record
+/// shape the runner writes and the shape recovery exists to finish. A journal holding only
+/// task-wide bookkeeping (`task_created`, a previous `daemon_started`, a truncated-tail repair) is
+/// a task that has not started yet, and recovering it would do three wrong things at once: it
+/// would announce a daemon session the task never joined, ask git to recreate a branch nobody
+/// created, and add a record on every start of every registered-but-unused project.
+///
+/// The check is deliberately on the *scope* rather than on a list of kinds. A new record kind the
+/// runner starts writing will be scoped by construction (D-076), so this predicate keeps working
+/// without being edited; a list of kinds would silently start treating fresh work as "never ran".
+#[must_use]
+pub fn has_begun(records: &[JournalRecord]) -> bool {
+    records
+        .iter()
+        .any(|record| record.fields.subtask.is_some() || record.fields.attempt.is_some())
 }
 
 /// Whether a journal's task is still unfinished.
