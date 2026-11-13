@@ -447,6 +447,94 @@ fn a_wrong_token_is_reported_as_a_token_problem() {
 }
 
 #[test]
+fn serve_brings_up_a_daemon_that_the_other_commands_can_reach() {
+    // The end-to-end proof that the CLI's own daemon works: a real child process, a real socket,
+    // a real token minted on first start. Before this, `serve` was a "not implemented until M5"
+    // stub and every socket command could only ever be tested against an in-process server.
+    let daemon = Daemon::new();
+    daemon.journal(2);
+    // The fixture writes a token to keep the in-process server honest; remove it so the minting
+    // path is what runs here.
+    std::fs::remove_file(daemon.token_path()).unwrap();
+    assert!(!daemon.socket.exists(), "the fixture starts with no socket");
+
+    let mut child = daemon
+        .cli()
+        .arg("serve")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    // Wait for the socket rather than sleeping a fixed time: `bind` is the last step before the
+    // server accepts, so the file existing is the signal that a connect will be queued.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !daemon.socket.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(daemon.socket.exists(), "the daemon never bound its socket");
+
+    // The token was minted, is non-empty, and is mode 0600.
+    let token = std::fs::read_to_string(daemon.token_path()).expect("minted token");
+    assert_ne!(token.trim(), "", "an empty token would authorise everyone");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(daemon.token_path())
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "token mode {mode:o}");
+    }
+
+    // `status` reaches it and sees the journal.
+    daemon
+        .cli()
+        .arg("status")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(task().as_str()))
+        .stdout(predicate::str::contains("2 record"));
+
+    // A second `serve` on the same state root refuses instead of racing on the journal.
+    daemon
+        .cli()
+        .arg("serve")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("already running"));
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    // `kill -9` cannot run any cleanup, so the socket file usually survives. The next start must
+    // still come up: `server::bind` removes a stale file before binding. This is the case that
+    // matters after a crash, and it is the reason a leftover socket is not an error.
+    assert!(daemon.socket.exists(), "SIGKILL leaves the socket behind");
+
+    let mut child = daemon
+        .cli()
+        .arg("serve")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut reachable = false;
+    while std::time::Instant::now() < deadline {
+        let probe = daemon.cli().arg("status").output().unwrap();
+        if probe.status.success() && String::from_utf8_lossy(&probe.stdout).contains("2 record") {
+            reachable = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(reachable, "a restart over a killed daemon never became reachable");
+}
+
+#[test]
 fn init_registers_the_repository_so_the_daemon_can_find_it_later() {
     let daemon = Daemon::new();
     let project = daemon.root().join("fresh");

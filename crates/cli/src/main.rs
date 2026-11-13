@@ -26,6 +26,7 @@ use immortality_daemon::doctor::{self, Report, Status};
 
 mod client;
 mod render;
+mod serve;
 mod style;
 
 #[derive(Debug, Parser)]
@@ -107,7 +108,7 @@ enum Command {
     Merge { task: String },
     /// Rotate logs and prune artefacts. (M1)
     Gc,
-    /// Run the daemon in the foreground. (M5)
+    /// Run the daemon in the foreground until killed.
     Serve,
 }
 
@@ -145,7 +146,7 @@ async fn main() -> Result<()> {
         Command::Status { task } => status_command(task, cli.json).await,
         Command::Log { task: _ } => not_yet("log", "M5"),
         Command::Merge { task: _ } => not_yet("merge", "M5"),
-        Command::Serve => not_yet("serve", "M5"),
+        Command::Serve => serve::run().await,
     }
 }
 

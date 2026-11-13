@@ -43,13 +43,22 @@ dir = "LOGDIR"
     path
 }
 
+/// A fresh, per-invocation state directory.
+///
+/// It must be unique per call and not merely per test binary: these tests run on several threads
+/// at once, and a shared state root makes them write the same `daemon.sock` and `daemon.lock` —
+/// which showed up as a test failing only when a previous *process* had left a socket behind.
+fn fresh_state_dir() -> std::path::PathBuf {
+    let unique = immortality_core::ids::Ulid::now();
+    let path = std::env::temp_dir().join(format!("immortality-cli-test-{unique}"));
+    std::fs::create_dir_all(&path).expect("create state dir");
+    path
+}
+
 fn binary() -> Command {
     let mut command = Command::cargo_bin("immortality").expect("binary built");
     // Hermetic state: never touch the developer's real daemon directory.
-    command.env(
-        "IMMORTALITY_STATE_DIR",
-        std::env::temp_dir().join("immortality-cli-test-state"),
-    );
+    command.env("IMMORTALITY_STATE_DIR", fresh_state_dir());
     command
 }
 
@@ -207,7 +216,9 @@ fn unimplemented_commands_fail_with_the_milestone() {
     let dir = tempfile::tempdir().expect("tempdir");
     let config = dead_backend_config(dir.path());
 
-    for (command, milestone) in [("log", "M5"), ("plan", "M4"), ("serve", "M5"), ("gc", "M1")] {
+    // `serve` was on this list until M3.12; it is implemented now, so leaving it here would make
+    // the test start a real daemon and hang instead of asserting anything.
+    for (command, milestone) in [("log", "M5"), ("plan", "M4"), ("gc", "M1")] {
         binary()
             .arg("--global-config")
             .arg(&config)
