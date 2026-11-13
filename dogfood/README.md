@@ -37,6 +37,14 @@ The specifications live in `tests/` rather than inside `src/count.rs` for a seco
 that does not exist yet is not a gate at all. `cargo test nothing_matches` exits zero, so "the test
 the agent has not written" would be green for free.
 
+There is a third way the gate can never go green, and it is the one that looks like success until
+you watch it: the gate is `cargo test`, whose diff is taken against the worktree and includes every
+untracked file. Without a `.gitignore` the gate's own `target/` enters that diff, the sanity scan
+reports `Finding::Binary` for the first compiled artefact, and the subtask can never close no
+matter what the model writes — every attempt ends in `failed_gates`. `repo/.gitignore` exists for
+that reason, not for tidiness, and `tests/dogfood.rs` runs the whole rehearsal (admission, a real
+worktree, a real `cargo test` gate, a model that makes one real edit) so this cannot regress.
+
 ## Layout
 
 Each task is a directory under `tasks/` holding:

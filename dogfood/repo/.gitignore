@@ -1,0 +1,9 @@
+# Build output.
+#
+# Not tidiness: the gate is `cargo test`, whose diff is taken against the worktree and includes
+# every untracked file. Without these lines the gate's own `target/` enters the diff, `sanity`
+# reports `Finding::Binary` for the first compiled artefact, and the subtask can never close —
+# the gate would be red no matter what the model wrote. `Cargo.lock` is generated too, and a lock
+# file in the review would be noise the reviewer has to read past.
+/target
+/Cargo.lock

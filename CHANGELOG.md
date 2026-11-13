@@ -182,5 +182,13 @@ Conventional Commits.
   незакоммиченный `tests/behaviour.rs` не попадает в worktree, и гейт был бы зелёным до
   работы. `tests/dogfood.rs` проверяет красный гейт именно в worktree и наличие спецификации
   в `HEAD` (оба случая проверены саботажем).
+- Гейт фикстуры отравлял собственный diff: `cargo test` оставлял в worktree `target/`, diff
+  брался против worktree вместе с untracked-файлами, `sanity` давал `Finding::Binary` на первый
+  скомпилированный артефакт, и подзадача не могла закрыться ни при какой правке — каждый прогон
+  кончался `failed_gates`. `dogfood/repo/.gitignore` (и копия в допущенной задаче) исключает
+  `target/` и `Cargo.lock`; `tests/dogfood.rs` проводит `line-count` через производственный путь
+  целиком — `start`, настоящий worktree, настоящий `cargo test --offline` в гейте и скриптовая
+  модель с одной реальной правкой — и требует `ready_for_review` только за счёт позеленевшего
+  гейта (проверено саботажем: без `.gitignore` прогон оседает на `failed_gates`).
 
 [Unreleased]: https://github.com/OWNER/immortality/commits/main

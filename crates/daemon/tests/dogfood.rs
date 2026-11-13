@@ -36,8 +36,18 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+use immortality_core::config::{Config, Policy};
+use immortality_core::domain::TaskState;
+use immortality_core::journal::JournalReader;
+use immortality_core::metrics;
 use immortality_core::plan::{Plan, SCHEMA_VERSION};
+use immortality_core::registry::Registry;
+use immortality_daemon::runner::{FINISH_SUBTASK, Model, ModelRequest, Reply};
+use immortality_daemon::server::{Events, ServerState};
+use immortality_daemon::start;
 
 /// The deepest a task may nest, as `Config::default` sets it.
 const MAX_DEPTH: u8 = 3;
@@ -245,4 +255,241 @@ fn an_admitted_task_is_a_git_repository_of_its_own() {
     if let Err(message) = gate_fails(&target) {
         panic!("the admitted checkout's gate passes before the work: {message}");
     }
+}
+
+// ── the rehearsal ──────────────────────────────────────────────────────────────────────
+//
+// The tests above prove the fixture is red and that admitting it produces a repository the run
+// can use. This one proves the whole production path works on it: `start` is called the way
+// `serve` calls it, the cycle builds a real worktree, `RealGates` runs the plan's real
+// `cargo test --offline` inside it, and the task reaches `ready_for_review` because the work made
+// the gate green rather than because nothing checked it.
+//
+// # Why this is not a live run
+//
+// The model is the one seam; everything else — git, the worktree, the policy gate, the check
+// runner, the journal — is production code. The backend is unreachable during development, and a
+// milestone that can only be tested when a server is up is a milestone that is never tested. What
+// this cannot cover is whether a real model writes the right code; what it does cover is every
+// reason the run would fail *around* the model, which is where the two admission bugs were.
+
+/// The edit that makes `line-count`'s gate green.
+///
+/// `split` yields a trailing empty field after a final separator, so the fix is to subtract the
+/// one line that separator did not start. Filtering empty fields instead would also pass the
+/// admitted spec while being wrong about `lines("a\n\nb")`, which is a good reminder that the
+/// spec is the bar and not the truth — but a rehearsal that ships a knowingly wrong fix proves
+/// less than one that ships a right one. A real model would call `read_file` first; this answers
+/// with the edit directly, because the point here is the gate and not the exploration.
+const LINE_COUNT_FIX: &str = r#"{"path":"src/count.rs","old":"    text.split('\\n').count()","new":"    text.split('\\n').count() - usize::from(text.ends_with('\\n'))"}"#;
+
+/// A model that answers every role, and for the executor performs one real edit.
+///
+/// The planner is never asked here — the plan is admitted, and `start` respects it — so an answer
+/// for it would only hide a bug where the plan was silently regenerated.
+#[derive(Debug)]
+struct Rehearsal {
+    /// The `edit_file` arguments, sent on the first executor turn.
+    edit: String,
+    executor_calls: std::sync::atomic::AtomicUsize,
+}
+
+impl Rehearsal {
+    fn new(edit: &str) -> Arc<Self> {
+        Arc::new(Self {
+            edit: edit.to_string(),
+            executor_calls: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    fn executor_calls(&self) -> usize {
+        self.executor_calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Model for Rehearsal {
+    fn complete(&self, request: &ModelRequest) -> Result<Reply, String> {
+        let system = request
+            .messages
+            .first()
+            .and_then(|message| message.content.clone())
+            .unwrap_or_default();
+        if system == immortality_core::planner::SYSTEM {
+            return Err("the admitted plan must be run, not replaced".to_string());
+        }
+        if system == immortality_core::gate::REVIEW_SYSTEM {
+            return Ok(Reply::text(r#"{"verdict":"approve"}"#));
+        }
+        let turn = self
+            .executor_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if turn == 0 {
+            Ok(Reply::call("call_edit", "edit_file", self.edit.clone()))
+        } else {
+            Ok(Reply::call(
+                "call_finish",
+                FINISH_SUBTASK,
+                r#"{"summary":"lines no longer counts the trailing empty field"}"#,
+            ))
+        }
+    }
+}
+
+/// How long the rehearsal waits for the run's own thread.
+const REHEARSAL_BUDGET: Duration = Duration::from_secs(180);
+
+/// A registered project around `repo`, with a state root and the daemon's config moved over it.
+fn rehearsal_state(repo: &Path, model: Arc<dyn Model>) -> (tempfile::TempDir, ServerState) {
+    let state = tempfile::tempdir().expect("state dir");
+    std::fs::write(state.path().join("daemon.token"), "fixture-token").expect("token");
+    // The policy confines reads to `workspace_root`, and the default is `~/rust_projects`; the
+    // fixture lives in a temp directory, so the root has to name it.
+    let config = Config {
+        policy: Policy {
+            workspace_root: repo.parent().expect("parent").to_path_buf(),
+            ..Policy::default()
+        },
+        ..Config::default()
+    };
+    let mut registry =
+        Registry::open(state.path().join(immortality_core::registry::FILE_NAME)).expect("registry");
+    registry.register(repo, None).expect("register");
+    let server = ServerState::discover(state.path())
+        .expect("state")
+        .with_config(&config)
+        .with_model(model)
+        .with_events(Events::new());
+    (state, server)
+}
+
+/// Wait until the journal of `task` last announced `wanted`, or fail with what it did say.
+fn wait_for_state(repo: &Path, task: &str, wanted: TaskState) -> Vec<String> {
+    let agent = repo.join(immortality_core::paths::AGENT_DIR);
+    let id = immortality_core::ids::TaskId::parse(task).expect("task id");
+    let deadline = Instant::now() + REHEARSAL_BUDGET;
+    loop {
+        let states: Vec<String> = JournalReader::open(&agent, &id)
+            .expect("reader")
+            .read()
+            .expect("records")
+            .records
+            .iter()
+            .filter(|record| record.fields.kind == immortality_core::journal::Kind::TaskState)
+            .filter_map(|record| {
+                record
+                    .event
+                    .payload
+                    .get("state")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect();
+        if states.last().map(String::as_str) == Some(wanted.as_str()) {
+            return states;
+        }
+        // A settled run is not going to announce anything else, so waiting the full budget for a
+        // state it has already passed turns a wrong answer into a three-minute test. `failed_gates`
+        // is the one that matters here: it is what a green-before-work fixture produces.
+        if let Some(last) = states.last()
+            && matches!(
+                last.as_str(),
+                "ready_for_review" | "failed_gates" | "blocked" | "merged" | "cancelled"
+            )
+        {
+            panic!("the run settled on `{last}` instead of `{wanted}`; it announced {states:?}");
+        }
+        assert!(
+            Instant::now() <= deadline,
+            "the run never reached `{wanted}`; it announced {states:?}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[test]
+fn a_dogfood_task_reaches_ready_for_review_through_the_real_gate() {
+    // The M6.2 rehearsal: the production handler, a real worktree, the plan's real `cargo test`,
+    // and a model that makes one real edit. The task may only report `ready_for_review` if the
+    // gate went from red to green, so this is also the assertion that the fixture is a task and
+    // not a no-op.
+    let scratch = tempfile::tempdir().expect("tempdir");
+    let repo = scratch.path().join("repo");
+    admit_into("line-count", &repo);
+
+    // Red before the work, in the main checkout, so the run starts from the state the milestone
+    // describes. The worktree's own red is asserted by `every_dogfood_task_starts_with_a_failing_gate`.
+    if let Err(message) = gate_fails(&repo) {
+        panic!("the admitted gate is green before the work: {message}");
+    }
+
+    let model = Rehearsal::new(LINE_COUNT_FIX);
+    let (_state_dir, state) = rehearsal_state(&repo, model.clone());
+
+    let answer = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime")
+        .block_on(start::start(
+            &state,
+            &serde_json::json!({ "project": repo, "goal": "fix the line count" }),
+        ))
+        .map_err(|error| error.message)
+        .expect("the task must be admitted");
+    let task = answer["task"].as_str().expect("a task id").to_string();
+    assert_eq!(answer["planned"], false, "the admitted plan must be respected");
+
+    let states = wait_for_state(&repo, &task, TaskState::ReadyForReview);
+    assert_eq!(
+        states,
+        vec![
+            "queued",
+            "planning",
+            "awaiting_plan_approval",
+            "running",
+            "verifying",
+            "ready_for_review",
+        ],
+        "the run took an unexpected path: {states:?}"
+    );
+    assert!(
+        model.executor_calls() >= 2,
+        "the edit and the claim are two turns"
+    );
+
+    // The work exists on the task's branch, in the worktree the run created — not in the admitted
+    // checkout, which is the difference between a run and a simulation.
+    let worktree = immortality_core::worktree::WorktreeManager::new(&repo).path_for(&task);
+    assert!(worktree.is_dir(), "the run must have a worktree");
+    let count = std::fs::read_to_string(worktree.join("src").join("count.rs")).expect("count.rs");
+    let admitted = std::fs::read_to_string(repo.join("src").join("count.rs")).expect("count.rs");
+    assert_ne!(
+        count, admitted,
+        "the run claimed the subtask without changing the rule it was asked to fix"
+    );
+
+    // The gate really is green there now, and that is why the subtask closed.
+    let gate = Command::new("cargo")
+        .args(["test", "--offline", "--quiet"])
+        .current_dir(&worktree)
+        .env("CARGO_TERM_COLOR", "never")
+        .output()
+        .expect("run the gate");
+    assert!(
+        gate.status.success(),
+        "the run closed a subtask whose gate is red; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&gate.stdout),
+        String::from_utf8_lossy(&gate.stderr)
+    );
+
+    // And the numbers a reader of `docs/metrics-v0.1.md` will check are in the journal, not in
+    // this test: one subtask, closed green, no escalation.
+    let id = immortality_core::ids::TaskId::parse(&task).expect("task id");
+    let records = JournalReader::open(repo.join(immortality_core::paths::AGENT_DIR), &id)
+        .expect("reader")
+        .read()
+        .expect("records");
+    let report = metrics::compute(&task, &records.records);
+    assert_eq!(report.closed_green, 1, "{report:?}");
+    assert_eq!(report.closed_with_escalation, 0, "{report:?}");
+    assert_eq!(report.escalations_pending, 0, "{report:?}");
 }
