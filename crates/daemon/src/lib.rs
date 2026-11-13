@@ -15,6 +15,7 @@ pub mod gates;
 pub mod recovery;
 pub mod rpc;
 pub mod runner;
+pub mod scheduling;
 pub mod server;
 pub mod service;
 pub mod startup;

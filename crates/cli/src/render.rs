@@ -77,6 +77,19 @@ pub fn status(result: &Value, style: Style) -> String {
     for task in tasks {
         render_task_line(&mut out, task, style);
     }
+
+    // Why nothing is running, when nothing is. An idle daemon with a table a human must interpret
+    // is the failure mode this project exists to avoid; the four reasons have four different
+    // fixes, so the line names the one that applies rather than leaving it to be guessed.
+    if let Some(scheduling) = result.get("scheduling") {
+        if let Some(error) = scheduling.get("error").and_then(Value::as_str) {
+            let _ = writeln!(out, "\n{}: {error}", style.yellow("scheduling unavailable"));
+        } else if let Some(reason) = scheduling.get("reason").and_then(Value::as_str)
+            && !reason.is_empty()
+        {
+            let _ = writeln!(out, "\n{}  {reason}", style.yellow("idle:"));
+        }
+    }
     out
 }
 
@@ -1021,6 +1034,53 @@ mod tests {
         // something a human can act on rather than crash on a `None`.
         let out = status(&json!({"projects": [{}], "tasks": [{"journal": {}}]}), PLAIN);
         assert!(out.contains('?'), "{out}");
+    }
+
+    #[test]
+    fn an_idle_daemon_says_why_it_is_idle() {
+        // A table with no explanation is what makes a human assume the daemon died. The four
+        // reasons have four different fixes, so the line has to name the one that applies.
+        let out = status(
+            &json!({
+                "projects": [{}],
+                "tasks": [{"journal": {}}],
+                "scheduling": {"next": null, "reason": "2 waiting for the model backend"},
+            }),
+            PLAIN,
+        );
+        assert!(out.contains("idle:"), "{out}");
+        assert!(out.contains("2 waiting for the model backend"), "{out}");
+    }
+
+    #[test]
+    fn a_busy_daemon_does_not_print_an_idle_line() {
+        // The other half: a next task present means something is running, and an `idle:` line
+        // beside it would be a lie the human has to resolve by reading the table.
+        let out = status(
+            &json!({
+                "projects": [{}],
+                "tasks": [{"journal": {}}],
+                "scheduling": {"next": "tsk_01", "reason": ""},
+            }),
+            PLAIN,
+        );
+        assert!(!out.contains("idle:"), "{out}");
+    }
+
+    #[test]
+    fn an_unavailable_scheduling_answer_is_said_out_loud() {
+        // "Could not compute" is not "nothing to run": reporting the second when the first is
+        // true would hide a broken registry behind a plausible idle daemon.
+        let out = status(
+            &json!({
+                "projects": [{}],
+                "tasks": [{"journal": {}}],
+                "scheduling": {"error": "cannot read registry.json"},
+            }),
+            PLAIN,
+        );
+        assert!(out.contains("scheduling unavailable"), "{out}");
+        assert!(out.contains("cannot read registry.json"), "{out}");
     }
 
     #[test]

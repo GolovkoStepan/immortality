@@ -31,6 +31,9 @@
 //! something is genuinely unresolved (an unmet dependency that is still pending) rather than
 //! whenever any subtask failed.
 
+pub mod backend;
+pub mod queue;
+
 use crate::domain::{Subtask, SubtaskId, SubtaskState, SubtaskTrigger, Timestamp};
 use crate::journal::{Journal, Kind, Scope};
 use crate::plan::{Plan, PlanError};

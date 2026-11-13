@@ -199,15 +199,23 @@ pub async fn run() -> Result<()> {
     }
 
     ensure_token(&state.daemon_token())?;
+    // The loaded config, not the built-in defaults: the plan depth limit is a user setting, and a
+    // `status` that read plans against a different limit than the scheduler would disagree with it
+    // about whether a tree is valid.
+    let loaded = config::load(&Overrides::default())?;
+    for warning in &loaded.warnings {
+        tracing::warn!("{warning}");
+    }
     let server_state = ServerState::discover(&root)
         .map_err(|error| anyhow::anyhow!("{error}"))
-        .context("the daemon cannot start")?;
+        .context("the daemon cannot start")?
+        .with_config(&loaded.config);
 
     // Recovery runs before the socket is bound, so no client can observe a task mid-repair. It is
     // blocking work (journals, git, the filesystem) with nothing else competing for the runtime —
     // `bind` has not happened yet — so a plain call is the honest shape rather than a
     // `spawn_blocking` that would only move the wait to another thread.
-    let touched = recover_all(&root);
+    let touched = recover_all(&root, &loaded.config);
 
     let socket = state.daemon_socket();
     let listener = server::bind(&socket).map_err(|error| anyhow::anyhow!("{error}"))?;
@@ -248,7 +256,7 @@ pub async fn run() -> Result<()> {
 /// because one task's journal is unreadable — would make a single bad task unobservable through
 /// every command, including the ones a human needs to inspect it. A blocked task is a *result* of
 /// recovery, not a failure of it; only an error that leaves no marker anywhere is logged loudly.
-fn recover_all(root: &Path) -> Vec<(TaskId, PathBuf)> {
+fn recover_all(root: &Path, config: &Config) -> Vec<(TaskId, PathBuf)> {
     let registry_path = root.join(immortality_core::registry::FILE_NAME);
     let registry = match Registry::open(&registry_path) {
         Ok(registry) => registry,
@@ -264,25 +272,9 @@ fn recover_all(root: &Path) -> Vec<(TaskId, PathBuf)> {
             return Vec::new();
         }
     };
-    // The global config is read once: every task's policy gate has to be built from the same
-    // rules, and a per-task reload would let a file edited mid-start make two tasks disagree.
-    let config = match config::load(&Overrides {
-        base_url: None,
-        model: None,
-        log_level: None,
-        global_config: None,
-        project_config: None,
-    }) {
-        Ok(loaded) => loaded.config,
-        Err(error) => {
-            tracing::warn!("cannot read the global config, using defaults: {error}");
-            Config::default()
-        }
-    };
-
     let mut touched = Vec::new();
     for (project, task, task_dir) in known {
-        match recover_one(&config, root, &project, &task, &task_dir) {
+        match recover_one(config, root, &project, &task, &task_dir) {
             Ok(Some(recovered)) => {
                 eprintln!(
                     "recovered {task}: {} ({})",

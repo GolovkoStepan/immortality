@@ -50,6 +50,13 @@ pub struct ServerState {
     pub state_root: PathBuf,
     /// The token a client must present.
     pub token: String,
+    /// How deep a subtask tree may grow, from `LoopLimits::max_subtask_depth`.
+    ///
+    /// Carried here because `status` has to *read* plans — `Plan::load` validates depth, so a
+    /// reader without the limit cannot load a tree at all. Defaulting it per call would make the
+    /// limit a property of the reader rather than of the daemon, and a plan that one call accepts
+    /// and another refuses is the kind of disagreement that shows up as "it ran yesterday".
+    pub max_subtask_depth: u8,
 }
 
 impl ServerState {
@@ -71,7 +78,24 @@ impl ServerState {
                 token_path.display()
             )));
         }
-        Ok(Self { state_root, token })
+        Ok(Self {
+            state_root,
+            token,
+            max_subtask_depth: immortality_core::config::Config::default()
+                .loop_
+                .max_subtask_depth,
+        })
+    }
+
+    /// The same state with `config`'s plan limits.
+    ///
+    /// The token and state root are the daemon's; only the limits come from configuration. A caller
+    /// that has just loaded the config must use this, or `status` will read plans against built-in
+    /// limits and refuse a tree the scheduler would happily run.
+    #[must_use]
+    pub const fn with_config(mut self, config: &immortality_core::config::Config) -> Self {
+        self.max_subtask_depth = config.loop_.max_subtask_depth;
+        self
     }
 
     /// The registry file.
@@ -545,7 +569,50 @@ fn status(state: &ServerState, params: &Value) -> Result<Value, RpcError> {
         ));
     }
 
-    Ok(json!({"projects": projects, "tasks": tasks, "version": rpc::VERSION}))
+    // Why nothing is running, when nothing is. An idle daemon with an empty table is the failure
+    // this project exists to avoid, so the answer carries the reason and `status` renders it: the
+    // four reasons have four different fixes, and "no tasks" is not one of them.
+    let scheduling = scheduling_reason(state);
+
+    Ok(json!({
+        "projects": projects,
+        "tasks": tasks,
+        "scheduling": scheduling,
+        "version": rpc::VERSION,
+    }))
+}
+
+/// What the scheduler would do right now, and why it would do nothing.
+///
+/// Read through the same [`crate::scheduling::candidates`] the scheduler uses, so `status` cannot
+/// report a task as runnable when the queue has already rejected it for a reason it does not know.
+/// A read failure is reported as text rather than omitted: a human whose daemon is idle needs to
+/// know that the answer could not be computed, which is different from "nothing to run".
+fn scheduling_reason(state: &ServerState) -> Value {
+    let mut config = immortality_core::config::Config::default();
+    config.loop_.max_subtask_depth = state.max_subtask_depth;
+    let registry = match Registry::open(state.registry_path()) {
+        Ok(registry) => registry,
+        Err(error) => return json!({"error": error.to_string()}),
+    };
+    let candidates = match crate::scheduling::candidates(&registry, &state.state_root, &config) {
+        Ok(candidates) => candidates,
+        Err(error) => return json!({"error": error.to_string()}),
+    };
+    let queue = immortality_core::scheduler::queue::Queue::new();
+    let all: Vec<immortality_core::scheduler::queue::Candidate> = candidates
+        .into_iter()
+        .map(|scheduled| scheduled.candidate)
+        .collect();
+    let (chosen, rejected) = queue.next_for_inference(&all);
+    json!({
+        "next": chosen.map(|candidate| candidate.task.clone()),
+        "reason": if chosen.is_some() {
+            String::new()
+        } else {
+            immortality_core::scheduler::queue::summarise(&rejected)
+        },
+    })
 }
 
 /// A one-line summary of one task's share of its repository's journal.
