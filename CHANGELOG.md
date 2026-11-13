@@ -175,5 +175,12 @@ Conventional Commits.
   возобновление читало её как `Stuck`: `next_ready` предлагает только `pending`. Теперь
   `Abandon` возвращает `pending`, а брошенные `kill -9` подзадачи адоптируются циклом до
   первого планирования (D-091).
+- `dogfood/scripts/admit.sh` допускал задачу в каталог, который не был собственным
+  git-репозиторием: `dogfood/repo` — подкаталог этого репозитория, поэтому `git worktree add`
+  из него дал бы worktree `immortality`, и агент получил бы чужой workspace. Теперь задача
+  копируется в `dogfood/work/<task>`, там делается `git init`, и спецификация коммитится:
+  незакоммиченный `tests/behaviour.rs` не попадает в worktree, и гейт был бы зелёным до
+  работы. `tests/dogfood.rs` проверяет красный гейт именно в worktree и наличие спецификации
+  в `HEAD` (оба случая проверены саботажем).
 
 [Unreleased]: https://github.com/OWNER/immortality/commits/main

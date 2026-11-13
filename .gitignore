@@ -24,4 +24,6 @@ daemon.token
 /dogfood/repo/target
 /dogfood/repo/tests
 /dogfood/repo/Cargo.lock
-/dogfood/repo-agent
+# The admitted copies and the worktrees created from them. Each is the output of a run.
+/dogfood/work
+/dogfood/work-agent
