@@ -443,8 +443,17 @@ async fn an_unknown_method_names_the_known_ones() {
     let error = response.error.expect("an unknown method must be refused");
     assert_eq!(error.code, ErrorCode::UnknownMethod);
     assert!(error.message.contains("status"), "{error:?}");
-    // `gc` is not implemented at this milestone, and the refusal says so by not listing it.
-    assert!(!error.message.contains("gc"), "{error:?}");
+    // The list is the build's own `METHODS`, so it cannot claim a method that will be refused or
+    // omit one that works: both would make the refusal send a human to the wrong place. Read from
+    // the constant rather than written out here — a literal is a second copy that goes stale, as
+    // the assertion this replaced did when `gc` was implemented.
+    for method in immortality_daemon::rpc::METHODS {
+        assert!(error.message.contains(method), "`{method}` missing: {error:?}");
+    }
+    // `push` appears in the sentence ("`push` is not a method"), so the check is against the list
+    // after the colon, which is the part a human reads as "what can I call instead".
+    let known = error.message.split("known methods: ").nth(1).expect("a list");
+    assert!(!known.contains("push"), "{error:?}");
 }
 
 // ── status ────────────────────────────────────────────────────────────────────

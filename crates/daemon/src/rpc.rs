@@ -192,11 +192,21 @@ pub struct HelloParams {
 
 /// The methods this build answers. Closed, for the same reason as [`ErrorCode`].
 ///
-/// `gc` is deliberately absent: it needs the live set from the scheduler and the storage
-/// thresholds from the global config, neither of which this milestone's daemon holds. A
-/// handler that answered `{"ok": true}` without collecting anything would be worse than one
-/// that does not exist — an `UnknownMethod` refusal is true, a fake success is not.
-pub const METHODS: &[&str] = &["hello", "status", "escalations", "approve", "attach"];
+/// Every method needs the daemon's own state — the journal it exclusively writes, the config it
+/// was started with, or the live set from the scheduler. A method that could be answered by a
+/// client alone is a method that does not belong here: two readers of the same files are two
+/// implementations that will disagree.
+pub const METHODS: &[&str] = &[
+    "hello",
+    "status",
+    "escalations",
+    "approve",
+    "attach",
+    "plan",
+    "log",
+    "gc",
+    "merge",
+];
 
 /// Whether `method` is one this build knows.
 #[must_use]

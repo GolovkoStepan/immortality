@@ -189,6 +189,217 @@ pub fn approved(result: &Value, style: Style) -> String {
     )
 }
 
+/// The plan as read from disk, or the reason it cannot be read.
+///
+/// The load error is printed as a report, not raised: a tree that fails validation is exactly
+/// what a human ran `immortality plan` to see, and the daemon's own message already names the
+/// subtask and the field.
+#[must_use]
+pub fn plan(result: &Value, style: Style) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "{}  {}",
+        style.bold(&text(result, "project")),
+        style.dim(&text(result, "root"))
+    );
+    if let Some(error) = result.get("load_error").and_then(Value::as_str) {
+        let _ = writeln!(out, "\n{}", style.red(&format!("cannot read the plan: {error}")));
+        // The file's location is the actionable half: the message says *what* is wrong, this says
+        // where to fix it.
+        let _ = writeln!(
+            out,
+            "  expected at {}/.agent/TASKS.json and {}/.agent/ACCEPTANCE.md",
+            text(result, "root"),
+            text(result, "root")
+        );
+        return out;
+    }
+    let subtasks = result
+        .get("subtasks")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    if subtasks.is_empty() {
+        let _ = writeln!(out, "\nthe plan is valid and has no subtasks.");
+        return out;
+    }
+    let depth = result
+        .get("max_subtask_depth")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let _ = writeln!(
+        out,
+        "\n{} ({}), depth limit {depth}",
+        style.bold(&format!("{} subtask(s)", subtasks.len())),
+        text(result, "project")
+    );
+    for subtask in subtasks {
+        render_subtask_line(&mut out, subtask, 0, style);
+    }
+    out
+}
+
+/// One subtask and its children, indented by depth.
+fn render_subtask_line(out: &mut String, subtask: &Value, depth: usize, style: Style) {
+    use std::fmt::Write as _;
+
+    let state = text(subtask, "state");
+    let painted = match state.as_str() {
+        "done" => style.green(&state),
+        "blocked" | "failed" => style.red(&state),
+        "pending" => style.dim(&state),
+        _ => style.yellow(&state),
+    };
+    let indent = "  ".repeat(depth + 1);
+    let _ = writeln!(
+        out,
+        "{indent}{painted:<12} {}  {}",
+        style.cyan(&text(subtask, "id")),
+        text(subtask, "title")
+    );
+    for child in subtask
+        .get("children")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+    {
+        render_subtask_line(out, child, depth + 1, style);
+    }
+}
+
+/// A transcript: every record, one block or line each, in journal order.
+///
+/// Rendered through the same [`Renderer`] as `attach`, because a transcript that looked different
+/// from the live stream would make a human re-learn how to read it — and the records are the same
+/// records.
+#[must_use]
+pub fn log(result: &Value, style: Style) -> String {
+    use std::fmt::Write as _;
+
+    let records = result
+        .get("records")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let mut out = String::new();
+    let corrupt = result.get("corrupt").and_then(Value::as_bool) == Some(true);
+    if corrupt {
+        let _ = writeln!(
+            out,
+            "{}",
+            style.red("the journal fails its own chain check; records below are what survived")
+        );
+    }
+    if records.is_empty() {
+        // Two different facts, and the difference changes what a human does: an unreadable journal
+        // is not a task that never ran, and calling it "not started" would send them looking for a
+        // task that is already there.
+        let _ = writeln!(
+            out,
+            "{}",
+            if corrupt {
+                format!("no record of {} survived the damage.", text(result, "task"))
+            } else {
+                format!(
+                    "no records for {} yet: the task has not started.",
+                    text(result, "task")
+                )
+            }
+        );
+        return out;
+    }
+    let mut renderer = Renderer::new(style);
+    for record in records {
+        out.push_str(&renderer.line(record));
+    }
+    let _ = writeln!(
+        out,
+        "{}",
+        style.dim(&format!(
+            "{} record(s), next seq {}",
+            records.len(),
+            result.get("next_seq").and_then(Value::as_u64).unwrap_or(0)
+        ))
+    );
+    out
+}
+
+/// What `gc` did, or what it would do.
+#[must_use]
+pub fn gc_report(result: &Value, style: Style) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    if result.get("dry_run").and_then(Value::as_bool) == Some(true) {
+        let _ = writeln!(out, "{}", style.yellow("dry run: nothing was deleted"));
+    }
+    let protected = result.get("protected").and_then(Value::as_u64).unwrap_or(0);
+    let unfinished = result
+        .get("unfinished")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let _ = writeln!(
+        out,
+        "{} artifact digest(s) kept because {} task(s) are unfinished",
+        protected,
+        unfinished.len()
+    );
+    for task in unfinished {
+        let _ = writeln!(out, "  {}", style.dim(task.as_str().unwrap_or("?")));
+    }
+    if result.get("dry_run").and_then(Value::as_bool) == Some(true) {
+        return out;
+    }
+    let removed = result
+        .get("artifacts_removed")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let bytes = result.get("bytes_reclaimed").and_then(Value::as_u64).unwrap_or(0);
+    let temp = result.get("temp_removed").and_then(Value::as_u64).unwrap_or(0);
+    let _ = writeln!(
+        out,
+        "{} artifact(s) removed, {} reclaimed, {} temp file(s) removed",
+        removed,
+        human_bytes(bytes),
+        temp
+    );
+    if result.get("noop").and_then(Value::as_bool) == Some(true) {
+        let _ = writeln!(out, "{}", style.dim("nothing needed collecting."));
+    }
+    out
+}
+
+/// Bytes as a human reads them.
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+/// The confirmation after a merge.
+#[must_use]
+pub fn merged(result: &Value, style: Style) -> String {
+    format!(
+        "merged {} into {}\n  state: {}\n",
+        style.cyan(&text(result, "branch")),
+        text(result, "path"),
+        style.green(&text(result, "state"))
+    )
+}
+
 /// A client-side notice, for the things that are not journal records.
 ///
 /// Written in the same gutter as the stream so it reads as part of it, but with no sequence
@@ -1148,6 +1359,201 @@ mod tests {
         }));
         assert!(first.contains("read_file"), "{first}");
         assert!(second.contains("shell"), "{second}");
+    }
+
+    #[test]
+    fn a_readable_plan_lists_each_subtask_with_its_state() {
+        let out = plan(
+            &json!({
+                "project": "repo-abc",
+                "root": "/tmp/repo",
+                "max_subtask_depth": 2,
+                "count": 2,
+                "subtasks": [
+                    {"id": "sub_01", "state": "done", "title": "write the parser", "children": []},
+                    {"id": "sub_02", "state": "pending", "title": "add tests", "children": []},
+                ],
+            }),
+            PLAIN,
+        );
+        assert!(out.contains("2 subtask(s)"), "{out}");
+        assert!(out.contains("depth limit 2"), "{out}");
+        assert!(out.contains("write the parser"), "{out}");
+        assert!(out.contains("add tests"), "{out}");
+    }
+
+    #[test]
+    fn children_are_indented_under_their_parent() {
+        // The whole point of a tree view: which subtask belongs to which. A flat list would make
+        // `plan` silently the same command as `grep title TASKS.json`.
+        let out = plan(
+            &json!({
+                "project": "repo-abc", "root": "/tmp/repo", "max_subtask_depth": 2,
+                "subtasks": [{
+                    "id": "sub_01", "state": "running", "title": "parent",
+                    "children": [{"id": "sub_02", "state": "pending", "title": "child", "children": []}],
+                }],
+            }),
+            PLAIN,
+        );
+        let parent = out.lines().find(|line| line.contains("parent")).unwrap();
+        let child = out.lines().find(|line| line.contains("child")).unwrap();
+        let indent = |line: &str| line.len() - line.trim_start().len();
+        assert!(
+            indent(child) > indent(parent),
+            "child indented deeper than parent:\n{out}"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_plan_names_the_files_to_fix() {
+        // The message says what is wrong; the paths say where. A human without the paths has to
+        // remember the layout, which is exactly the knowledge they ran the command to avoid.
+        let out = plan(
+            &json!({
+                "project": "repo-abc", "root": "/tmp/repo",
+                "load_error": "TASKS.json is not valid JSON",
+            }),
+            PLAIN,
+        );
+        assert!(out.contains("cannot read the plan"), "{out}");
+        assert!(out.contains("TASKS.json is not valid JSON"), "{out}");
+        assert!(out.contains("/tmp/repo/.agent/TASKS.json"), "{out}");
+        assert!(out.contains("/tmp/repo/.agent/ACCEPTANCE.md"), "{out}");
+    }
+
+    #[test]
+    fn an_empty_task_log_says_the_task_has_not_started() {
+        let out = log(&json!({"task": "tsk_01", "records": [], "next_seq": 0}), PLAIN);
+        assert!(out.contains("tsk_01"), "{out}");
+        assert!(out.contains("has not started"), "{out}");
+    }
+
+    #[test]
+    fn a_log_renders_records_the_same_way_attach_does() {
+        // One renderer for both, or a human re-learns how to read their own transcript.
+        let record = json!({
+            "seq": 7, "kind": "tool_call_intent",
+            "payload": {"call": "c", "tool": "read_file", "expected_effect": "look"}
+        });
+        let out = log(
+            &json!({"task": "tsk_01", "records": [&record], "next_seq": 8}),
+            PLAIN,
+        );
+        assert!(out.contains(&rendered(&record)), "{out}");
+        assert!(out.contains("read_file"), "{out}");
+        assert!(out.contains("next seq 8"), "{out}");
+    }
+
+    #[test]
+    fn a_corrupt_journal_is_announced_before_its_records() {
+        // "These records are what survived" is a different reading from "here is the history",
+        // and only the announcement distinguishes them.
+        let out = log(
+            &json!({"task": "tsk_01", "corrupt": true, "records": [], "next_seq": 0}),
+            PLAIN,
+        );
+        assert!(out.contains("chain check"), "{out}");
+        // And it must not claim the task never ran: that is a different fact, and it sends a human
+        // looking for work that is already on disk.
+        assert!(!out.contains("has not started"), "{out}");
+        assert!(out.contains("survived the damage"), "{out}");
+    }
+
+    #[test]
+    fn a_dry_run_gc_says_nothing_was_deleted() {
+        let out = gc_report(
+            &json!({"dry_run": true, "protected": 3, "unfinished": ["tsk_01"]}),
+            PLAIN,
+        );
+        assert!(out.contains("nothing was deleted"), "{out}");
+        assert!(out.contains('3'), "{out}");
+        assert!(out.contains("tsk_01"), "{out}");
+        assert!(
+            !out.contains("reclaimed"),
+            "a dry run must not report collecting: {out}"
+        );
+    }
+
+    #[test]
+    fn a_real_gc_reports_what_it_reclaimed() {
+        let out = gc_report(
+            &json!({
+                "dry_run": false, "protected": 0, "unfinished": [],
+                "artifacts_removed": 5, "bytes_reclaimed": 2_097_152, "temp_removed": 1,
+                "noop": false,
+            }),
+            PLAIN,
+        );
+        assert!(out.contains('5'), "{out}");
+        assert!(out.contains("2.0 MiB"), "bytes are human-readable: {out}");
+        assert!(!out.contains("nothing was deleted"), "{out}");
+    }
+
+    #[test]
+    fn a_noop_gc_says_so_rather_than_printing_zeros() {
+        let out = gc_report(
+            &json!({
+                "dry_run": false, "protected": 0, "unfinished": [],
+                "artifacts_removed": 0, "bytes_reclaimed": 0, "temp_removed": 0, "noop": true,
+            }),
+            PLAIN,
+        );
+        assert!(out.contains("nothing needed collecting"), "{out}");
+    }
+
+    #[test]
+    fn human_bytes_never_prints_a_bare_float() {
+        assert_eq!(human_bytes(0), "0 B");
+        assert_eq!(human_bytes(999), "999 B");
+        assert_eq!(human_bytes(1024), "1.0 KiB");
+        assert_eq!(human_bytes(1024 * 1024), "1.0 MiB");
+        assert!(human_bytes(u64::MAX).contains("GiB"));
+    }
+
+    #[test]
+    fn a_merge_confirmation_names_the_branch_and_the_state() {
+        let out = merged(
+            &json!({"branch": "agent/tsk_01", "path": "/tmp/repo", "state": "merged"}),
+            PLAIN,
+        );
+        assert!(out.contains("agent/tsk_01"), "{out}");
+        assert!(out.contains("/tmp/repo"), "{out}");
+        assert!(out.contains("merged"), "{out}");
+    }
+
+    #[test]
+    fn the_new_reports_emit_no_escape_bytes_in_a_pipe() {
+        // The same guarantee as the stream, extended to the commands added beside it: redirecting
+        // any of them to a file must not write terminal control codes into that file.
+        let outputs = [
+            plan(
+                &json!({
+                    "project": "p", "root": "/r", "max_subtask_depth": 1,
+                    "subtasks": [{"id": "s", "state": "done", "title": "t", "children": []}],
+                }),
+                PLAIN,
+            ),
+            plan(&json!({"project": "p", "root": "/r", "load_error": "bad"}), PLAIN),
+            log(
+                &json!({"task": "t", "records": [{"seq": 1, "kind": "task_state", "payload": {"state": "running"}}]}),
+                PLAIN,
+            ),
+            gc_report(
+                &json!({"dry_run": true, "protected": 1, "unfinished": ["t"]}),
+                PLAIN,
+            ),
+            gc_report(
+                &json!({"dry_run": false, "protected": 0, "unfinished": [], "artifacts_removed": 1,
+                        "bytes_reclaimed": 2048, "temp_removed": 0, "noop": false}),
+                PLAIN,
+            ),
+            merged(&json!({"branch": "b", "path": "/p", "state": "merged"}), PLAIN),
+        ];
+        for out in outputs {
+            assert_ne!(out, String::new(), "every report prints something");
+            assert!(!out.contains('\u{1b}'), "{out:?}");
+        }
     }
 
     #[test]

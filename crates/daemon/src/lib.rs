@@ -10,6 +10,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 pub mod checkpoints;
+pub mod commands;
 pub mod doctor;
 pub mod gates;
 pub mod recovery;

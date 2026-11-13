@@ -212,22 +212,45 @@ fn approve_requires_an_id_and_an_answer() {
 }
 
 #[test]
-fn unimplemented_commands_fail_with_the_milestone() {
+fn every_command_without_a_daemon_says_so_and_changes_nothing() {
+    // The roadmap's requirement for this milestone, stated as one test: each command answers a
+    // missing daemon with the socket path and the fact that nothing was changed. "Connection
+    // refused" alone sends a human looking for a network problem that does not exist, and silence
+    // would look like success.
+    //
+    // `start` is on the list with a milestone instead of a socket error, because the run loop
+    // lands in M5.8 — the message has to name what it waits for rather than pretend to work.
     let dir = tempfile::tempdir().expect("tempdir");
     let config = dead_backend_config(dir.path());
+    let task = "tsk_01ARZ3NDEKTSV4RRFFQ69G5FAV";
 
-    // `serve` was on this list until M3.12; it is implemented now, so leaving it here would make
-    // the test start a real daemon and hang instead of asserting anything.
-    for (command, milestone) in [("log", "M5"), ("plan", "M4"), ("gc", "M1")] {
+    for args in [
+        vec!["status"],
+        vec!["escalations"],
+        vec!["plan"],
+        vec!["log"],
+        vec!["gc"],
+        vec!["gc", "--dry-run"],
+        vec!["merge", task],
+        vec!["attach"],
+    ] {
         binary()
             .arg("--global-config")
             .arg(&config)
-            .arg(command)
+            .args(&args)
             .assert()
             .failure()
-            .stderr(predicate::str::contains(milestone))
-            .stderr(predicate::str::contains(command));
+            .stderr(predicate::str::contains("daemon.sock"))
+            .stderr(predicate::str::contains("nothing was changed"));
     }
+
+    binary()
+        .arg("--global-config")
+        .arg(&config)
+        .args(["start", "do a thing"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("M5.8"));
 }
 
 #[test]

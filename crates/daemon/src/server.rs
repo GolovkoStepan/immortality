@@ -50,13 +50,13 @@ pub struct ServerState {
     pub state_root: PathBuf,
     /// The token a client must present.
     pub token: String,
-    /// How deep a subtask tree may grow, from `LoopLimits::max_subtask_depth`.
+    /// The configuration the daemon was started with.
     ///
-    /// Carried here because `status` has to *read* plans — `Plan::load` validates depth, so a
-    /// reader without the limit cannot load a tree at all. Defaulting it per call would make the
-    /// limit a property of the reader rather than of the daemon, and a plan that one call accepts
-    /// and another refuses is the kind of disagreement that shows up as "it ran yesterday".
-    pub max_subtask_depth: u8,
+    /// Carried whole rather than field by field because several handlers need a different piece of
+    /// it — `status` and `plan` the depth limit, `gc` the retention policy — and a reader that
+    /// invented its own defaults would answer differently from the scheduler about the same tree.
+    /// That disagreement shows up as "it ran yesterday".
+    pub config: immortality_core::config::Config,
 }
 
 impl ServerState {
@@ -81,21 +81,34 @@ impl ServerState {
         Ok(Self {
             state_root,
             token,
-            max_subtask_depth: immortality_core::config::Config::default()
-                .loop_
-                .max_subtask_depth,
+            config: immortality_core::config::Config::default(),
         })
     }
 
-    /// The same state with `config`'s plan limits.
+    /// The same state with the loaded configuration.
     ///
-    /// The token and state root are the daemon's; only the limits come from configuration. A caller
-    /// that has just loaded the config must use this, or `status` will read plans against built-in
-    /// limits and refuse a tree the scheduler would happily run.
+    /// The token and state root are the daemon's; the config comes from the caller, which has just
+    /// loaded it. A daemon that used built-in defaults would read plans against a depth limit and
+    /// run `gc` against a retention policy that no human configured.
     #[must_use]
-    pub const fn with_config(mut self, config: &immortality_core::config::Config) -> Self {
-        self.max_subtask_depth = config.loop_.max_subtask_depth;
+    pub fn with_config(mut self, config: &immortality_core::config::Config) -> Self {
+        self.config = config.clone();
         self
+    }
+
+    /// Where content-addressed artifacts live.
+    ///
+    /// Under the state root, not the project: an artifact body is shared by every task that
+    /// produced the same bytes, and `gc` works on the store as a whole.
+    #[must_use]
+    pub fn artifacts_dir(&self) -> PathBuf {
+        self.state_root.join("artifacts")
+    }
+
+    /// Where `tracing` writes its log files, which `gc` compresses and prunes.
+    #[must_use]
+    pub fn logs_dir(&self) -> PathBuf {
+        self.config.logging.dir.clone()
     }
 
     /// The registry file.
@@ -503,6 +516,10 @@ fn dispatch(request: &Request, state: &ServerState) -> Result<Value, RpcError> {
         "escalations" => escalations(state, &request.params),
         "approve" => approve(state, &request.params),
         "attach" => attach(state, &request.params),
+        "plan" => crate::commands::plan(state, &request.params),
+        "log" => crate::commands::log(state, &request.params),
+        "gc" => crate::commands::collect_garbage(state, &request.params),
+        "merge" => crate::commands::merge(state, &request.params),
         "hello" => Ok(json!({"version": rpc::VERSION})),
         other => Err(RpcError::new(
             ErrorCode::UnknownMethod,
@@ -589,13 +606,11 @@ fn status(state: &ServerState, params: &Value) -> Result<Value, RpcError> {
 /// A read failure is reported as text rather than omitted: a human whose daemon is idle needs to
 /// know that the answer could not be computed, which is different from "nothing to run".
 fn scheduling_reason(state: &ServerState) -> Value {
-    let mut config = immortality_core::config::Config::default();
-    config.loop_.max_subtask_depth = state.max_subtask_depth;
     let registry = match Registry::open(state.registry_path()) {
         Ok(registry) => registry,
         Err(error) => return json!({"error": error.to_string()}),
     };
-    let candidates = match crate::scheduling::candidates(&registry, &state.state_root, &config) {
+    let candidates = match crate::scheduling::candidates(&registry, &state.state_root, &state.config) {
         Ok(candidates) => candidates,
         Err(error) => return json!({"error": error.to_string()}),
     };

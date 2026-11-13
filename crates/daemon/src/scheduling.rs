@@ -136,7 +136,7 @@ fn facts_for(project: &Project, task: &immortality_core::ids::TaskId, config: &C
 }
 
 /// The state the last `task_state` record announced.
-fn last_task_state(records: &[immortality_core::journal::JournalRecord]) -> Option<TaskState> {
+pub fn last_task_state(records: &[immortality_core::journal::JournalRecord]) -> Option<TaskState> {
     records
         .iter()
         .rev()

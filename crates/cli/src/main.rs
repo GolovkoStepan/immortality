@@ -89,8 +89,12 @@ enum Command {
         /// One task, instead of every task this daemon knows.
         task: Option<String>,
     },
-    /// Show or edit the plan. (M4)
-    Plan,
+    /// Show the plan as the daemon reads it.
+    Plan {
+        /// A registered project path. Defaults to the current directory.
+        #[arg(long)]
+        project: Option<String>,
+    },
     /// List pending escalations. (M3)
     Escalations {
         /// One task, instead of every task this daemon knows.
@@ -107,8 +111,12 @@ enum Command {
     Log { task: Option<String> },
     /// Merge a finished task branch into main. Human action only. (M5)
     Merge { task: String },
-    /// Rotate logs and prune artefacts. (M1)
-    Gc,
+    /// Rotate logs and prune artefacts.
+    Gc {
+        /// Report what would be collected without deleting anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Run the daemon in the foreground until killed.
     Serve,
     /// Manage the launchd agent that runs the daemon in the background.
@@ -147,7 +155,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Command::Doctor => doctor_command(&loaded, cli.json).await,
-        Command::Gc => not_yet("gc", "M1"),
+        Command::Gc { dry_run } => gc_command(dry_run, cli.json).await,
         Command::Escalations { task } => escalations_command(task, cli.json).await,
         Command::Approve { id, answer } => approve_command(&id, &answer, cli.json).await,
         Command::Init => init_command(&loaded, cli.json),
@@ -155,13 +163,13 @@ async fn main() -> Result<()> {
             if goal.trim().is_empty() {
                 anyhow::bail!("goal must not be empty");
             }
-            not_yet("start", "M4")
+            not_yet("start", "M5.8")
         }
-        Command::Plan => not_yet("plan", "M4"),
+        Command::Plan { project } => plan_command(project, cli.json).await,
         Command::Attach { task, since_seq } => attach_command(task, since_seq, cli.json).await,
         Command::Status { task } => status_command(task, cli.json).await,
-        Command::Log { task: _ } => not_yet("log", "M5"),
-        Command::Merge { task: _ } => not_yet("merge", "M5"),
+        Command::Log { task } => log_command(task, cli.json).await,
+        Command::Merge { task } => merge_command(&task, cli.json).await,
         Command::Serve => serve::run().await,
         Command::Service { action } => service_command(&action, cli.json),
     }
@@ -294,6 +302,77 @@ async fn status_command(task: Option<String>, json: bool) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&result)?);
     } else {
         print!("{}", render::status(&result, style()));
+    }
+    Ok(())
+}
+
+/// `plan`: the tree as the scheduler reads it.
+///
+/// The project defaults to the current directory, which is what a human means when they type
+/// `immortality plan` inside a repository. An unregistered directory is an error rather than a
+/// guess: the daemon has no task there, so there is no tree for it to read.
+async fn plan_command(project: Option<String>, json: bool) -> Result<()> {
+    let mut client = connect().await?;
+    // The daemon cannot see this process's working directory, and its own is meaningless under
+    // launchd, so the client always says which repository it means.
+    let project = match project {
+        Some(project) => PathBuf::from(project),
+        None => std::env::current_dir().context("cannot read the current directory")?,
+    };
+    let params = serde_json::json!({ "project": project });
+    let result = take(client.request("plan", params).await?)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    } else {
+        print!("{}", render::plan(&result, style()));
+    }
+    Ok(())
+}
+
+/// `log`: the transcript of one task.
+async fn log_command(task: Option<String>, json: bool) -> Result<()> {
+    let mut client = connect().await?;
+    let task = match task {
+        Some(task) => task,
+        None => single_task(&mut client).await?,
+    };
+    let result = take(client.request("log", serde_json::json!({ "task": task })).await?)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    } else {
+        print!("{}", render::log(&result, style()));
+    }
+    Ok(())
+}
+
+/// `gc`: collect what nothing needs.
+async fn gc_command(dry_run: bool, json: bool) -> Result<()> {
+    let mut client = connect().await?;
+    let result = take(
+        client
+            .request("gc", serde_json::json!({ "dry_run": dry_run }))
+            .await?,
+    )?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    } else {
+        print!("{}", render::gc_report(&result, style()));
+    }
+    Ok(())
+}
+
+/// `merge`: the human's one git action.
+async fn merge_command(task: &str, json: bool) -> Result<()> {
+    let mut client = connect().await?;
+    let result = take(
+        client
+            .request("merge", serde_json::json!({ "task": task }))
+            .await?,
+    )?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    } else {
+        print!("{}", render::merged(&result, style()));
     }
     Ok(())
 }
