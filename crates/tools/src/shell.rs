@@ -277,6 +277,13 @@ impl Tool for Shell {
         paths
     }
 
+    /// The command itself, quoted, because the classified paths are often empty (`true`, `make`)
+    /// and the operator's question is "which command was about to run", not "what did it touch".
+    fn expected_effect(&self, args: &Args) -> String {
+        let command = args.str("command").unwrap_or("?");
+        crate::tool::one_line(&format!("run `{command}`"), crate::tool::EFFECT_LIMIT)
+    }
+
     fn execute(&self, ctx: &ToolCtx, args: Args) -> Result<ToolResult, ToolError> {
         let command = args.str("command")?.trim().to_string();
         if command.is_empty() {
@@ -790,6 +797,17 @@ mod tests {
         )
         .unwrap();
         ToolCtx::new(Arc::new(gate), crate::OutputBudget::default())
+    }
+
+    #[test]
+    fn the_expected_effect_quotes_the_command() {
+        // The classified paths are empty for `true` or `make`, so a path-derived sentence would
+        // say only "shell". The operator's question is which command was about to run.
+        let shell = Shell::standalone(None);
+        let effect = shell.expected_effect(&Args::new(json!({"command": "cargo test --all"})));
+        assert_eq!(effect, "run `cargo test --all`");
+        let newlines = shell.expected_effect(&Args::new(json!({"command": "echo a\necho b"})));
+        assert_eq!(newlines, "run `echo a echo b`", "one journal line, one line");
     }
 
     fn fixture() -> tempfile::TempDir {

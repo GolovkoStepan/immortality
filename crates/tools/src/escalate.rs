@@ -135,7 +135,7 @@ impl JournalQueue {
     fn append(&self, task: &TaskId, kind: immortality_core::journal::Kind, payload: Value) -> CoreResult<()> {
         use immortality_core::journal::Journal;
         let mut journal = Journal::open(&self.journal_dir, task.clone())?;
-        journal.append_event(time::now(), kind, payload)?;
+        journal.append_event(journal.now(), kind, payload)?;
         journal.close()
     }
 }
@@ -278,6 +278,17 @@ impl Tool for Escalate {
         // Nothing in the worktree. The queue is under the daemon's state directory, which the
         // model never names and the gate does not govern.
         Vec::new()
+    }
+
+    /// The question, not the tool: an escalation in the log is read by the human who has to answer
+    /// it, and "escalate" on its own tells them nothing about what is being asked.
+    fn expected_effect(&self, args: &Args) -> String {
+        let key = args.str("key").unwrap_or("?");
+        let question = args.str("question").unwrap_or("");
+        crate::tool::one_line(
+            &format!("ask the human about `{key}`: {question}"),
+            crate::tool::EFFECT_LIMIT,
+        )
     }
 
     fn execute(&self, ctx: &ToolCtx, args: Args) -> Result<ToolResult, ToolError> {

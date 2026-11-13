@@ -223,6 +223,20 @@ impl Tool for EditFile {
             .unwrap_or_default()
     }
 
+    /// `old` and `new` are the whole point of the call and neither is a path, so the sentence has
+    /// to name the edit rather than just the file.
+    fn expected_effect(&self, args: &Args) -> String {
+        let path = args.opt_str("path").ok().flatten().unwrap_or("?");
+        let every = args.opt_bool("replace_all").ok().flatten() == Some(true);
+        crate::tool::one_line(
+            &format!(
+                "replace {} occurrence(s) of quoted text in {path}",
+                if every { "every" } else { "one" }
+            ),
+            crate::tool::EFFECT_LIMIT,
+        )
+    }
+
     fn execute(&self, ctx: &ToolCtx, args: Args) -> Result<ToolResult, ToolError> {
         let raw = args.str("path")?;
         let old = args.str("old")?;
@@ -555,6 +569,35 @@ mod tests {
 
     fn read(dir: &Path, name: &str) -> String {
         std::fs::read_to_string(dir.join(name)).unwrap()
+    }
+
+    #[test]
+    fn an_edit_says_what_it_replaces_and_where() {
+        // `old` and `new` are the call, and neither is a path: a sentence built only from
+        // `paths()` would read "write a.rs" and hide the fact that it is a targeted edit.
+        let effect = EditFile.expected_effect(&Args::new(json!({
+            "path": "src/a.rs",
+            "old": "a",
+            "new": "b"
+        })));
+        assert_eq!(effect, "replace one occurrence(s) of quoted text in src/a.rs");
+        let all = EditFile.expected_effect(&Args::new(json!({
+            "path": "src/a.rs",
+            "old": "a",
+            "new": "b",
+            "replace_all": true
+        })));
+        assert!(all.contains("every"), "{all}");
+        assert_ne!(
+            EditFile.expected_effect(&Args::new(json!({"path": "x"}))),
+            EditFile.description()
+        );
+    }
+
+    #[test]
+    fn a_write_names_the_file_because_its_effect_is_the_file() {
+        let effect = WriteFile.expected_effect(&Args::new(json!({"path": "src/a.rs", "content": "x"})));
+        assert_eq!(effect, "write src/a.rs");
     }
 
     // ── write_file ──────────────────────────────────────────────────────────────

@@ -14,12 +14,22 @@ pub enum Effect {
 pub trait Tool {
     fn name(&self) -> &'static str;
     fn schema(&self) -> &'static serde_json::Value;
+    fn description(&self) -> &'static str;                      // для списка инструментов в промпте
     fn idempotency(&self, args: &Args) -> Idempotency;          // Idempotent | ByContent | Unknown
     fn effect(&self, args: &Args) -> Effect;                    // может зависеть от аргументов
-    fn probe(&self, rec: &CallRecord) -> Probe;                 // Applied | NotApplied | Unknown
+    fn paths(&self, args: &Args) -> Vec<PathUse>;               // что трогает вызов, для гейта
+    fn expected_effect(&self, args: &Args) -> String;           // про ЭТОТ вызов, для журнала (D-081)
     fn execute(&self, ctx: &ToolCtx, args: Args) -> ToolResult;
+    // probe живёт отдельно: recovery спрашивает инструмент по записи журнала, без запуска
 }
 ```
+
+`expected_effect` — не `description`. Описание говорит, что инструмент *такое* («Write a complete
+file…»), и одинаково для всех вызовов; ожидаемый эффект называет файл, команду или вопрос —
+именно его читает человек в `immortality log` и именно его цитирует recovery, когда не может
+понять, подействовал ли прерванный вызов. По умолчанию строится из `paths` («write
+src/parser.rs»), инструменты с эффектом в аргументе переопределяют («run `cargo test`»).
+Фраза всегда одна строка не длиннее 120 символов.
 
 `PolicyGate::check(tool, args) -> Allowed | Escalate(reason) | Denied(reason)`:
 

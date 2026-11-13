@@ -255,6 +255,27 @@ impl Default for OutputBudget {
     }
 }
 
+/// How long an expected-effect sentence may be.
+///
+/// One journal line, one `immortality log` line and one `escalations` entry all show it, and a
+/// budget that lets a whole file through would make the log unreadable. The cut is on a character
+/// boundary and marked with `…`, because a silently truncated sentence reads as a complete one.
+pub(crate) const EFFECT_LIMIT: usize = 120;
+
+/// Collapse whitespace and cut at a character boundary.
+///
+/// Shared by the tools' [`Tool::expected_effect`] overrides so a multi-line command or a pasted
+/// excerpt cannot turn one journal line into several.
+pub(crate) fn one_line(text: &str, max: usize) -> String {
+    let collapsed: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() <= max {
+        return collapsed;
+    }
+    let mut cut: String = collapsed.chars().take(max).collect();
+    cut.push('…');
+    cut
+}
+
 /// One tool.
 pub trait Tool: Send + Sync + std::fmt::Debug {
     /// The name the model calls. Stable: it appears in journals and in goldens.
@@ -280,6 +301,36 @@ pub trait Tool: Send + Sync + std::fmt::Debug {
     /// Declared by the tool rather than inferred by the gate: only the tool knows that
     /// `edit_file`'s `path` is a write while `read_file`'s is a read.
     fn paths(&self, args: &Args) -> Vec<PathUse>;
+
+    /// What this call is expected to do, in prose, for the journal and `immortality log`.
+    ///
+    /// The audience is a human asking "what was it doing when it died", and the answer has to be
+    /// about *this* call: which file, which command, which question. The tool's own
+    /// [`Tool::description`] is the wrong answer and used to be the one recorded — it says what
+    /// the tool *is* ("Write a complete file, creating parent directories") and never names the
+    /// path, so every intent in the log read the same.
+    ///
+    /// The default builds the sentence from the paths the tool declared, which is right for the
+    /// tools whose effect *is* their path. Tools whose effect lives in an argument — a command, a
+    /// question, a subcommand — override it. Recovery quotes this string to the operator, so it
+    /// must be true before the call runs.
+    fn expected_effect(&self, args: &Args) -> String {
+        let paths = self.paths(args);
+        if paths.is_empty() {
+            return self.name().to_string();
+        }
+        let listed = paths
+            .iter()
+            .map(|path| path.path.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let verb = match self.effect(args) {
+            Effect::Read => "read",
+            Effect::Mutate => "write",
+            Effect::External => "act outside the worktree on",
+        };
+        one_line(&format!("{verb} {listed}"), EFFECT_LIMIT)
+    }
 
     /// Run it.
     ///
@@ -428,6 +479,46 @@ mod tests {
             name,
             schema: schema(),
         })
+    }
+
+    #[test]
+    fn the_default_expected_effect_names_the_call_not_the_tool() {
+        // The default is what most tools use, and the bug it replaces was `description()` here:
+        // "a fake" for every call, whatever the path. The effect has to distinguish two calls to
+        // one tool, or `immortality log` is a column of identical lines.
+        let tool = fake("read_file");
+        let first = tool.expected_effect(&Args::new(json!({"path": "src/a.rs"})));
+        let second = tool.expected_effect(&Args::new(json!({"path": "src/b.rs"})));
+        assert_eq!(first, "read src/a.rs");
+        assert_eq!(second, "read src/b.rs");
+        assert_ne!(first, tool.description());
+    }
+
+    #[test]
+    fn the_default_expected_effect_falls_back_to_the_name_for_a_pathless_call() {
+        let tool = fake("no_paths");
+        assert_eq!(tool.expected_effect(&Args::empty()), "no_paths");
+    }
+
+    #[test]
+    fn an_expected_effect_is_one_bounded_line() {
+        // One journal line is one line. A model that sends a command with newlines in it must not
+        // be able to break the log's shape or push the sentence into the next record.
+        assert_eq!(one_line("  a\n\tb   c  ", EFFECT_LIMIT), "a b c");
+        let long = "x".repeat(EFFECT_LIMIT + 20);
+        let cut = one_line(&long, EFFECT_LIMIT);
+        assert_eq!(cut.chars().count(), EFFECT_LIMIT + 1, "cut plus the ellipsis");
+        assert!(cut.ends_with('…'), "{cut}");
+    }
+
+    #[test]
+    fn a_multibyte_character_is_never_cut_in_half() {
+        // A cut through a multi-byte character would panic in `String::truncate` and, worse, could
+        // put invalid UTF-8 into a journal line.
+        let text = "я".repeat(EFFECT_LIMIT * 2);
+        let cut = one_line(&text, EFFECT_LIMIT);
+        assert_eq!(cut.chars().count(), EFFECT_LIMIT + 1);
+        assert!(cut.ends_with('…'));
     }
 
     #[test]

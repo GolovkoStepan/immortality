@@ -266,6 +266,16 @@ impl Tool for Delegate {
         Vec::new()
     }
 
+    /// The first clause of the brief. A delegated run can cost twenty steps, so the log has to
+    /// show what the sub-agent was asked to do before it starts, not after its report lands.
+    fn expected_effect(&self, args: &Args) -> String {
+        let brief = args.str("brief").unwrap_or("");
+        crate::tool::one_line(
+            &format!("delegate to a sub-agent: {brief}"),
+            crate::tool::EFFECT_LIMIT,
+        )
+    }
+
     fn execute(&self, ctx: &ToolCtx, args: Args) -> Result<ToolResult, ToolError> {
         refuse_nested(ctx)?;
 

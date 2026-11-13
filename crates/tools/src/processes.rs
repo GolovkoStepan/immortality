@@ -536,6 +536,16 @@ impl Tool for StartProcess {
         paths
     }
 
+    /// The command that is being started, since the tool's whole point is that it outlives the
+    /// call: a handle in the journal is useless without the command behind it.
+    fn expected_effect(&self, args: &Args) -> String {
+        let command = args.str("command").unwrap_or("?");
+        crate::tool::one_line(
+            &format!("start a background command: `{command}`"),
+            crate::tool::EFFECT_LIMIT,
+        )
+    }
+
     fn execute(&self, ctx: &ToolCtx, args: Args) -> Result<ToolResult, ToolError> {
         let command = args.str("command")?.trim().to_string();
         if command.is_empty() {
@@ -670,6 +680,16 @@ impl Tool for ReadProcess {
 
     fn paths(&self, _args: &Args) -> Vec<PathUse> {
         Vec::new()
+    }
+
+    /// The handle, because there is no path in this call at all and `read_process` alone says
+    /// nothing about which of several servers is being polled.
+    fn expected_effect(&self, args: &Args) -> String {
+        let handle = args.str("handle").unwrap_or("?");
+        crate::tool::one_line(
+            &format!("read the new output of `{handle}`"),
+            crate::tool::EFFECT_LIMIT,
+        )
     }
 
     fn execute(&self, _ctx: &ToolCtx, args: Args) -> Result<ToolResult, ToolError> {
@@ -866,6 +886,12 @@ impl Tool for KillProcess {
 
     fn paths(&self, _args: &Args) -> Vec<PathUse> {
         Vec::new()
+    }
+
+    /// The handle: `kill_process` without it does not say what is about to die.
+    fn expected_effect(&self, args: &Args) -> String {
+        let handle = args.str("handle").unwrap_or("?");
+        crate::tool::one_line(&format!("stop the process `{handle}`"), crate::tool::EFFECT_LIMIT)
     }
 
     fn execute(&self, _ctx: &ToolCtx, args: Args) -> Result<ToolResult, ToolError> {

@@ -44,7 +44,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use immortality_core::artifacts::ArtifactStore;
 use immortality_core::config::Detectors;
@@ -52,6 +52,7 @@ use immortality_core::context::{
     Budget, Context, Entry, StableLayers, TokenCounter, ToolCall, Verdict, artifact_hint, truncate_output,
 };
 use immortality_core::detect::{Detector, Level, Reaction, Signals, Stream, StreamVerdict, Thresholds};
+use immortality_core::domain::Timestamp;
 use immortality_core::domain::{Attempt, AttemptTrigger, FailureReason, Subtask, SubtaskId, SubtaskReport};
 use immortality_core::gate::{GateRecord, GateVerdict, Gates, Reviewer, evaluate};
 use immortality_core::ids::TaskId;
@@ -59,6 +60,7 @@ use immortality_core::journal::{Journal, Kind, Scope};
 use immortality_core::protocol::{CallId, Intent, ToolCallLog};
 use immortality_core::restart::{self, Allowance, Cause, Checkpoints, Decision, Ended, Limit, Stop};
 use immortality_core::scheduler::Piece;
+use immortality_core::time::Clock;
 use immortality_llm::turn::AssistantTurn;
 use immortality_llm::wire::ChatRequest;
 use immortality_llm::{Backend, ToolDef};
@@ -477,6 +479,12 @@ pub struct Runner {
     /// pure), but acting on it without this would claim an L3 that never happened. The session
     /// then stops instead of starting an attempt on a tree nobody put back.
     pub checkpoints: Option<Arc<dyn Checkpoints + Send + Sync>>,
+    /// Where wall-clock time comes from.
+    ///
+    /// The attempt budget and every journal timestamp read it. A simulator passes a fixed clock
+    /// so that a 45-minute attempt ends in microseconds and a golden journal has one spelling per
+    /// timestamp; production passes [`SystemClock`].
+    pub clock: Arc<dyn Clock>,
 }
 
 impl std::fmt::Debug for Runner {
@@ -528,17 +536,16 @@ impl Runner {
         base_checkpoint: Option<&str>,
         journal: &mut Journal,
     ) -> immortality_core::Result<RunOutcome> {
-        let mut attempt = Attempt::start(
-            subtask.id.clone(),
-            attempt_number,
-            strategy,
-            immortality_core::time::now(),
-        );
+        // One clock, not two kept in step by hand: the records this call writes and the records
+        // `ToolCallLog` writes inside it have to be ordered by the same source, or a golden
+        // journal is unreproducible in exactly the way that hides an ordering bug.
+        journal.set_clock(std::sync::Arc::clone(&self.clock));
+        let mut attempt = Attempt::start(subtask.id.clone(), attempt_number, strategy, self.clock.now());
         if let Some(sha) = base_checkpoint {
             attempt.base_checkpoint = Some(sha.to_string());
         }
         journal.append_scoped(
-            immortality_core::time::now(),
+            self.clock.now(),
             Kind::AttemptStarted,
             serde_json::json!({
                 "attempt": attempt.id.to_string(),
@@ -570,11 +577,11 @@ impl Runner {
             _ => AttemptTrigger::Fail,
         };
         attempt
-            .finish(trigger, ending.failure_reason(), immortality_core::time::now())
+            .finish(trigger, ending.failure_reason(), self.clock.now())
             .map_err(|error| immortality_core::Error::Protocol(error.to_string()))?;
 
         journal.append_scoped(
-            immortality_core::time::now(),
+            self.clock.now(),
             Kind::AttemptFailed,
             serde_json::json!({
                 "attempt": attempt.id.to_string(),
@@ -640,7 +647,7 @@ impl Runner {
         match &verdict {
             GateVerdict::Passed => {
                 attempt
-                    .finish(AttemptTrigger::Succeed, None, immortality_core::time::now())
+                    .finish(AttemptTrigger::Succeed, None, self.clock.now())
                     .map_err(|error| immortality_core::Error::Protocol(error.to_string()))?;
                 // Nothing is written about the subtask here. Closing it means writing `done` into
                 // `TASKS.json` and then the journal (D-078's order), and only the scheduler holds
@@ -649,10 +656,10 @@ impl Runner {
             }
             GateVerdict::Failed { reason, why } => {
                 attempt
-                    .finish(AttemptTrigger::Fail, Some(*reason), immortality_core::time::now())
+                    .finish(AttemptTrigger::Fail, Some(*reason), self.clock.now())
                     .map_err(|error| immortality_core::Error::Protocol(error.to_string()))?;
                 journal.append_scoped(
-                    immortality_core::time::now(),
+                    self.clock.now(),
                     Kind::AttemptFailed,
                     serde_json::json!({
                         "attempt": attempt.id.to_string(),
@@ -708,6 +715,7 @@ impl Runner {
                 why: "no gate runner is wired, so the claim cannot be verified".to_string(),
             };
             record_gate(
+                self.clock.now(),
                 journal,
                 &scope,
                 &GateRecord::Verdict {
@@ -727,17 +735,22 @@ impl Runner {
             immortality_core::Error::Protocol(format!("the gate diff could not be produced: {why}"))
         })?;
         for record in GateRecord::of(&report) {
-            record_gate(journal, &scope, &record)?;
+            record_gate(self.clock.now(), journal, &scope, &record)?;
         }
         Ok(report.verdict())
     }
 }
 
 /// Append one `gate_result` record.
-fn record_gate(journal: &mut Journal, scope: &Scope, record: &GateRecord) -> immortality_core::Result<()> {
+fn record_gate(
+    at: Timestamp,
+    journal: &mut Journal,
+    scope: &Scope,
+    record: &GateRecord,
+) -> immortality_core::Result<()> {
     let payload =
         serde_json::to_value(record).map_err(|error| immortality_core::Error::Protocol(error.to_string()))?;
-    journal.append_scoped(immortality_core::time::now(), Kind::GateResult, payload, scope)?;
+    journal.append_scoped(at, Kind::GateResult, payload, scope)?;
     Ok(())
 }
 
@@ -973,7 +986,14 @@ impl<'a> AttemptSession<'a> {
                 }
                 Err(why) => return Ok(RollBack::Blocked(why)),
             };
-            record_checkpoint(journal, &self.subtask.id, closed, &taken, "base")?;
+            record_checkpoint(
+                self.runner.clock.now(),
+                journal,
+                &self.subtask.id,
+                closed,
+                &taken,
+                "base",
+            )?;
             self.base = Some(taken);
         }
         let Some(base) = self.base.clone() else {
@@ -987,7 +1007,14 @@ impl<'a> AttemptSession<'a> {
         // tree was clean: there was nothing to preserve.
         match checkpoint_snapshot(checkpoints, &reason) {
             Ok(Some(safety)) => {
-                record_checkpoint(journal, &self.subtask.id, closed, &safety, "discarded")?;
+                record_checkpoint(
+                    self.runner.clock.now(),
+                    journal,
+                    &self.subtask.id,
+                    closed,
+                    &safety,
+                    "discarded",
+                )?;
             }
             Ok(None) => {}
             Err(why) => return Ok(RollBack::Blocked(why)),
@@ -996,7 +1023,7 @@ impl<'a> AttemptSession<'a> {
         // recoverable: it says "the tree is about to be reset to this SHA", and a journal that
         // stops after it is a rollback recovery can finish (see `recover`, plan step 4).
         journal.append_scoped(
-            immortality_core::time::now(),
+            self.runner.clock.now(),
             Kind::CheckpointCreated,
             serde_json::json!({
                 "sha": base.sha,
@@ -1010,7 +1037,7 @@ impl<'a> AttemptSession<'a> {
             return Ok(RollBack::Blocked(why));
         }
         journal.append_scoped(
-            immortality_core::time::now(),
+            self.runner.clock.now(),
             Kind::AttemptRestarted,
             serde_json::json!({
                 "number": closed,
@@ -1060,6 +1087,7 @@ fn checkpoint_snapshot(
 
 /// Append a `checkpoint_created` record for one attempt's tree state.
 fn record_checkpoint(
+    at: Timestamp,
     journal: &mut Journal,
     subtask: &SubtaskId,
     attempt: u32,
@@ -1067,7 +1095,7 @@ fn record_checkpoint(
     role: &str,
 ) -> immortality_core::Result<()> {
     journal.append_scoped(
-        immortality_core::time::now(),
+        at,
         Kind::CheckpointCreated,
         serde_json::json!({
             "sha": snapshot.sha,
@@ -1110,7 +1138,12 @@ struct StepLoop<'a> {
     /// A restarted attempt is not a failed one in the same way as a step budget: the report has
     /// to say *which* signal gave up, because the next attempt's strategy is written from it.
     stopped_by: Option<Reaction>,
-    started: Instant,
+    /// When the attempt started, on the runner's clock.
+    ///
+    /// A wall-clock instant rather than `std::time::Instant` because the budget it measures is
+    /// 45 minutes of *wall* time, and because a fake clock has to be able to move it: a budget
+    /// that can only be spent by waiting is a budget no test covers.
+    started: Timestamp,
 }
 
 impl<'a> StepLoop<'a> {
@@ -1138,7 +1171,7 @@ impl<'a> StepLoop<'a> {
             signals: Signals::default(),
             thresholds: Thresholds::from_config(&runner.detectors),
             stopped_by: None,
-            started: Instant::now(),
+            started: runner.clock.now(),
         }
     }
 
@@ -1278,7 +1311,7 @@ impl<'a> StepLoop<'a> {
         };
         journal
             .append_scoped(
-                immortality_core::time::now(),
+                self.runner.clock.now(),
                 Kind::InvalidToolcall,
                 serde_json::json!({
                     "call": call.call_id,
@@ -1320,7 +1353,7 @@ impl<'a> StepLoop<'a> {
                 metric: occurrences,
             };
             journal.append_scoped(
-                immortality_core::time::now(),
+                self.runner.clock.now(),
                 Kind::ModelStreamAborted,
                 serde_json::json!({
                     "step": self.steps,
@@ -1404,12 +1437,7 @@ impl<'a> StepLoop<'a> {
         if let Some(text) = seen {
             fields["chars_seen"] = serde_json::json!(text.chars().count());
         }
-        journal.append_scoped(
-            immortality_core::time::now(),
-            Kind::DetectorFired,
-            fields,
-            &self.scope,
-        )?;
+        journal.append_scoped(self.runner.clock.now(), Kind::DetectorFired, fields, &self.scope)?;
         Ok(())
     }
 
@@ -1457,7 +1485,10 @@ impl<'a> StepLoop<'a> {
         if self.tokens >= u64::from(self.runner.limits.max_tokens) {
             return Some(Ending::Tokens);
         }
-        if self.started.elapsed() >= self.runner.limits.max_wall_time {
+        let elapsed = self.runner.clock.now() - self.started;
+        let limit =
+            chrono::Duration::from_std(self.runner.limits.max_wall_time).unwrap_or(chrono::Duration::MAX);
+        if elapsed >= limit {
             return Some(Ending::Time);
         }
         // The hard context budget is a token budget too. `Compact` is not acted on: compaction
@@ -1476,7 +1507,7 @@ impl<'a> StepLoop<'a> {
     /// Journal the response's shape and cost.
     fn record_response(&self, journal: &mut Journal, reply: &Reply) -> immortality_core::Result<()> {
         journal.append_scoped(
-            immortality_core::time::now(),
+            self.runner.clock.now(),
             Kind::ModelResponse,
             serde_json::json!({
                 "step": self.steps,
@@ -1502,7 +1533,7 @@ impl<'a> StepLoop<'a> {
         let Some(tool) = self.runner.registry.get(&call.name).cloned() else {
             journal
                 .append_scoped(
-                    immortality_core::time::now(),
+                    self.runner.clock.now(),
                     Kind::InvalidToolcall,
                     serde_json::json!({ "call": call.call_id, "tool": call.name, "detail": "unknown tool" }),
                     &self.scope,
@@ -1559,10 +1590,15 @@ impl<'a> StepLoop<'a> {
             call.name.clone(),
             args.raw(),
             tool.idempotency(&args),
-            tool.description(),
+            // What *this* call is expected to do, not what the tool is: the journal quote goes to
+            // the operator reading `immortality log` and into the observation recovery hands the
+            // model, and a tool description there says "Write a complete file…" for every write.
+            tool.expected_effect(&args),
         );
-        log.intent(&intent, args.raw().clone())
-            .map_err(|error| backend(&error))?;
+        // The arguments are the second argument, not the record: `intent` writes the metadata
+        // (`tool`, `idempotency`, digest, expected effect) from the typed value and nests these
+        // under `arguments`, so a tool argument named `tool` cannot impersonate a record field.
+        log.intent(&intent, args.raw()).map_err(|error| backend(&error))?;
         log.started(&intent.call, serde_json::Value::Null)
             .map_err(|error| backend(&error))?;
 
@@ -1653,7 +1689,7 @@ impl<'a> StepLoop<'a> {
     ) -> Result<Option<Args>, Ending> {
         journal
             .append_scoped(
-                immortality_core::time::now(),
+                self.runner.clock.now(),
                 Kind::InvalidToolcall,
                 serde_json::json!({
                     "call": call.call_id,
@@ -2027,6 +2063,43 @@ mod tests {
         }
     }
 
+    /// A model that spends wall time: each reply advances the shared clock.
+    ///
+    /// The 45-minute budget is the one limit no test can wait for, so the only way to cover it
+    /// is a clock the loop reads and a step that moves it. This is not a fake of the budget — it
+    /// is the budget, measured through the seam that production reads too.
+    #[derive(Debug)]
+    struct Slow {
+        replies: Mutex<VecDeque<Result<Reply, String>>>,
+        clock: Arc<immortality_core::time::FixedClock>,
+        per_step: chrono::Duration,
+    }
+
+    impl Slow {
+        fn new(
+            replies: Vec<Result<Reply, String>>,
+            clock: Arc<immortality_core::time::FixedClock>,
+            per_step: chrono::Duration,
+        ) -> Arc<Self> {
+            Arc::new(Self {
+                replies: Mutex::new(replies.into()),
+                clock,
+                per_step,
+            })
+        }
+    }
+
+    impl Model for Slow {
+        fn complete(&self, _request: &ChatRequest) -> Result<Reply, String> {
+            self.clock.advance(self.per_step);
+            self.replies
+                .lock()
+                .ok()
+                .and_then(|mut queue| queue.pop_front())
+                .unwrap_or_else(|| Err("the script has no reply for this step".to_string()))
+        }
+    }
+
     /// A tool that always succeeds and touches one path.
     #[derive(Debug)]
     struct Touch;
@@ -2135,6 +2208,7 @@ mod tests {
             // No git repository in the loop fixtures: a restart that needs a rollback now stops
             // with a named reason instead of silently pretending it rolled back.
             checkpoints: None,
+            clock: Arc::new(immortality_core::time::SystemClock),
         };
         (dir, runner)
     }
@@ -2930,6 +3004,75 @@ mod tests {
     }
 
     #[test]
+    fn the_wall_time_budget_is_measured_on_the_injected_clock() {
+        // The design's 45 minutes. Waiting for them is not a test, so the loop reads a clock the
+        // test can move: one step is allowed to spend 46 of them in zero real time.
+        let clock = Arc::new(immortality_core::time::FixedClock::fixture());
+        let model = Slow::new(
+            vec![Ok(Reply::call("call_1", "touch", r#"{"path":"a"}"#))],
+            Arc::clone(&clock),
+            chrono::Duration::minutes(46),
+        );
+        let (dir, mut runner) = runner(model, registry(vec![Arc::new(Touch)]));
+        runner.clock = Arc::clone(&clock) as Arc<dyn Clock>;
+        let mut journal = journal(&dir);
+        let outcome = runner.run(&subtask(), 1, "", &mut journal).expect("run");
+
+        assert_eq!(outcome.ending, Ending::Time);
+        assert_eq!(outcome.attempt.failure, Some(FailureReason::TimeExhausted));
+        // One step ran; the second iteration found the budget gone. A budget checked only
+        // before the first step would have run all ten.
+        assert_eq!(outcome.steps, 1);
+    }
+
+    #[test]
+    fn a_step_that_fits_the_budget_does_not_end_the_attempt() {
+        // The other half of the guard: the clock seam must not make every attempt look expired.
+        let clock = Arc::new(immortality_core::time::FixedClock::fixture());
+        let model = Slow::new(
+            vec![Ok(Reply::call("call_1", "touch", r#"{"path":"a"}"#))],
+            Arc::clone(&clock),
+            chrono::Duration::minutes(44),
+        );
+        let (dir, mut runner) = runner(model, registry(vec![Arc::new(Touch)]));
+        runner.clock = Arc::clone(&clock) as Arc<dyn Clock>;
+        runner.limits.max_steps = 1;
+        let mut journal = journal(&dir);
+        let outcome = runner.run(&subtask(), 1, "", &mut journal).expect("run");
+
+        assert_eq!(outcome.ending, Ending::Steps);
+    }
+
+    #[test]
+    fn every_journal_timestamp_comes_from_the_runner_clock() {
+        // This is why the clock exists: a golden journal is only golden if its `ts` fields are
+        // the seeded ones rather than whatever the machine happened to say. A single record read
+        // from `Utc::now()` would make the whole file uncomparable.
+        let clock = Arc::new(immortality_core::time::FixedClock::fixture());
+        let model = Scripted::new(vec![Ok(Reply::call("call_1", "touch", r#"{"path":"a"}"#))]);
+        let (dir, mut runner) = runner(model, registry(vec![Arc::new(Touch)]));
+        runner.clock = Arc::clone(&clock) as Arc<dyn Clock>;
+        runner.limits.max_steps = 1;
+        let mut journal = journal(&dir);
+        runner.run(&subtask(), 1, "", &mut journal).expect("run");
+
+        let records = journal_records(&dir);
+        assert!(
+            !records.is_empty(),
+            "an attempt writes at least its own start and end"
+        );
+        let start = immortality_core::time::FixedClock::fixture().now();
+        for record in &records {
+            assert_eq!(
+                record.fields.at,
+                start,
+                "{} was not stamped from the clock",
+                record.fields.kind.as_str()
+            );
+        }
+    }
+
+    #[test]
     fn a_talking_model_stalls_out_rather_than_looping_forever() {
         // The failure mode the stall budget exists for: a model that answers prose and never
         // calls a tool would otherwise run to the step budget, spending every step's tokens.
@@ -3070,6 +3213,57 @@ mod tests {
         let completed = kinds.iter().position(|kind| *kind == Kind::ToolCallCompleted);
         assert!(intent < started, "{kinds:?}");
         assert!(started < completed, "{kinds:?}");
+    }
+
+    #[test]
+    fn the_intent_records_what_this_call_does_not_what_the_tool_is() {
+        // The record used to carry `tool.description()`, so every `write_file` in the journal said
+        // "Write a complete file, creating parent directories" and never named the path. Recovery
+        // quotes this sentence to the operator when it cannot tell whether a call took effect, and
+        // `immortality log` shows it before the call runs; both need the specific call.
+        let model = Scripted::new(vec![
+            Ok(Reply::call("call_1", "touch", r#"{"path":"src/parser.rs"}"#)),
+            Ok(finish()),
+        ]);
+        let (dir, runner) = runner(model, registry(vec![Arc::new(Touch)]));
+        let mut journal = journal(&dir);
+        runner.run(&subtask(), 1, "", &mut journal).expect("run");
+
+        let reader = immortality_core::journal::JournalReader::open(
+            dir.path().join("journal"),
+            &TaskId::from_suffix("01ARZ3NDEKTSV4RRFFQ69G5FAJ"),
+        )
+        .expect("reader");
+        let intent = reader
+            .read()
+            .expect("records")
+            .records
+            .into_iter()
+            .find(|record| record.fields.kind == Kind::ToolCallIntent)
+            .expect("an intent");
+        let effect = intent.event.payload["expected_effect"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            effect.contains("src/parser.rs"),
+            "the effect must name the subject of the call, not the tool: {effect}"
+        );
+        assert_ne!(
+            effect, "Write content to a path.",
+            "the tool's description is not an expected effect: {effect}"
+        );
+        // And the metadata is in the record at all: a journal that only holds arguments cannot be
+        // recovered, because `tool` and `idempotency` are what decide whether a replay is safe.
+        assert_eq!(intent.event.payload["tool"], serde_json::json!("touch"));
+        assert_eq!(
+            intent.event.payload["idempotency"],
+            serde_json::json!("by_content")
+        );
+        assert_eq!(
+            intent.event.payload["arguments"],
+            serde_json::json!({"path": "src/parser.rs"}),
+            "the tool's arguments live under `arguments`, so they cannot impersonate a field"
+        );
     }
 
     #[test]

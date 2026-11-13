@@ -145,6 +145,16 @@ impl Tool for Grep {
             .unwrap_or_default()
     }
 
+    /// The pattern, because the searched path is optional and the pattern is the question.
+    fn expected_effect(&self, args: &Args) -> String {
+        let pattern = args.str("pattern").unwrap_or("?");
+        let base = args.opt_str("path").ok().flatten().unwrap_or(".");
+        crate::tool::one_line(
+            &format!("search for `{pattern}` under {base}"),
+            crate::tool::EFFECT_LIMIT,
+        )
+    }
+
     fn execute(&self, ctx: &ToolCtx, args: Args) -> Result<ToolResult, ToolError> {
         let pattern = args.str("pattern")?;
         if pattern.is_empty() {

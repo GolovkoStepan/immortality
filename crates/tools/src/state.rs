@@ -482,6 +482,24 @@ impl Tool for GrepJournal {
         vec![PathUse::read(format!("{AGENT_DIR}/"))]
     }
 
+    /// The query and the kind, since the declared path is the whole journal directory and says
+    /// nothing about what was being looked for.
+    fn expected_effect(&self, args: &Args) -> String {
+        let query = args.opt_str("query").ok().flatten().unwrap_or("");
+        let kind = args.opt_str("kind").ok().flatten().unwrap_or("any kind");
+        if query.is_empty() {
+            crate::tool::one_line(
+                &format!("search the journal for records of {kind}"),
+                crate::tool::EFFECT_LIMIT,
+            )
+        } else {
+            crate::tool::one_line(
+                &format!("search the journal for `{query}` in records of {kind}"),
+                crate::tool::EFFECT_LIMIT,
+            )
+        }
+    }
+
     fn execute(&self, ctx: &ToolCtx, args: Args) -> Result<ToolResult, ToolError> {
         let query = args.opt_str("query")?.unwrap_or("").trim().to_string();
         // `None`, not zero. Sequence numbers start at 0, so a zero default would mean "skip the

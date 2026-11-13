@@ -179,15 +179,7 @@ pub fn crash_at(
         let mut journal = Journal::open(dir, task.clone())?;
         {
             let mut log = ToolCallLog::new(&mut journal);
-            log.intent(
-                &intent,
-                serde_json::json!({
-                    "tool": tool,
-                    "idempotency": idempotency,
-                    "expected_effect": intent.expected_effect,
-                    "args_digest": intent.args_digest,
-                }),
-            )?;
+            log.intent(&intent, &serde_json::json!({ "command": "rm -rf build" }))?;
             if matches!(
                 point,
                 CrashPoint::AfterStarted | CrashPoint::BeforeCompleted | CrashPoint::AfterCompleted

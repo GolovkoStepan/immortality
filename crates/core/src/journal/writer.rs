@@ -33,6 +33,7 @@ use super::Digest;
 use super::record::{JournalEvent, JournalRecord, RecordFields, Scope};
 use crate::domain::{TaskId, Timestamp};
 use crate::journal::Kind;
+use crate::time::{Clock, SystemClock};
 
 /// Maximum size of one segment file before rotation.
 ///
@@ -58,6 +59,15 @@ pub struct Journal {
     /// Bytes written to the active segment, tracked in memory rather than `fstat`ed on every
     /// append: the only writer is this struct, so the count cannot drift.
     written: u64,
+    /// Where timestamps come from for the writes this struct performs itself.
+    ///
+    /// Most records arrive with their `at` already chosen by the caller; three do not — the
+    /// truncation audit in [`Journal::open`], a rotation's segment name, and every record
+    /// [`crate::protocol::ToolCallLog`] writes. Those are exactly the timestamps a golden
+    /// journal cannot tolerate being whatever the machine said, so the source is a field rather
+    /// than a free function. Production never calls [`Journal::set_clock`]: the default is the
+    /// system clock.
+    clock: std::sync::Arc<dyn Clock>,
 }
 
 impl Journal {
@@ -99,6 +109,7 @@ impl Journal {
             next_seq: tail.next_seq,
             last_digest: tail.last_digest,
             written: tail.valid_bytes,
+            clock: std::sync::Arc::new(SystemClock),
         };
 
         if tail.dropped_bytes > 0 {
@@ -108,7 +119,7 @@ impl Journal {
             journal.append(
                 RecordFields::new(
                     journal.next_seq,
-                    crate::time::now(),
+                    journal.now(),
                     journal.task.clone(),
                     Kind::JournalTruncatedTail,
                 ),
@@ -117,6 +128,26 @@ impl Journal {
         }
 
         Ok(journal)
+    }
+
+    /// Install the clock this journal stamps its own records from.
+    ///
+    /// The runner calls this before it writes anything, so that the runner's `clock` and the
+    /// journal's are the same clock rather than two that have to be kept in step by hand. A
+    /// journal opened by a one-shot process — `immortality approve` resolving an escalation —
+    /// keeps the default.
+    pub fn set_clock(&mut self, clock: std::sync::Arc<dyn Clock>) {
+        self.clock = clock;
+    }
+
+    /// The current instant on this journal's clock.
+    ///
+    /// Used by the writers that have no caller to hand them a timestamp. A caller that already
+    /// knows *when* something happened should pass that `at` explicitly: an event can be
+    /// observed before it is written, and `now()` would then say the wrong thing.
+    #[must_use]
+    pub fn now(&self) -> Timestamp {
+        self.clock.now()
     }
 
     /// Directory holding the segments.
@@ -259,7 +290,7 @@ impl Journal {
         self.file
             .sync_all()
             .map_err(|e| crate::Error::io(&self.path, e))?;
-        let stamp = crate::time::now().format("%Y-%m-%dT%H-%M-%S%.3f");
+        let stamp = self.now().format("%Y-%m-%dT%H-%M-%S%.3f");
         // Two rotations can land in the same millisecond — a forced rotation in a test, or a
         // single record larger than the segment limit. `create_new` refuses to clobber the
         // previous segment, so step the timestamp forward instead of failing the append.

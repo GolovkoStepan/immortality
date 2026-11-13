@@ -81,6 +81,13 @@ logs/2026-10.log.gz      # архивы по месяцам
 усечение хвоста) области не имеют и не сериализуют эти поля вовсе — `null` и «отсутствует»
 читались бы потребителями по-разному.
 
+`ts` приходит не с машинных часов, а с часов **журнала**: `Journal` держит
+`Arc<dyn Clock>`, runner ставит туда свои на входе в попытку (`set_clock`). Поэтому записи
+раннера, `ToolCallLog` и ротации сегментов упорядочены одним источником, а симулятор
+подставляет замороженные часы и получает воспроизводимый журнал. Golden-файл сравнивается
+нормализованным: `ts` → `dt_ms` (смещение от фикстуры), attempt-ULID → `att_1`, `att_2`
+(D-081).
+
 `kind` (закрытый список; расширение — только с повышением `v`):
 
 | kind | Когда |
@@ -92,7 +99,7 @@ logs/2026-10.log.gz      # архивы по месяцам
 | `attempt_started`, `attempt_failed`, `attempt_restarted` | попытки; у `attempt_restarted` поле `attempt` — закрываемая попытка, номер замены в payload (`next`), там же `cause`, `why`, `base` (D-027, D-080) |
 | `model_request`, `model_response`, `model_stream_aborted` | инференс (метаданные; тело — в artifacts) |
 | `native_toolcall`, `text_fallback`, `invalid_toolcall` | качество протокола |
-| `tool_call_intent` | **до** исполнения: имя, аргументы, idempotency, ожидаемый эффект |
+| `tool_call_intent` | **до** исполнения: `call`, `tool`, `idempotency`, `args_digest`, `expected_effect` и **вложенный** `arguments` — аргументы инструмента не лежат рядом с метаданными, иначе аргумент с именем `tool` выдал бы себя за поле записи (D-081) |
 | `tool_call_started` | процесс запущен |
 | `tool_call_completed` / `tool_call_failed` | результат (тело — в artifact) |
 | `tool_call_unknown` | процесс умер, эффект неизвестен |
@@ -112,11 +119,22 @@ logs/2026-10.log.gz      # архивы по месяцам
 
 Каждый вызов инструмента проходит журнал трижды:
 
+```jsonc
+// tool_call_intent — запись целиком, метаданные из типа `Intent`, аргументы вложены
+{"call":"call_7","tool":"write_file","idempotency":"by_content",
+ "args_digest":"sha256:…","expected_effect":"write src/parser.rs",
+ "arguments":{"path":"src/parser.rs","content":"…"}}
+
+// tool_call_started  → pid/handle (если применимо)
+// tool_call_completed → exit_code, output_artifact, duration
 ```
-tool_call_intent    → id, tool, args_hash, idempotency, expected_effect
-tool_call_started   → pid/handle (если применимо)
-tool_call_completed → exit_code, output_artifact, duration
-```
+
+Метаданные пишет сам `ToolCallLog::intent` из `Intent`, а не call-site: одна точка владеет
+схемой записи, и забыть поле нельзя. `expected_effect` — про **этот** вызов («write
+src/parser.rs», «run `cargo test`»), а не описание инструмента; recovery цитирует эту фразу
+оператору, когда не может понять, подействовал ли вызов, и `immortality log` показывает её
+до запуска. Чтение терпит старые записи: без `idempotency` — `Unknown` (самый опасный класс),
+без `expected_effect` — пустая строка (D-081).
 
 Правило: **результат записывается в журнал до того, как его увидит модель.** Иначе
 восстановление после сбоя невозможно: модель «помнит» результат, которого нет на диске,

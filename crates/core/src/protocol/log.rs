@@ -73,19 +73,34 @@ impl<'journal> ToolCallLog<'journal> {
     }
 
     /// Record the decision to run a tool call. Must be the first thing written.
-    pub fn intent(&mut self, intent: &Intent, payload: serde_json::Value) -> Result<()> {
+    ///
+    /// `arguments` is the tool's own argument object and is written under `arguments`; every
+    /// other field comes from `intent`. That separation is the whole contract, and it used to be
+    /// a bug: the caller passed the raw arguments as the *record*, so a real `write_file` intent
+    /// on disk said `{"path": …, "content": …}` and nothing else. Recovery then rebuilt the
+    /// `Intent` as `tool: "unknown"`, `idempotency: Unknown` — the class that must never be
+    /// retried — so every crash between a write's intent and its result rolled the tree back and
+    /// threw the work away. Writing the metadata here, from the typed value, is what makes the
+    /// record self-describing; nesting the arguments is what makes it unforgeable, because a
+    /// tool argument named `tool` or `idempotency` can no longer look like a field of the record.
+    pub fn intent(&mut self, intent: &Intent, arguments: &serde_json::Value) -> Result<()> {
         if self.open.contains_key(&intent.call) {
             return Err(crate::Error::Protocol(format!(
                 "call `{}` already has an intent",
                 intent.call
             )));
         }
-        let record = self.journal.append_scoped(
-            crate::time::now(),
-            Kind::ToolCallIntent,
-            with_call(&intent.call, payload),
-            &self.scope,
-        )?;
+        let payload = serde_json::json!({
+            "call": intent.call.as_str(),
+            "tool": &intent.tool,
+            "idempotency": intent.idempotency,
+            "args_digest": &intent.args_digest,
+            "expected_effect": &intent.expected_effect,
+            "arguments": arguments,
+        });
+        let record =
+            self.journal
+                .append_scoped(self.journal.now(), Kind::ToolCallIntent, payload, &self.scope)?;
         debug_assert_eq!(record.fields.kind, Kind::ToolCallIntent);
         self.open.insert(intent.call.clone(), intent.clone());
         Ok(())
@@ -99,7 +114,7 @@ impl<'journal> ToolCallLog<'journal> {
     pub fn started(&mut self, call: &CallId, handle: serde_json::Value) -> Result<()> {
         self.require_open(call)?;
         self.journal.append_scoped(
-            crate::time::now(),
+            self.journal.now(),
             Kind::ToolCallStarted,
             with_call(call, handle),
             &self.scope,
@@ -129,7 +144,7 @@ impl<'journal> ToolCallLog<'journal> {
             None => JournalEvent::with_payload(observation),
         };
         self.journal
-            .append_full_scoped(crate::time::now(), Kind::ToolCallCompleted, event, &self.scope)
+            .append_full_scoped(self.journal.now(), Kind::ToolCallCompleted, event, &self.scope)
             .map(|_| ())
     }
 
@@ -138,7 +153,7 @@ impl<'journal> ToolCallLog<'journal> {
         self.require_open(call)?;
         self.open.remove(call);
         self.journal.append_scoped(
-            crate::time::now(),
+            self.journal.now(),
             Kind::ToolCallFailed,
             with_call(call, error),
             &self.scope,
@@ -154,7 +169,7 @@ impl<'journal> ToolCallLog<'journal> {
         self.require_open(call)?;
         self.open.remove(call);
         self.journal.append_scoped(
-            crate::time::now(),
+            self.journal.now(),
             Kind::ToolCallUnknown,
             with_call(call, reason),
             &self.scope,
@@ -175,7 +190,7 @@ impl<'journal> ToolCallLog<'journal> {
             }
         };
         self.journal
-            .append_scoped(crate::time::now(), kind, with_call(call, detail), &self.scope)?;
+            .append_scoped(self.journal.now(), kind, with_call(call, detail), &self.scope)?;
         Ok(())
     }
 
@@ -361,7 +376,7 @@ mod tests {
         let call = intent("call_1", Idempotency::Idempotent);
         {
             let mut log = ToolCallLog::new(&mut journal);
-            log.intent(&call, serde_json::json!({ "tool": "shell" })).unwrap();
+            log.intent(&call, &serde_json::json!({})).unwrap();
             log.started(&call.call, serde_json::json!({ "pid": 42 })).unwrap();
             log.completed(&call.call, serde_json::json!({ "exit_code": 0 }), None)
                 .unwrap();
@@ -392,7 +407,7 @@ mod tests {
         let call = intent("call_7", Idempotency::Idempotent);
         {
             let mut log = ToolCallLog::new(&mut journal);
-            log.intent(&call, serde_json::json!({ "tool": "shell" })).unwrap();
+            log.intent(&call, &serde_json::json!({})).unwrap();
             log.started(&call.call, serde_json::Value::Null).unwrap();
             log.completed(&call.call, serde_json::json!({}), None).unwrap();
         }
@@ -423,8 +438,8 @@ mod tests {
         let mut journal = open(dir.path());
         let mut log = ToolCallLog::new(&mut journal);
         let call = intent("call_dup", Idempotency::Idempotent);
-        log.intent(&call, serde_json::json!({})).unwrap();
-        assert!(log.intent(&call, serde_json::json!({})).is_err());
+        log.intent(&call, &serde_json::json!({})).unwrap();
+        assert!(log.intent(&call, &serde_json::json!({})).is_err());
     }
 
     #[test]
@@ -433,7 +448,7 @@ mod tests {
         let mut journal = open(dir.path());
         let mut log = ToolCallLog::new(&mut journal);
         let call = intent("call_twice", Idempotency::Idempotent);
-        log.intent(&call, serde_json::json!({})).unwrap();
+        log.intent(&call, &serde_json::json!({})).unwrap();
         log.started(&call.call, serde_json::json!({})).unwrap();
         log.completed(&call.call, serde_json::json!({}), None).unwrap();
         assert!(log.completed(&call.call, serde_json::json!({}), None).is_err());
@@ -445,7 +460,7 @@ mod tests {
         let mut journal = open(dir.path());
         let mut log = ToolCallLog::new(&mut journal);
         let call = intent("call_unknown", Idempotency::Unknown);
-        log.intent(&call, serde_json::json!({})).unwrap();
+        log.intent(&call, &serde_json::json!({})).unwrap();
         log.unknown(&call.call, serde_json::json!({"reason": "timeout"}))
             .unwrap();
         assert_eq!(log.open_calls().len(), 0);
@@ -473,11 +488,8 @@ mod tests {
         let mut journal = open(dir.path());
         {
             let mut log = ToolCallLog::new(&mut journal);
-            log.intent(
-                &intent("call_a", Idempotency::Idempotent),
-                serde_json::json!({"tool": "shell", "idempotency": "idempotent"}),
-            )
-            .unwrap();
+            log.intent(&intent("call_a", Idempotency::Idempotent), &serde_json::json!({}))
+                .unwrap();
         }
         journal.close().unwrap();
 
@@ -500,11 +512,7 @@ mod tests {
         {
             let mut log = ToolCallLog::new(&mut journal);
             let call = intent("call_b", Idempotency::Unknown);
-            log.intent(
-                &call,
-                serde_json::json!({"tool": "shell", "idempotency": "unknown"}),
-            )
-            .unwrap();
+            log.intent(&call, &serde_json::json!({})).unwrap();
             log.started(&call.call, serde_json::json!({"pid": 1})).unwrap();
         }
         journal.close().unwrap();
@@ -527,11 +535,7 @@ mod tests {
         {
             let mut log = ToolCallLog::new(&mut journal);
             let call = intent("call_f", Idempotency::Unknown);
-            log.intent(
-                &call,
-                serde_json::json!({"tool": "shell", "idempotency": "unknown"}),
-            )
-            .unwrap();
+            log.intent(&call, &serde_json::json!({})).unwrap();
             log.started(&call.call, serde_json::json!({})).unwrap();
             log.failed(&call.call, serde_json::json!({"exit_code": 2}))
                 .unwrap();
@@ -549,11 +553,7 @@ mod tests {
         {
             let mut log = ToolCallLog::new(&mut journal);
             let call = intent("call_u", Idempotency::Unknown);
-            log.intent(
-                &call,
-                serde_json::json!({"tool": "shell", "idempotency": "unknown"}),
-            )
-            .unwrap();
+            log.intent(&call, &serde_json::json!({})).unwrap();
             log.unknown(&call.call, serde_json::json!({"reason": "daemon died"}))
                 .unwrap();
         }
@@ -574,7 +574,7 @@ mod tests {
         let mut journal = open(dir.path());
         journal
             .append_event(
-                crate::time::now(),
+                journal.now(),
                 Kind::ToolCallCompleted,
                 serde_json::json!({"call": "ghost"}),
             )
@@ -591,11 +591,8 @@ mod tests {
         {
             let mut log = ToolCallLog::new(&mut journal);
             for name in ["call_z", "call_a", "call_m"] {
-                log.intent(
-                    &intent(name, Idempotency::Idempotent),
-                    serde_json::json!({"idempotency": "idempotent"}),
-                )
-                .unwrap();
+                log.intent(&intent(name, Idempotency::Idempotent), &serde_json::json!({}))
+                    .unwrap();
             }
         }
         journal.close().unwrap();
@@ -613,7 +610,7 @@ mod tests {
         {
             let mut log = ToolCallLog::new(&mut journal);
             let call = intent("call_spill", Idempotency::Idempotent);
-            log.intent(&call, serde_json::json!({"idempotency": "idempotent"}))
+            log.intent(&call, &serde_json::json!({"idempotency": "idempotent"}))
                 .unwrap();
             log.started(&call.call, serde_json::json!({})).unwrap();
             log.completed(&call.call, serde_json::json!({"bytes": 11}), Some(digest))
@@ -641,7 +638,7 @@ mod tests {
         let mut journal = open(dir.path());
         journal
             .append_event(
-                crate::time::now(),
+                journal.now(),
                 Kind::ToolCallIntent,
                 serde_json::json!({"call": "call_legacy", "tool": "shell"}),
             )
@@ -665,15 +662,9 @@ mod tests {
             let call = intent("call_crash", Idempotency::Unknown);
             {
                 let mut log = ToolCallLog::new(&mut journal);
-                log.intent(
-                    &call,
-                    serde_json::json!({
-                        "tool": "shell",
-                        "idempotency": "unknown",
-                        "expected_effect": "remove the build directory",
-                    }),
-                )
-                .unwrap();
+                // The metadata is in the `Intent`; the argument object is the tool's own input.
+                log.intent(&call, &serde_json::json!({"command": "rm -rf build"}))
+                    .unwrap();
                 if crash_point == "after_started" {
                     log.started(&call.call, serde_json::json!({"pid": 4242})).unwrap();
                 }
@@ -701,11 +692,7 @@ mod tests {
                     serde_json::json!({"checked": "build/ exists"}),
                 )
                 .unwrap();
-                log.intent(
-                    &call,
-                    serde_json::json!({"tool": "shell", "idempotency": "unknown"}),
-                )
-                .unwrap();
+                log.intent(&call, &serde_json::json!({})).unwrap();
                 log.started(&call.call, serde_json::json!({"pid": 4243})).unwrap();
                 log.completed(&call.call, serde_json::json!({"exit_code": 0}), None)
                     .unwrap();
@@ -735,11 +722,8 @@ mod tests {
         let call = intent("call_mid", Idempotency::ByContent);
         {
             let mut log = ToolCallLog::new(&mut journal);
-            log.intent(
-                &call,
-                serde_json::json!({"tool": "write_file", "idempotency": "by_content"}),
-            )
-            .unwrap();
+            log.intent(&call, &serde_json::json!({"path": "src/lib.rs", "content": "x"}))
+                .unwrap();
             log.started(&call.call, serde_json::Value::Null).unwrap();
         }
         journal.close().unwrap();
@@ -763,10 +747,8 @@ mod tests {
             let mut log = ToolCallLog::new(&mut journal);
             let a = intent("call_a", Idempotency::Idempotent);
             let b = intent("call_b", Idempotency::Idempotent);
-            log.intent(&a, serde_json::json!({"idempotency": "idempotent"}))
-                .unwrap();
-            log.intent(&b, serde_json::json!({"idempotency": "idempotent"}))
-                .unwrap();
+            log.intent(&a, &serde_json::json!({})).unwrap();
+            log.intent(&b, &serde_json::json!({})).unwrap();
             log.started(&a.call, serde_json::json!({})).unwrap();
             log.started(&b.call, serde_json::json!({})).unwrap();
             log.completed(&a.call, serde_json::json!({}), None).unwrap();
@@ -790,7 +772,7 @@ mod tests {
             let mut log = ToolCallLog::new(&mut journal);
             log.intent(
                 &intent("call_now", Idempotency::Idempotent),
-                serde_json::json!({"idempotency": "idempotent"}),
+                &serde_json::json!({}),
             )
             .unwrap();
         }

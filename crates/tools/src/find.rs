@@ -121,6 +121,16 @@ impl Tool for GlobTool {
             .unwrap_or_default()
     }
 
+    /// The pattern and the base, because `path` is optional and a bare `glob` would name neither.
+    fn expected_effect(&self, args: &Args) -> String {
+        let pattern = args.str("pattern").unwrap_or("?");
+        let base = args.opt_str("path").ok().flatten().unwrap_or(".");
+        crate::tool::one_line(
+            &format!("list files matching `{pattern}` under {base}"),
+            crate::tool::EFFECT_LIMIT,
+        )
+    }
+
     fn execute(&self, ctx: &ToolCtx, args: Args) -> Result<ToolResult, ToolError> {
         let pattern = args.str("pattern")?;
         let base = args.opt_str("path")?.unwrap_or(".");

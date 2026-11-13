@@ -810,6 +810,7 @@ dependencies = [
  "chrono",
  "immortality-core",
  "immortality-llm",
+ "immortality-testkit",
  "immortality-tools",
  "reqwest",
  "serde",

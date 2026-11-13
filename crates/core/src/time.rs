@@ -21,6 +21,94 @@ pub fn now() -> Timestamp {
     Utc::now().trunc_subsecs(3)
 }
 
+/// Where the current time comes from.
+///
+/// # Why this is a trait and not the free [`now`]
+///
+/// Three things in this system are measured in wall time: an attempt's 45-minute budget, the
+/// 30-day artifact TTL and the 15-minute backend-outage escalation. A test that waits for any of
+/// them is not a test, and a golden journal whose `ts` fields come from the machine clock is not
+/// a golden. Runs that must be reproducible — the simulator (M4.8), most of all — take a clock;
+/// production takes [`SystemClock`].
+///
+/// It is deliberately *not* a global: two tests in one process would share it, and the order they
+/// happen to run in would decide their results.
+pub trait Clock: std::fmt::Debug + Send + Sync {
+    /// The current instant, at journal resolution.
+    fn now(&self) -> Timestamp;
+}
+
+/// The system clock, the only implementation production uses.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now(&self) -> Timestamp {
+        now()
+    }
+}
+
+/// Seconds from the Unix epoch to 2026-11-12T10:00:00Z, the documentation's fixture date.
+///
+/// Written as a constant offset rather than a calendar construction so that
+/// [`FixedClock::fixture`] cannot fail: it is used by tests and by the simulator, and a fixture
+/// date that panics is a fixture every call site has to handle. A test pins the constant to the
+/// date it is supposed to be.
+const FIXTURE_SECONDS: i64 = 1_794_477_600;
+
+/// A clock that does not move on its own.
+///
+/// `advance` is explicit because a simulator has to be able to say "the 45 minutes passed"
+/// without spending them. It is also the seeded value a golden journal is measured from: the
+/// first record sits at `start`, so a normalised journal has offsets rather than dates.
+#[derive(Debug)]
+pub struct FixedClock {
+    start: Timestamp,
+    elapsed: std::sync::Mutex<chrono::Duration>,
+}
+
+impl FixedClock {
+    /// A clock frozen at `start`.
+    #[must_use]
+    pub const fn at(start: Timestamp) -> Self {
+        Self {
+            start,
+            elapsed: std::sync::Mutex::new(chrono::Duration::zero()),
+        }
+    }
+
+    /// The fixture instant the documentation uses: `2026-11-12T10:00:00Z`.
+    #[must_use]
+    pub fn fixture() -> Self {
+        Self::at(Timestamp::UNIX_EPOCH + chrono::Duration::seconds(FIXTURE_SECONDS))
+    }
+
+    /// Move forward. Never panics on a poisoned lock: a poisoned clock is a test that already
+    /// failed, and returning the time hides one failure instead of two.
+    pub fn advance(&self, by: chrono::Duration) {
+        let mut elapsed = self
+            .elapsed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *elapsed += by;
+    }
+
+    /// Move forward by whole seconds.
+    pub fn advance_secs(&self, secs: i64) {
+        self.advance(chrono::Duration::seconds(secs));
+    }
+}
+
+impl Clock for FixedClock {
+    fn now(&self) -> Timestamp {
+        let elapsed = *self
+            .elapsed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        truncate(self.start + elapsed)
+    }
+}
+
 /// Truncate an arbitrary instant to the resolution the journal stores.
 #[must_use]
 pub fn truncate(at: Timestamp) -> Timestamp {
@@ -173,5 +261,42 @@ mod tests {
     struct OptWrapper {
         #[serde(with = "millis_opt", skip_serializing_if = "Option::is_none", default)]
         at: Option<Timestamp>,
+    }
+    #[test]
+    fn the_system_clock_matches_the_free_function() {
+        // The trait is a seam, not a second definition of "now": a caller that took the clock
+        // must get the same answer as one that did not, or a mixed run would order records by
+        // two different clocks.
+        let clock = SystemClock;
+        let before = now();
+        let seen = clock.now();
+        let after = now();
+        assert!(before <= seen && seen <= after, "{before} {seen} {after}");
+    }
+
+    #[test]
+    fn a_fixed_clock_does_not_move_until_told_to() {
+        let clock = FixedClock::fixture();
+        assert_eq!(clock.now(), clock.now());
+        assert_eq!(clock.now().to_rfc3339(), "2026-11-12T10:00:00+00:00");
+    }
+
+    #[test]
+    fn advancing_a_fixed_clock_moves_it_by_exactly_that_much() {
+        // This is what makes "the 45-minute budget ran out" a microsecond test instead of a
+        // 45-minute one.
+        let clock = FixedClock::fixture();
+        clock.advance_secs(45 * 60);
+        assert_eq!(clock.now().to_rfc3339(), "2026-11-12T10:45:00+00:00");
+    }
+
+    #[test]
+    fn a_fixed_clock_keeps_journal_resolution() {
+        let clock = FixedClock::fixture();
+        clock.advance(chrono::Duration::nanoseconds(221_999_999));
+        assert_eq!(clock.now().timestamp_subsec_millis(), 221);
+        // Fixed width: the same truncation the writer applies, so a seeded journal has one
+        // spelling per timestamp.
+        assert!(to_json(clock.now()).contains(".221Z"));
     }
 }

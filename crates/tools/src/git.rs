@@ -232,6 +232,18 @@ impl Tool for Git {
             .unwrap_or_default()
     }
 
+    /// The verb and its arguments. `paths` is empty for most verbs — `git commit` names no path
+    /// when it stages the whole tree — so the path-based default would say only `git`.
+    fn expected_effect(&self, args: &Args) -> String {
+        let verb = args.str("subcommand").unwrap_or("?");
+        let extra = read_args(args).unwrap_or_default().join(" ");
+        if extra.is_empty() {
+            crate::tool::one_line(&format!("git {verb}"), crate::tool::EFFECT_LIMIT)
+        } else {
+            crate::tool::one_line(&format!("git {verb} {extra}"), crate::tool::EFFECT_LIMIT)
+        }
+    }
+
     fn execute(&self, ctx: &ToolCtx, args: Args) -> Result<ToolResult, ToolError> {
         let verb = Verb::parse(args.str("subcommand")?)?;
         let extra = read_args(&args)?;
