@@ -535,6 +535,56 @@ fn serve_brings_up_a_daemon_that_the_other_commands_can_reach() {
 }
 
 #[test]
+fn sigterm_removes_the_socket_and_the_lock() {
+    // The cleanup path a human actually triggers: Ctrl-C and `kill` are both signals, and the
+    // help text promises the socket goes away. Before this was handled the process died inside
+    // `accept`, no destructor ran, and the socket stayed behind — a documented promise that was
+    // simply false. `SIGKILL` cannot be caught; that case is covered by the restart test.
+    let daemon = Daemon::new();
+    daemon.journal(1);
+
+    let mut child = daemon
+        .cli()
+        .arg("serve")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !daemon.socket.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(daemon.socket.exists(), "the daemon never bound its socket");
+
+    let killed = std::process::Command::new("kill")
+        .arg("-TERM")
+        .arg(child.id().to_string())
+        .status()
+        .expect("send SIGTERM");
+    assert!(killed.success());
+
+    // Waiting on the child reaps it, which is the synchronization: by the time `wait` returns,
+    // the process has run its shutdown path or died, so the filesystem is settled.
+    let status = child.wait().unwrap();
+    assert!(
+        status.success(),
+        "a signalled daemon must exit by its own cleanup path, got {status:?}"
+    );
+
+    assert!(!daemon.socket.exists(), "the socket must be gone after SIGTERM");
+    assert!(
+        !daemon.state_root.join("daemon.lock").exists(),
+        "the lock file must be gone after SIGTERM"
+    );
+    // The token is not cleanup: removing it would force every client to re-read a different
+    // secret, and the next start would mint a new one anyway.
+    assert!(
+        daemon.token_path().exists(),
+        "the token survives a clean shutdown"
+    );
+}
+
+#[test]
 fn init_registers_the_repository_so_the_daemon_can_find_it_later() {
     let daemon = Daemon::new();
     let project = daemon.root().join("fresh");

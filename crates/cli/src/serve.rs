@@ -203,12 +203,40 @@ pub async fn run() -> Result<()> {
         std::process::id()
     );
 
-    let outcome = server::serve(listener, server_state, Events::new()).await;
-    // `serve` returns only on an accept error; the socket is removed so the next start does not
-    // find a corpse. `bind` also removes a stale file, so this is for the common case only.
+    let outcome = tokio::select! {
+        outcome = server::serve(listener, server_state, Events::new()) => outcome,
+        signal = shutdown_signal() => {
+            // Ctrl-C and `kill` both arrive here. Without this the process dies mid-`accept`,
+            // no cleanup runs, and the socket survives — which the help text promised it would
+            // not. `SIGKILL` cannot be caught, and `bind` already handles that leftover file.
+            eprintln!("received {signal}; shutting down");
+            Ok(())
+        }
+    };
+    // Removed before the lock is released: a start that waited for the lock must not observe a
+    // moment in which the lock is free and a dead socket is still there.
     let _ = std::fs::remove_file(&socket);
     drop(lock);
     outcome.context("the daemon stopped")
+}
+
+/// Resolve on `SIGTERM` or `SIGINT`, naming which arrived.
+///
+/// Never resolves if the handler cannot be installed. That is not a reason to refuse to serve —
+/// the daemon still works, it just cannot clean up on a signal — but it *is* a reason not to
+/// treat "no handler" as "shut down now", which is what returning immediately would do.
+async fn shutdown_signal() -> &'static str {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let (Ok(mut terminate), Ok(mut interrupt)) =
+        (signal(SignalKind::terminate()), signal(SignalKind::interrupt()))
+    else {
+        return std::future::pending().await;
+    };
+    tokio::select! {
+        _ = terminate.recv() => "SIGTERM",
+        _ = interrupt.recv() => "SIGINT",
+    }
 }
 
 #[cfg(test)]
