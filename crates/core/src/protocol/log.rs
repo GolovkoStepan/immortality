@@ -21,7 +21,7 @@
 //! recovery the observation is replayed into the conversation from the journal, so the model
 //! sees exactly what was durable, and no tool runs twice.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::Result;
 use crate::journal::{Journal, JournalEvent, Kind, Scope};
@@ -43,6 +43,19 @@ pub struct ToolCallLog<'journal> {
     /// truth — the journal is — and it deliberately does not survive a restart: after a restart
     /// the in-flight state is exactly what `recover` has to reconstruct.
     open: BTreeMap<CallId, Intent>,
+    /// Whether a terminal record may be written for a call this process never opened.
+    ///
+    /// Only recovery sets this. Its calls come from [`open_calls`] over the same journal, so they
+    /// were opened — by a process that no longer exists. The in-memory map is precisely the thing
+    /// a restart loses, and refusing to close a call whose id was read from disk would leave the
+    /// model's `tool_calls` entry unanswered forever, which the backend rejects.
+    recovering: bool,
+    /// Calls a recovery pass has already answered.
+    ///
+    /// Only meaningful while `recovering`: the in-memory map cannot serve that role, because the
+    /// intents are on disk. It exists so that answering one call twice is still the immediate
+    /// error a caller made it, rather than a second terminal record nobody asked for.
+    closed: BTreeSet<CallId>,
 }
 
 impl<'journal> ToolCallLog<'journal> {
@@ -56,6 +69,8 @@ impl<'journal> ToolCallLog<'journal> {
             journal,
             scope: Scope::task(),
             open: BTreeMap::new(),
+            recovering: false,
+            closed: BTreeSet::new(),
         }
     }
 
@@ -69,6 +84,24 @@ impl<'journal> ToolCallLog<'journal> {
             journal,
             scope,
             open: BTreeMap::new(),
+            recovering: false,
+            closed: BTreeSet::new(),
+        }
+    }
+
+    /// A log that may close calls it did not open, in the scope they were opened in.
+    ///
+    /// Recovery is the only caller, and it needs both halves of this: the calls it answers were
+    /// opened by a process that died, so they are absent from `open`; and their records must land
+    /// in the `(subtask, attempt)` scope the intent carried, not in `Scope::task()`.
+    #[must_use]
+    pub const fn recovering(journal: &'journal mut Journal, scope: Scope) -> Self {
+        Self {
+            journal,
+            scope,
+            open: BTreeMap::new(),
+            recovering: true,
+            closed: BTreeSet::new(),
         }
     }
 
@@ -135,7 +168,7 @@ impl<'journal> ToolCallLog<'journal> {
         artifact: Option<crate::journal::Digest>,
     ) -> Result<()> {
         self.require_open(call)?;
-        self.open.remove(call);
+        self.close(call);
         // The call id goes into the payload like every other protocol record: recovery groups
         // by id, and a terminal record without one cannot close anything.
         let observation = with_call(call, observation);
@@ -151,7 +184,7 @@ impl<'journal> ToolCallLog<'journal> {
     /// Record a failure. The call is finished; the model must be told.
     pub fn failed(&mut self, call: &CallId, error: serde_json::Value) -> Result<()> {
         self.require_open(call)?;
-        self.open.remove(call);
+        self.close(call);
         self.journal.append_scoped(
             self.journal.now(),
             Kind::ToolCallFailed,
@@ -167,7 +200,7 @@ impl<'journal> ToolCallLog<'journal> {
     /// nobody knows. Only the latter triggers a probe.
     pub fn unknown(&mut self, call: &CallId, reason: serde_json::Value) -> Result<()> {
         self.require_open(call)?;
-        self.open.remove(call);
+        self.close(call);
         self.journal.append_scoped(
             self.journal.now(),
             Kind::ToolCallUnknown,
@@ -207,12 +240,34 @@ impl<'journal> ToolCallLog<'journal> {
     }
 
     fn require_open(&self, call: &CallId) -> Result<()> {
+        if self.recovering {
+            // The intent exists on disk — that is where recovery read the id from — even though
+            // this process's map never saw it. Answering the same call twice is still a caller
+            // bug, and still caught here.
+            if self.closed.contains(call) {
+                return Err(crate::Error::Protocol(format!(
+                    "call `{call}` was already answered by this recovery pass"
+                )));
+            }
+            return Ok(());
+        }
         if !self.open.contains_key(call) {
             return Err(crate::Error::Protocol(format!(
                 "call `{call}` has no open intent; a record out of order is a bug in the caller"
             )));
         }
         Ok(())
+    }
+
+    /// Forget a call that has just been answered.
+    fn close(&mut self, call: &CallId) {
+        if self.recovering {
+            // Inserted before the write, so a journal failure still leaves the in-memory guard
+            // consistent with what this log believes it did.
+            self.closed.insert(call.clone());
+        } else {
+            self.open.remove(call);
+        }
     }
 }
 
@@ -241,6 +296,13 @@ pub struct FoundOpenCall {
     /// content, and `None` here (an older record without `arguments`, or a truncated payload)
     /// means a `ByContent` probe cannot answer anything but `Unknown`.
     pub arguments: Option<serde_json::Value>,
+    /// The scope the `intent` record was written in.
+    ///
+    /// Recovery closes a call in the scope it was opened in, not in a scope of its own choosing.
+    /// The pair `(subtask, attempt)` is what `attempts.json` is rebuilt from and what decides
+    /// whether an attempt is over; a terminal record in the wrong scope would answer the model's
+    /// `tool_calls` entry while leaving the attempt looking open forever.
+    pub scope: crate::journal::Scope,
     /// `seq` of the `intent` record, so a human can jump to it in the file.
     pub intent_seq: u64,
     /// `seq` of the `started` record, if any.
@@ -290,6 +352,10 @@ pub fn open_calls(records: &[crate::journal::JournalRecord]) -> Vec<FoundOpenCal
                             marked_unknown: false,
                         },
                         arguments: record.event.payload.get("arguments").cloned(),
+                        scope: crate::journal::Scope {
+                            subtask: record.fields.subtask.clone(),
+                            attempt: record.fields.attempt,
+                        },
                         intent_seq: record.fields.seq,
                         started_seq: None,
                     },
@@ -540,6 +606,102 @@ mod tests {
             found[0].arguments,
             Some(serde_json::json!({"path": "src/lib.rs", "content": "fn main() {}\n"}))
         );
+    }
+
+    #[test]
+    fn open_calls_carries_the_scope_the_intent_was_written_in() {
+        // Recovery closes a call in the scope it was opened in. A closing record in
+        // `Scope::task()` would answer the model's `tool_calls` entry while leaving the attempt
+        // looking open, so the next boot would abandon an attempt whose work is done.
+        let dir = tempfile::tempdir().unwrap();
+        let subtask = crate::ids::SubtaskId::from_suffix("01ARZ3NDEKTSV4RRFFQ69G5FAA");
+        let mut journal = open(dir.path());
+        {
+            let mut log = ToolCallLog::scoped(&mut journal, Scope::attempt(subtask.clone(), 3));
+            let call = intent("call_scoped", Idempotency::Idempotent);
+            log.intent(&call, &serde_json::json!({})).unwrap();
+        }
+        journal.close().unwrap();
+
+        let reader = JournalReader::open(dir.path(), &task()).unwrap();
+        let found = open_calls(&reader.read().unwrap().records);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].scope, Scope::attempt(subtask, 3));
+    }
+
+    #[test]
+    fn a_recovering_log_closes_a_call_it_never_opened_in_the_given_scope() {
+        // The call was opened by the process that died, so this process's map is empty. The
+        // closing record must still be written, and in the intent's scope.
+        let dir = tempfile::tempdir().unwrap();
+        let subtask = crate::ids::SubtaskId::from_suffix("01ARZ3NDEKTSV4RRFFQ69G5FAA");
+        let mut journal = open(dir.path());
+        {
+            let mut log = ToolCallLog::scoped(&mut journal, Scope::attempt(subtask.clone(), 2));
+            let call = intent("call_died", Idempotency::ByContent);
+            log.intent(&call, &serde_json::json!({"path": "a"})).unwrap();
+            log.started(&call.call, serde_json::json!(null)).unwrap();
+        }
+        {
+            // A fresh process re-opens the journal and answers the call.
+            let mut log = ToolCallLog::recovering(&mut journal, Scope::attempt(subtask.clone(), 2));
+            log.completed(
+                &CallId::from_model("call_died"),
+                serde_json::json!({"observation": "already written"}),
+                None,
+            )
+            .unwrap();
+        }
+        journal.close().unwrap();
+
+        let reader = JournalReader::open(dir.path(), &task()).unwrap();
+        let records = reader.read().unwrap().records;
+        let completed = records
+            .iter()
+            .find(|record| record.fields.kind == Kind::ToolCallCompleted)
+            .expect("the recovering log wrote the terminal record");
+        assert_eq!(
+            completed.fields.subtask.as_ref(),
+            Some(&subtask),
+            "the scope must be the intent's, not the task's"
+        );
+        assert_eq!(completed.fields.attempt, Some(2));
+        assert_eq!(open_calls(&records), []);
+    }
+
+    #[test]
+    fn a_recovery_pass_refuses_to_answer_the_same_call_twice() {
+        // Answering twice writes a terminal record for a call that is already closed. The journal
+        // still passes its own checks, so nothing else would catch it.
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal = open(dir.path());
+        {
+            let mut log = ToolCallLog::new(&mut journal);
+            let call = intent("call_once", Idempotency::Idempotent);
+            log.intent(&call, &serde_json::json!({})).unwrap();
+            log.started(&call.call, serde_json::json!(null)).unwrap();
+        }
+        let mut log = ToolCallLog::recovering(&mut journal, Scope::task());
+        let call = CallId::from_model("call_once");
+        log.completed(&call, serde_json::json!({}), None)
+            .expect("the first answer");
+        let error = log
+            .completed(&call, serde_json::json!({}), None)
+            .expect_err("the second answer is a caller bug");
+        assert!(error.to_string().contains("already answered"), "{error}");
+    }
+
+    #[test]
+    fn a_normal_log_still_refuses_a_call_it_never_opened() {
+        // The recovering flag must not leak into the runner's path: an out-of-order record there
+        // is still a bug worth failing loudly.
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal = open(dir.path());
+        let mut log = ToolCallLog::new(&mut journal);
+        let error = log
+            .completed(&CallId::from_model("call_ghost"), serde_json::json!({}), None)
+            .expect_err("no intent was written");
+        assert!(error.to_string().contains("no open intent"), "{error}");
     }
 
     #[test]

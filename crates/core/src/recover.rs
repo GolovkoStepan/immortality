@@ -47,7 +47,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::checkpoint::CheckpointKind;
 use crate::domain::{SubtaskId, SubtaskState};
 use crate::journal::{JournalRecord, Kind, ReadOutcome, ReadProblem};
-use crate::protocol::{CallId, FoundOpenCall, Intent, OpenCall, Probe, RecoveryAction};
+use crate::protocol::{CallId, FoundOpenCall, Intent, Probe, RecoveryAction};
 
 /// Facts about the task's worktree, gathered by the caller.
 ///
@@ -163,6 +163,13 @@ pub enum Divergence {
 pub struct CallRecovery {
     pub call: CallId,
     pub action: RecoveryAction,
+    /// The scope the call's `intent` was written in.
+    ///
+    /// The executor writes the closing record — `tool_call_completed`, `tool_call_failed`,
+    /// `effect_verified` — in *this* scope. `(subtask, attempt)` is the key `attempts.json` is
+    /// rebuilt from, so a closing record in a scope of recovery's own invention would leave the
+    /// attempt looking open while the model's `tool_calls` entry is answered.
+    pub scope: crate::journal::Scope,
     /// The probe's answer, when one was run. `None` for calls that did not need a probe.
     ///
     /// The executor reads this to write `effect_verified` / `effect_absent` before running the
@@ -488,16 +495,8 @@ fn reclaim_calls(input: &RecoveryInput<'_>, prober: &impl Prober, verdict: &mut 
     if let Some(step) = interrupted_rollback(input, verdict) {
         rollbacks.push(step);
     }
-    for FoundOpenCall { open, arguments, .. } in crate::protocol::open_calls(&input.journal.records) {
-        let recovered = reclaim_call(
-            &open,
-            arguments.as_ref(),
-            prober,
-            input,
-            &mut actions,
-            &mut rollbacks,
-            verdict,
-        );
+    for found in crate::protocol::open_calls(&input.journal.records) {
+        let recovered = reclaim_call(&found, prober, input, &mut actions, &mut rollbacks, verdict);
         calls.push(recovered);
     }
     // Two unknown calls often answer `Unknown` for the same reason and point at the same
@@ -582,14 +581,14 @@ fn worktree_action(input: &RecoveryInput<'_>) -> WorktreeAction {
 /// Steps go to one of two lists: `rollbacks` collects the tree-rewriting steps that must run
 /// before anything else, `actions` collects the rest. See the caller for why.
 fn reclaim_call(
-    open: &OpenCall,
-    arguments: Option<&serde_json::Value>,
+    found: &FoundOpenCall,
     prober: &impl Prober,
     input: &RecoveryInput<'_>,
     actions: &mut Vec<RecoveryStep>,
     rollbacks: &mut Vec<RecoveryStep>,
     verdict: &mut Verdict,
 ) -> CallRecovery {
+    let open = &found.open;
     let action = open.required_action();
     let call = open.intent.call.clone();
     let tool = open.intent.tool.clone();
@@ -619,7 +618,7 @@ fn reclaim_call(
             });
         }
         RecoveryAction::Probe | RecoveryAction::VerifyContent => {
-            let answer = prober.probe(&open.intent, arguments);
+            let answer = prober.probe(&open.intent, found.arguments.as_ref());
             effect = Some(answer);
             *verdict = Verdict::Repaired;
             match answer {
@@ -654,7 +653,12 @@ fn reclaim_call(
         }
     }
 
-    CallRecovery { call, action, effect }
+    CallRecovery {
+        call,
+        action,
+        scope: found.scope.clone(),
+        effect,
+    }
 }
 
 /// The rollback an interrupted L3 restart had already committed to, if there is one.
@@ -1620,6 +1624,7 @@ mod tests {
         report.calls.push(CallRecovery {
             call: CallId::from_model("call_ghost"),
             action: RecoveryAction::Retry,
+            scope: crate::journal::Scope::task(),
             effect: None,
         });
         assert!(!all_calls_addressed(&journal.records, &report));
