@@ -217,7 +217,17 @@ pub enum RecoveryStep {
     SynthesizeApplied { call: CallId, observation: String },
 
     /// Nothing happened (or the call was safe to repeat): run it.
-    RetryCall { call: CallId, tool: String },
+    ///
+    /// `arguments` are the stored arguments, because re-issuing a call means re-issuing *that*
+    /// call: without them the executor would have the tool name and nothing to run. `None` is a
+    /// record that lost its payload, and the executor must close the call with an observation
+    /// rather than guess a second time — running a `shell` with invented arguments is exactly the
+    /// duplicate this project cannot have.
+    RetryCall {
+        call: CallId,
+        tool: String,
+        arguments: Option<serde_json::Value>,
+    },
 
     /// The call can neither be probed nor retried; close it with an observation explaining why.
     AbandonCall { call: CallId, reason: String },
@@ -606,6 +616,7 @@ fn reclaim_call(
             actions.push(RecoveryStep::RetryCall {
                 call: call.clone(),
                 tool,
+                arguments: found.arguments.clone(),
             });
         }
         // `required_action` cannot return `Abandon` today; handled so that giving it a
@@ -632,6 +643,7 @@ fn reclaim_call(
                 Probe::NotApplied => actions.push(RecoveryStep::RetryCall {
                     call: call.clone(),
                     tool,
+                    arguments: found.arguments.clone(),
                 }),
                 Probe::Unknown => match &input.last_checkpoint {
                     // L3. Guessing here is how a destructive command runs twice.
@@ -1287,6 +1299,60 @@ mod tests {
         assert!(matches!(
             report.steps.last(),
             Some(RecoveryStep::RecordRecovery { .. })
+        ));
+    }
+
+    #[test]
+    fn a_retried_call_carries_the_arguments_it_was_issued_with() {
+        // Re-issuing a call means re-issuing *that* call. A plan that said "run `shell` again"
+        // without the command would either force the executor to invent one — a second, possibly
+        // destructive, command nobody asked for — or to give up on an idempotent call that is
+        // safe to repeat. The stored arguments travel with the step.
+        let journal = outcome(vec![record(
+            0,
+            Kind::ToolCallIntent,
+            serde_json::json!({
+                "call": "call_shell",
+                "tool": "shell",
+                "idempotency": "idempotent",
+                "expected_effect": "run cargo fmt",
+                "arguments": {"command": "cargo fmt --all"},
+            }),
+        )]);
+        let report = plan(
+            &input(
+                &journal,
+                WorkspaceFacts::healthy("agent/tsk_01", "abc"),
+                PersistedState::default(),
+            ),
+            &NoProbe,
+        );
+        assert_eq!(
+            step_of(&report, "RetryCall"),
+            Some(&RecoveryStep::RetryCall {
+                call: CallId::from_model("call_shell"),
+                tool: "shell".into(),
+                arguments: Some(serde_json::json!({"command": "cargo fmt --all"})),
+            })
+        );
+    }
+
+    #[test]
+    fn a_retried_call_without_stored_arguments_says_so() {
+        // An older `intent` record may not carry `arguments`. `None` is the honest answer and the
+        // executor must close the call with an observation; nothing here may guess.
+        let journal = call_with("idempotent", "call_bare", false);
+        let report = plan(
+            &input(
+                &journal,
+                WorkspaceFacts::healthy("agent/tsk_01", "abc"),
+                PersistedState::default(),
+            ),
+            &NoProbe,
+        );
+        assert!(matches!(
+            step_of(&report, "RetryCall"),
+            Some(RecoveryStep::RetryCall { arguments: None, .. })
         ));
     }
 
