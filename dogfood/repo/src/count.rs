@@ -6,6 +6,12 @@
 ///
 /// A file that ends with a newline has as many lines as it has newlines; the empty string has
 /// none.
+///
+/// # The bug this fixture ships with
+///
+/// `str::split` yields a trailing empty field after a final separator, so `lines("a\nb\n")` is 3
+/// and not 2. The task `line-count` exists to fix exactly this, and its gate is red until it is
+/// fixed — which is what makes the task a fair test rather than a no-op.
 pub fn lines(text: &str) -> usize {
     if text.is_empty() {
         return 0;

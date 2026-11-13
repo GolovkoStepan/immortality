@@ -22,4 +22,6 @@ daemon.token
 # it; those are run artefacts, not fixtures. The task plans under `dogfood/tasks/` are committed.
 /dogfood/repo/.agent
 /dogfood/repo/target
+/dogfood/repo/tests
+/dogfood/repo/Cargo.lock
 /dogfood/repo-agent

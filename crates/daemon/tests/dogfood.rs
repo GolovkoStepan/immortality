@@ -1,17 +1,22 @@
-//! The dogfood fixtures load as plans.
+//! The dogfood fixtures are tasks the daemon would accept, and each one's gate actually starts red.
 //!
 //! # Why this is a test and not a note in `dogfood/README.md`
 //!
-//! A fixture task is a claim that a run can execute it. `Plan::load` is the only authority on
-//! that claim: a dangling dependency, a `DoD` with no gate, a `depth` that lies about nesting or
-//! a timestamp that does not parse all make the fixture a task the daemon would refuse before
-//! spending a single model call. Hand-written JSON drifts the moment a field is renamed, and a
-//! fixture that cannot load would show up as a mysterious failure hours into M6.2.
+//! A fixture task is a claim that a run can execute it and that success means something.
+//! `Plan::load` is the authority on the first half: a dangling dependency, a `DoD` with no gate or
+//! a `depth` that lies about nesting all make the fixture a task the daemon would refuse before
+//! spending a single model call.
 //!
-//! # Why the workspace root and not a copy
+//! The second half is subtler and is the reason this file runs the fixture repository's own gate:
+//! a gate that passes on the untouched repository closes a subtask that changed nothing, and M6's
+//! criterion would be met by a run that did no work. So each task installs a failing test through
+//! `admit.sh`, and the red run is asserted here rather than remembered during a dogfood session.
 //!
-//! The fixtures are the tasks a human will actually run, so the test must read the same bytes.
-//! A copy under `tests/` would be a second authority and would pass while the real file rotted.
+//! # Why `cargo` is invoked for real
+//!
+//! The fixture repository is a dependency-free crate, so its test gate is a local compile and run
+//! in under a second. A fake `cargo` would prove that this test calls something, not that the
+//! fixture is red — and "is it red" is exactly the claim.
 
 #![allow(
     clippy::unwrap_used,
@@ -21,6 +26,7 @@
 )]
 
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use immortality_core::plan::{Plan, SCHEMA_VERSION};
 
@@ -34,6 +40,14 @@ fn dogfood() -> PathBuf {
         .join("dogfood")
 }
 
+fn repo() -> PathBuf {
+    dogfood().join("repo")
+}
+
+fn admit() -> PathBuf {
+    dogfood().join("scripts").join("admit.sh")
+}
+
 /// Every task directory under `dogfood/tasks`, sorted so a failure names them in a stable order.
 fn tasks() -> Vec<PathBuf> {
     let mut found: Vec<PathBuf> = std::fs::read_dir(dogfood().join("tasks"))
@@ -43,6 +57,39 @@ fn tasks() -> Vec<PathBuf> {
         .collect();
     found.sort();
     found
+}
+
+/// A fresh copy of the fixture repository, so admitting into it cannot disturb the checked-in one.
+fn copy_of_repo(into: &Path) {
+    for entry in std::fs::read_dir(repo()).expect("repo") {
+        let entry = entry.expect("entry");
+        let name = entry.file_name();
+        // `target/` is build output; copying it would make each test pay for a stale tree and
+        // would compare a binary built from other sources.
+        if name == "target" || name == ".agent" || name == "tests" {
+            continue;
+        }
+        let from = entry.path();
+        let to = into.join(&name);
+        if from.is_dir() {
+            copy_dir(&from, &to);
+        } else {
+            std::fs::copy(&from, &to).expect("copy");
+        }
+    }
+}
+
+fn copy_dir(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).expect("mkdir");
+    for entry in std::fs::read_dir(from).expect("read dir") {
+        let entry = entry.expect("entry");
+        let target = to.join(entry.file_name());
+        if entry.path().is_dir() {
+            copy_dir(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), &target).expect("copy");
+        }
+    }
 }
 
 #[test]
@@ -64,9 +111,9 @@ fn every_dogfood_task_is_a_plan_the_daemon_would_execute() {
 }
 
 #[test]
-fn every_dogfood_task_names_itself_in_the_three_files_the_daemon_reads() {
-    // The admit script copies three files; a task directory missing one would fail at copy time
-    // with a message about a missing path rather than about a broken fixture.
+fn every_dogfood_task_has_the_three_files_the_daemon_reads() {
+    // `admit.sh` copies three files; a task directory missing one would fail at copy time with a
+    // message about a missing path rather than about a broken fixture.
     for task in tasks() {
         for name in ["PLAN.md", "ACCEPTANCE.md", "TASKS.json"] {
             let path = task.join(immortality_core::paths::AGENT_DIR).join(name);
@@ -93,23 +140,42 @@ fn every_dogfood_task_names_itself_in_the_three_files_the_daemon_reads() {
 }
 
 #[test]
-fn the_line_count_task_reproduces_a_real_bug_before_the_fix() {
-    // The bugfix task is only a fair test if the bug exists. This pins the defect against the
-    // fixture repository's own code, so a fixture edit that accidentally fixes it makes this
-    // test fail rather than producing a task with nothing to do.
-    let source =
-        std::fs::read_to_string(dogfood().join("repo").join("src").join("count.rs")).expect("count.rs");
-    assert!(
-        source.contains("fn lines"),
-        "the fixture's counting module moved; the bugfix task points at a function that is gone"
-    );
-    // The defect is `split('\n').count()` without trimming a trailing empty field. It is present
-    // in the initial fixture and the task exists to remove it; the assertion is on the *shape*
-    // that produces the bug, not on the bug being permanent.
-    let body = source.split("pub fn lines").nth(1).expect("the function body");
-    let body = body.split("pub fn words").next().expect("the body ends");
-    assert!(
-        body.contains("split('\\n')"),
-        "the fixture's `lines` no longer splits on newlines, so the bugfix task's premise is gone: {body}"
-    );
+fn every_dogfood_task_starts_with_a_failing_gate() {
+    // The milestone's criterion is "three subtasks closed with green gates, unaided". A gate that
+    // is green before the run makes that criterion satisfiable by doing nothing, so each task's
+    // gate is run against a fresh copy of the repository and must fail. This is the assertion
+    // that stops a fixture from quietly becoming a no-op.
+    for task in tasks() {
+        let name = task.file_name().expect("name").to_string_lossy().into_owned();
+        let scratch = tempfile::tempdir().expect("tempdir");
+        let target = scratch.path().join("repo");
+        std::fs::create_dir_all(&target).expect("repo dir");
+        copy_of_repo(&target);
+
+        let admitted = Command::new("bash")
+            .arg(admit())
+            .arg(&name)
+            .arg(&target)
+            .output()
+            .expect("run admit.sh");
+        assert!(
+            admitted.status.success(),
+            "admit.sh failed for {name}: {}",
+            String::from_utf8_lossy(&admitted.stderr)
+        );
+
+        let gate = Command::new("cargo")
+            .args(["test", "--offline", "--quiet"])
+            .current_dir(&target)
+            .env("CARGO_TERM_COLOR", "never")
+            .output()
+            .expect("run the fixture's gate");
+        assert!(
+            !gate.status.success(),
+            "the gate of {name} passes before the work, so a subtask could close without \
+             changing anything; stdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&gate.stdout),
+            String::from_utf8_lossy(&gate.stderr)
+        );
+    }
 }

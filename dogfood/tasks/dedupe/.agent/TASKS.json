@@ -4,10 +4,10 @@
     {
       "id": "sub_01M7A5K55R00014D2PF28AQKFJ",
       "depth": 1,
-      "title": "replace the seen-words vector with a set",
-      "goal": "Change unique_words in src/count.rs to collect normalised words into a std::collections::BTreeSet<String> instead of a Vec<String> plus a linear contains check. The returned count and every observable behaviour must stay identical, so all existing tests must pass without being edited. Add one test proving that words differing only by surrounding punctuation still collapse to one, because that behaviour is the whole point of the normalisation and a container swap must not quietly change it.",
+      "title": "replace the seen-words vector with a set and expose sorted words",
+      "goal": "Change unique_words in src/count.rs to collect normalised words into a std::collections::BTreeSet<String> instead of a Vec plus a linear contains check, and add a public function unique_words_sorted that returns the same normalised words as a sorted Vec<String>. The counts must stay identical, and every assertion that already exists in src/count.rs must remain untouched and green. The repository's tests/behaviour.rs calls count::unique_words_sorted and is currently failing to compile; make it pass without editing the test file.",
       "dod": {
-        "statement": "the container is a set, every pre-existing assertion is untouched and green, and a test pins that punctuation-only differences still collapse",
+        "statement": "the container is a set, the sorted accessor exists, tests/behaviour.rs passes, and no pre-existing assertion was edited",
         "checks": [
           { "id": "test", "command": "cargo test --offline", "required": true }
         ],

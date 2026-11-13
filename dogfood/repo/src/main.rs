@@ -5,7 +5,7 @@
 
 use std::process::ExitCode;
 
-mod count;
+use tally::count;
 
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
