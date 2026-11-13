@@ -109,6 +109,11 @@ pub enum FailureReason {
     TimeExhausted,
     /// The model looped and the escalation ladder ran out at L5.
     Looped,
+    /// The subtask was decomposed by the model into smaller pieces.
+    ///
+    /// Not a failure of the model's work: the subtask was too large, which is what the split
+    /// says. It is its own reason so a metric query can separate "too big" from "too hard".
+    Split,
     /// A required command from `ACCEPTANCE.md` failed.
     GateFailed,
     /// The reviewer asked for changes and the changes were not made.

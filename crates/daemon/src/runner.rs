@@ -55,6 +55,7 @@ use immortality_core::domain::{Attempt, AttemptTrigger, FailureReason, Subtask, 
 use immortality_core::ids::TaskId;
 use immortality_core::journal::{Journal, Kind, Scope};
 use immortality_core::protocol::{CallId, Intent, ToolCallLog};
+use immortality_core::scheduler::Piece;
 use immortality_llm::turn::AssistantTurn;
 use immortality_llm::wire::ChatRequest;
 use immortality_llm::{Backend, ToolDef};
@@ -65,6 +66,20 @@ use immortality_tools::{Args, PolicyGate, Registry, ToolCtx, ToolError};
 /// Spelled here once and compared against a name that came from a model: a typo would turn
 /// "done" into "unknown tool" and run the attempt to its step budget.
 pub const FINISH_SUBTASK: &str = "finish_subtask";
+
+/// The name the model calls to say the subtask is too large and propose pieces.
+///
+/// Like [`FINISH_SUBTASK`] it is declared but never dispatched to a tool: it has no effect on
+/// its own. The model *proposes*, the scheduler decides — a model that could split itself would
+/// be choosing the shape of a tree it is not allowed to see, and its pieces still have to keep
+/// the parent's gates, which only [`immortality_core::scheduler::validate_split`] can check.
+pub const SPLIT_SUBTASK: &str = "split_subtask";
+
+/// The largest number of pieces a split may propose.
+///
+/// Not a limit on decomposition but on a model's habit of listing ten headings instead of two
+/// pieces of work: past this, a split is a plan rewrite, and a plan rewrite needs a human.
+pub const MAX_SPLIT_PIECES: usize = 8;
 
 /// Step, token and time limits for one attempt.
 ///
@@ -291,6 +306,12 @@ pub enum Ending {
     /// *which signal* concluded that another step in this attempt was worthless. The strategy of
     /// the next attempt is written from the detector's name and metric.
     Looped(Reaction),
+    /// The model proposed a decomposition of the subtask (L4).
+    ///
+    /// The runner does not own the tree, so it stops and hands the pieces up. Validating them
+    /// — depth, inherited gates, no duplicate work — is the scheduler's job, and doing it here
+    /// would make the runner the authority on a tree it cannot see the neighbours of.
+    SplitRequested(Vec<Piece>),
 }
 
 impl Ending {
@@ -311,6 +332,9 @@ impl Ending {
             // reason, so a metric query can separate "the model gave up" from "the model ran out
             // of room".
             Self::Looped(_) => Some(FailureReason::Looped),
+            // A split is not a failure of the model's work: the subtask was too large, which is
+            // what the split says. Its own reason keeps that apart from "too hard".
+            Self::SplitRequested(_) => Some(FailureReason::Split),
         }
     }
 
@@ -327,6 +351,7 @@ impl Ending {
             Self::Backend { .. } => "backend",
             Self::Stalled => "stalled",
             Self::Looped(_) => "looped",
+            Self::SplitRequested(_) => "split",
         }
     }
 }
@@ -380,6 +405,11 @@ pub struct Runner {
     pub task: TaskId,
     /// Detector thresholds, read from config once.
     pub detectors: Detectors,
+    /// How deep the tree may grow, from `LoopLimits::max_subtask_depth`.
+    ///
+    /// The runner does not enforce it — the scheduler does — but the brief has to know whether
+    /// offering a split would be an offer the tree is going to refuse.
+    pub max_subtask_depth: u8,
 }
 
 impl std::fmt::Debug for Runner {
@@ -526,7 +556,7 @@ impl<'a> StepLoop<'a> {
     fn new(runner: &'a Runner, subtask: &'a Subtask, attempt: &Attempt) -> Self {
         let layers = StableLayers {
             system: runner.system_prompt.clone(),
-            brief: brief_for(subtask, &attempt.strategy),
+            brief: brief_for(subtask, &attempt.strategy, runner.max_subtask_depth),
             // Working memory and the task-level digest are the scheduler's to supply. This
             // milestone runs one subtask, so both are empty and render as `(nothing yet)`
             // rather than vanishing, keeping the layer shape constant.
@@ -608,26 +638,11 @@ impl<'a> StepLoop<'a> {
                 continue;
             }
 
-            let mut claimed = false;
-            for call in &calls {
-                if call.name == FINISH_SUBTASK {
-                    claimed = true;
-                    self.claim_summary = summary_of(call);
-                    continue;
-                }
-                // A protocol failure ends the attempt, but it is still an `Ending` and not an
-                // error: the run has to produce a report saying why.
-                let step = match self.run_tool(journal, call) {
-                    Ok(step) => step,
-                    Err(ending) => return Ok(ending),
-                };
-                match step {
-                    ToolStep::Ran => self.stalled = 0,
-                    ToolStep::NotRun => self.stalled = self.stalled.saturating_add(1),
-                }
-            }
-            if claimed {
-                return Ok(Ending::Claimed);
+            match self.handle_calls(journal, &calls) {
+                Ok(Calls::Claimed) => return Ok(Ending::Claimed),
+                Ok(Calls::Split(pieces)) => return Ok(Ending::SplitRequested(pieces)),
+                Ok(Calls::Continue) => {}
+                Err(ending) => return Ok(ending),
             }
             if let Some(ending) = self.react(journal)? {
                 return Ok(ending);
@@ -636,6 +651,87 @@ impl<'a> StepLoop<'a> {
                 return Ok(Ending::Stalled);
             }
         }
+    }
+
+    /// Run every call in one reply, and say whether the reply ended the attempt.
+    ///
+    /// Two of the three call kinds the model can name are not tools: `finish_subtask` is a
+    /// claim and `split_subtask` is a proposal, and neither has an effect to execute. They are
+    /// intercepted here because this is the only place that sees both the call and the attempt,
+    /// and because a split has to stop the loop before the calls planned for the retired
+    /// subtask run.
+    fn handle_calls(&mut self, journal: &mut Journal, calls: &[ToolCall]) -> Result<Calls, Ending> {
+        let mut claimed = false;
+        for call in calls {
+            if call.name == FINISH_SUBTASK {
+                claimed = true;
+                self.claim_summary = summary_of(call);
+                continue;
+            }
+            if call.name == SPLIT_SUBTASK {
+                // A proposed split ends the attempt: the rest of the tool calls in this reply
+                // were planned for a subtask that is about to stop existing, and running them
+                // would put work on disk under a parent the tree is retiring.
+                match self.proposed_split(journal, call) {
+                    Ok(Some(pieces)) => return Ok(Calls::Split(pieces)),
+                    Ok(None) => continue,
+                    Err(ending) => return Err(ending),
+                }
+            }
+            let step = self.run_tool(journal, call)?;
+            match step {
+                ToolStep::Ran => self.stalled = 0,
+                ToolStep::NotRun => self.stalled = self.stalled.saturating_add(1),
+            }
+        }
+        Ok(if claimed { Calls::Claimed } else { Calls::Continue })
+    }
+
+    /// Read a `split_subtask` call, or tell the model why it cannot be honoured.
+    ///
+    /// `Ok(None)` means the call was answered with an observation and the attempt continues: a
+    /// model that described the decomposition badly has still told us the subtask is too large,
+    /// which is worth keeping, and may still produce a usable answer.
+    fn proposed_split(
+        &mut self,
+        journal: &mut Journal,
+        call: &ToolCall,
+    ) -> Result<Option<Vec<Piece>>, Ending> {
+        let detail = if self.subtask.depth.saturating_add(1) > self.runner.max_subtask_depth {
+            // The tool is not offered at this depth, so reaching here means the model asked for
+            // something it was never shown. Telling it why is cheaper than ending the attempt.
+            Some(format!(
+                "`{SPLIT_SUBTASK}` was not offered: a subtask at depth {} cannot be split, \
+                 because the tree may not grow past depth {}",
+                self.subtask.depth, self.runner.max_subtask_depth
+            ))
+        } else if let Some(pieces) = pieces_of(call) {
+            return Ok(Some(pieces));
+        } else {
+            Some(format!(
+                "`{SPLIT_SUBTASK}` needs at least two pieces, each with a non-empty title and goal"
+            ))
+        };
+        let Some(detail) = detail else {
+            return Ok(None);
+        };
+        journal
+            .append_scoped(
+                immortality_core::time::now(),
+                Kind::InvalidToolcall,
+                serde_json::json!({
+                    "call": call.call_id,
+                    "tool": call.name,
+                    "detail": detail,
+                }),
+                &self.scope,
+            )
+            .map_err(|error| backend(&error))?;
+        self.last_text.clone_from(&detail);
+        self.context
+            .push_entry(Entry::tool(call.call_id.clone(), call.name.clone(), detail));
+        self.stalled = self.stalled.saturating_add(1);
+        Ok(None)
     }
 
     /// Ask the model one step, watching the stream for D4.
@@ -718,6 +814,10 @@ impl<'a> StepLoop<'a> {
         // offered — the runner would recognise the name and the model would never produce it,
         // so every run would end at the step budget instead of on a claim.
         tools.push(finish_def());
+        // Declared for the same reason, and intercepted by name in `drive` for the same reason:
+        // a split is a proposal about a tree the runner cannot see, so it has no side effect to
+        // execute here. A model cannot call what it was not offered.
+        tools.push(split_def());
         request.tools = Some(tools);
         request
     }
@@ -1043,6 +1143,20 @@ impl<'a> StepLoop<'a> {
     }
 }
 
+/// What one model reply did.
+///
+/// Separate from [`Step`] because a reply can end the attempt without being an answer to run:
+/// a claim and a split proposal are both calls, and both stop the loop before the next step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Calls {
+    /// The reply's tools ran; the loop continues.
+    Continue,
+    /// The model claimed the subtask done.
+    Claimed,
+    /// The model proposed a decomposition; the scheduler decides whether it is legal.
+    Split(Vec<Piece>),
+}
+
 /// What one tool call did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ToolStep {
@@ -1069,7 +1183,7 @@ enum Step {
 /// goal, the definition of done, the strategy, and the one rule the model cannot infer: the
 /// gates decide, not the claim.
 #[must_use]
-pub fn brief_for(subtask: &Subtask, strategy: &str) -> String {
+pub fn brief_for(subtask: &Subtask, strategy: &str, max_depth: u8) -> String {
     use std::fmt::Write as _;
 
     let mut out = String::new();
@@ -1109,6 +1223,15 @@ pub fn brief_for(subtask: &Subtask, strategy: &str) -> String {
          claim: the system runs the checks and a reviewer may reject the diff. Do not claim it \
          before the work is on disk."
     );
+    if subtask.depth < max_depth {
+        let _ = writeln!(
+            out,
+            "If the goal is clear but the work does not fit in one pass, call `{SPLIT_SUBTASK}` \
+             with two or more pieces instead of burning the attempt on it. Each piece inherits \
+             this subtask's definition of done, and the system decides whether the split is \
+             legal."
+        );
+    }
     out
 }
 
@@ -1136,6 +1259,79 @@ fn finish_def() -> ToolDef {
             "additionalProperties": false
         }),
     )
+}
+
+/// The declaration of `split_subtask`, which the model is offered but the runner never runs.
+///
+/// The pieces are words only: title and goal. The `DoD` is not a parameter because it is
+/// inherited from the parent — a model that could write its children's gates could quietly
+/// weaken the guarantee the split exists to preserve, and validating that after the fact would
+/// be checking a promise it had no power to keep.
+fn split_def() -> ToolDef {
+    ToolDef::function(
+        SPLIT_SUBTASK,
+        "Say that this subtask is too large to finish in one pass and propose two or more \
+         pieces of it. Use it when the goal is clear but the work does not fit in one attempt — \
+         not when you are stuck. Each piece keeps this subtask's definition of done, and the \
+         system decides whether the decomposition is legal.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "reason": {
+                    "type": "string",
+                    "description": "Why the subtask does not fit in one pass."
+                },
+                "pieces": {
+                    "type": "array",
+                    "minItems": 2,
+                    "maxItems": MAX_SPLIT_PIECES,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "title": { "type": "string", "description": "A short title." },
+                            "goal": {
+                                "type": "string",
+                                "description": "What to achieve, written for a fresh context \
+                                                that has not seen this conversation."
+                            }
+                        },
+                        "required": ["title", "goal"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "required": ["pieces"],
+            "additionalProperties": false
+        }),
+    )
+}
+
+/// The `pieces` argument of a `split_subtask` call.
+///
+/// `None` when the arguments do not name between two and [`MAX_SPLIT_PIECES`] pieces with text in
+/// them. Neither bound is left to the schema: `split_subtask` is intercepted before the generic
+/// argument validation, precisely so it never reaches a tool, so the schema's `minItems` and
+/// `maxItems` would otherwise be advice nobody enforces. The caller turns `None` into an
+/// observation and the attempt continues: a model that described a decomposition badly has still
+/// told us the subtask is too large, and that is not a protocol failure.
+fn pieces_of(call: &ToolCall) -> Option<Vec<Piece>> {
+    let value: serde_json::Value = serde_json::from_str(&call.arguments).ok()?;
+    let pieces: Vec<Piece> = value
+        .get("pieces")?
+        .as_array()?
+        .iter()
+        .map(|piece| {
+            Some(Piece::new(
+                piece.get("title")?.as_str()?.trim(),
+                piece.get("goal")?.as_str()?.trim(),
+            ))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    // A single piece is not a decomposition but the same work under a new id with a fresh
+    // attempts budget; past the cap a "split" is a plan rewrite, which needs a human.
+    ((2..=MAX_SPLIT_PIECES).contains(&pieces.len())
+        && pieces.iter().all(|p| !p.title.is_empty() && !p.goal.is_empty()))
+    .then_some(pieces)
 }
 
 /// The `summary` argument of a `finish_subtask` call, if it parsed and was not blank.
@@ -1370,6 +1566,7 @@ mod tests {
             counter: Arc::new(immortality_core::context::CharsCounter::default()),
             task: TaskId::from_suffix("01ARZ3NDEKTSV4RRFFQ69G5FAA"),
             detectors: Detectors::default(),
+            max_subtask_depth: 2,
         };
         (dir, runner)
     }
@@ -1479,6 +1676,132 @@ mod tests {
         assert!(names.contains(&FINISH_SUBTASK), "{names:?}");
         // The real tools are still there: the declaration is an addition, not a replacement.
         assert!(names.contains(&"touch"), "{names:?}");
+    }
+
+    #[test]
+    fn the_model_is_offered_split_subtask() {
+        // Same reason as `finish_subtask`: a proposal the model cannot name is a proposal it can
+        // never make, and L4 would then depend on luck.
+        let model = Scripted::new(vec![Ok(finish())]);
+        let (dir, runner) = runner(model.clone(), registry(vec![Arc::new(Touch)]));
+        let mut journal = journal(&dir);
+        runner.run(&subtask(), 1, "", &mut journal).expect("run");
+
+        let request = model.requests().pop().expect("a request");
+        let tools = request.tools.expect("tools are offered");
+        let names: Vec<&str> = tools.iter().map(|tool| tool.function.name.as_str()).collect();
+        assert!(names.contains(&SPLIT_SUBTASK), "{names:?}");
+    }
+
+    #[test]
+    fn a_split_proposal_ends_the_attempt_without_touching_the_tree() {
+        // The runner has no tree to touch: it stops and reports, and the scheduler decides. An
+        // attempt that kept going would keep spending steps on a subtask about to disappear.
+        let model = Scripted::new(vec![Ok(Reply::call(
+            "call_split",
+            SPLIT_SUBTASK,
+            r#"{"reason":"too large","pieces":[{"title":"parse","goal":"parse the header"},{"title":"emit","goal":"emit the body"}]}"#,
+        ))]);
+        let (dir, runner) = runner(model, registry(vec![Arc::new(Touch)]));
+        let mut journal = journal(&dir);
+        let outcome = runner.run(&subtask(), 1, "", &mut journal).expect("run");
+
+        match &outcome.ending {
+            Ending::SplitRequested(pieces) => {
+                assert_eq!(pieces.len(), 2);
+                assert_eq!(pieces[0].title, "parse");
+                assert_eq!(pieces[1].goal, "emit the body");
+            }
+            other => panic!("expected a split request, got {other:?}"),
+        }
+        assert_eq!(outcome.steps, 1);
+        assert_eq!(outcome.attempt.failure, Some(FailureReason::Split));
+        assert_eq!(outcome.attempt.state, AttemptState::Failed);
+    }
+
+    #[test]
+    fn a_split_with_one_piece_is_an_observation_not_an_ending() {
+        // The schema says `minItems: 2`, but a schema is advice to a model. A single piece would
+        // be the same work under a new id with a fresh attempts budget, so it is refused here and
+        // the model is told why instead of the attempt ending on a bad call.
+        let model = Scripted::new(vec![
+            Ok(Reply::call(
+                "call_split",
+                SPLIT_SUBTASK,
+                r#"{"pieces":[{"title":"all of it","goal":"do the whole thing"}]}"#,
+            )),
+            Ok(finish()),
+        ]);
+        let (dir, runner) = runner(model, registry(vec![Arc::new(Touch)]));
+        let mut journal = journal(&dir);
+        let outcome = runner.run(&subtask(), 1, "", &mut journal).expect("run");
+
+        assert!(outcome.claimed_done(), "{:?}", outcome.ending);
+        let records = immortality_core::journal::JournalReader::open(
+            dir.path().join("journal"),
+            &TaskId::from_suffix("01ARZ3NDEKTSV4RRFFQ69G5FAJ"),
+        )
+        .expect("reader")
+        .read()
+        .expect("records")
+        .records;
+        assert!(
+            records.iter().any(|record| {
+                record.fields.kind == Kind::InvalidToolcall && record.event.payload["tool"] == SPLIT_SUBTASK
+            }),
+            "the model must be told what was wrong"
+        );
+    }
+
+    #[test]
+    fn a_split_with_too_many_pieces_is_an_observation() {
+        // The schema says `maxItems: 8`, but the split call never reaches the generic argument
+        // validation, so an unenforced bound would be advice. Ten headings are a plan rewrite,
+        // not a decomposition, and a plan rewrite needs a human.
+        let pieces: Vec<String> = (0..=MAX_SPLIT_PIECES)
+            .map(|index| format!(r#"{{"title":"p{index}","goal":"do {index}"}}"#))
+            .collect();
+        let arguments = format!(r#"{{"pieces":[{}]}}"#, pieces.join(","));
+        let model = Scripted::new(vec![
+            Ok(Reply::call("call_split", SPLIT_SUBTASK, arguments)),
+            Ok(finish()),
+        ]);
+        let (dir, runner) = runner(model, registry(vec![Arc::new(Touch)]));
+        let mut journal = journal(&dir);
+        let outcome = runner.run(&subtask(), 1, "", &mut journal).expect("run");
+
+        assert!(outcome.claimed_done(), "{:?}", outcome.ending);
+    }
+
+    #[test]
+    fn a_split_at_the_depth_limit_is_refused_as_not_offered() {
+        // The tool is withheld at `max_depth`, so a model that calls it anyway is answered with
+        // the reason rather than silently obeyed into a tree the loader would reject.
+        let mut deep = subtask();
+        deep.depth = 2;
+        let model = Scripted::new(vec![
+            Ok(Reply::call(
+                "call_split",
+                SPLIT_SUBTASK,
+                r#"{"pieces":[{"title":"a","goal":"do a"},{"title":"b","goal":"do b"}]}"#,
+            )),
+            Ok(finish()),
+        ]);
+        let (dir, runner) = runner(model, registry(vec![Arc::new(Touch)]));
+        let mut journal = journal(&dir);
+        let outcome = runner.run(&deep, 1, "", &mut journal).expect("run");
+
+        assert!(outcome.claimed_done(), "{:?}", outcome.ending);
+    }
+
+    #[test]
+    fn the_brief_offers_a_split_only_where_the_tree_has_room() {
+        let shallow = brief_for(&subtask(), "", 2);
+        assert!(shallow.contains(SPLIT_SUBTASK), "{shallow}");
+        let mut deep = subtask();
+        deep.depth = 2;
+        let deep_brief = brief_for(&deep, "", 2);
+        assert!(!deep_brief.contains(SPLIT_SUBTASK), "{deep_brief}");
     }
 
     #[test]
@@ -1762,7 +2085,7 @@ mod tests {
 
     #[test]
     fn the_brief_names_the_goal_the_gate_and_the_finish_call() {
-        let text = brief_for(&subtask(), "roll back and narrow the change");
+        let text = brief_for(&subtask(), "roll back and narrow the change", 2);
         assert!(text.contains("parse trailing commas"), "{text}");
         assert!(text.contains("trailing commas parse"), "{text}");
         assert!(text.contains(FINISH_SUBTASK), "{text}");
@@ -1782,7 +2105,7 @@ mod tests {
             }],
             review: false,
         };
-        let text = brief_for(&subtask, "");
+        let text = brief_for(&subtask, "", 2);
         assert!(text.contains("cargo build"), "{text}");
         assert!(text.contains("required"), "{text}");
     }

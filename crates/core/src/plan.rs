@@ -40,7 +40,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::atomic::write_atomically;
-use crate::domain::{Dod, Subtask, SubtaskId, SubtaskState, Timestamp};
+use crate::domain::{Dod, Subtask, SubtaskId, SubtaskState, SubtaskTrigger, Timestamp};
 
 /// Schema version of `TASKS.json`.
 pub const SCHEMA_VERSION: u16 = 1;
@@ -241,18 +241,104 @@ impl Plan {
     /// every level, so a human who reorders `TASKS.json` reorders execution.
     #[must_use]
     pub fn next_ready(&self) -> Option<&Subtask> {
+        self.next_ready_with(&BTreeSet::new())
+    }
+
+    /// What would be ready if `id` were settled, without mutating the tree.
+    ///
+    /// This is what L5 asks before blocking a subtask: "if I retire this one, is there other work
+    /// to do?" Answering it by looking for any `Pending` sibling would be wrong, because a
+    /// pending subtask whose dependency is also pending is not independent work — it is a queue
+    /// with nothing at its head.
+    #[must_use]
+    pub fn next_ready_after_retiring(&self, id: &SubtaskId) -> Option<&Subtask> {
+        let retired = BTreeSet::from([id.as_str()]);
+        self.next_ready_with(&retired)
+    }
+
+    fn next_ready_with(&self, retired: &BTreeSet<&str>) -> Option<&Subtask> {
         let mut all: Vec<&Subtask> = Vec::new();
         for subtask in &self.subtasks {
             collect(subtask, &mut all);
         }
         let settled: BTreeSet<&str> = all
             .iter()
-            .filter(|subtask| subtask.state.counts_as_settled())
+            .filter(|subtask| subtask.state.counts_as_settled() || retired.contains(subtask.id.as_str()))
             .map(|subtask| subtask.id.as_str())
             .collect();
         self.subtasks
             .iter()
             .find_map(|subtask| ready_within(subtask, &settled))
+    }
+
+    /// Whether every subtask in the tree is settled.
+    ///
+    /// Unlike [`crate::domain::Task::ready_to_finish_execution`] this cannot be called on an
+    /// empty tree: a plan that passed [`Plan::load`] always has at least one subtask, and an
+    /// empty one is refused, so `true` here always means "there was work and it is done".
+    #[must_use]
+    pub fn all_settled(&self) -> bool {
+        !self.subtasks.is_empty()
+            && self
+                .subtasks
+                .iter()
+                .all(|subtask| subtask.state.counts_as_settled())
+    }
+
+    /// Every subtask in the tree that is not settled, deepest first.
+    ///
+    /// Deepest first because the innermost unfinished work is what a human reading `status`
+    /// needs; a parent that is waiting on a child is not the interesting line.
+    #[must_use]
+    pub fn open_subtasks(&self) -> Vec<&Subtask> {
+        let mut all: Vec<&Subtask> = Vec::new();
+        for subtask in &self.subtasks {
+            collect(subtask, &mut all);
+        }
+        let mut open: Vec<&Subtask> = all
+            .into_iter()
+            .filter(|subtask| !subtask.state.counts_as_settled())
+            .collect();
+        open.sort_by(|left, right| right.depth.cmp(&left.depth).then_with(|| left.id.cmp(&right.id)));
+        open
+    }
+
+    /// Replace one subtask with its children and write the tree.
+    ///
+    /// The parent is retired with [`SubtaskState::Skipped`] and keeps its children, so the tree
+    /// still records that the work was once one subtask. Validation happens against the tree as
+    /// it is *now*, before anything is mutated, so a refused split leaves the file untouched.
+    ///
+    /// # Errors
+    /// A [`crate::scheduler::SplitError`] for a split that would weaken the parent's `DoD` or
+    /// exceed the depth limit, or a [`PlanError`] if the parent is unknown or the write fails.
+    pub fn split(
+        &mut self,
+        parent: &SubtaskId,
+        children: Vec<Subtask>,
+        max_depth: u8,
+        at: Timestamp,
+    ) -> Result<(), crate::scheduler::SplitError> {
+        let existing = self
+            .subtask(parent)
+            .ok_or_else(|| PlanError::UnknownSubtask {
+                id: parent.to_string(),
+            })?
+            .clone();
+        crate::scheduler::validate_split(&existing, &children, max_depth)?;
+        let target = find_mut(&mut self.subtasks, parent).ok_or_else(|| PlanError::UnknownSubtask {
+            id: parent.to_string(),
+        })?;
+        target
+            .transition(SubtaskTrigger::Split, at)
+            .map_err(|_| crate::scheduler::SplitError::Terminal {
+                id: parent.to_string(),
+                state: target.state,
+            })?;
+        target.children.extend(children);
+        target.updated_at = at;
+        self.write()?;
+        Ok(())
     }
 
     /// Replace one subtask's state and write the tree.
@@ -481,7 +567,13 @@ fn ready_within<'a>(subtask: &'a Subtask, settled: &BTreeSet<&str>) -> Option<&'
         .children
         .iter()
         .all(|child| child.state.counts_as_settled());
-    if subtask.state == SubtaskState::Pending && satisfied && children_settled {
+    // `settled` also holds ids the caller asked to treat as retired, so a `Pending` subtask can
+    // appear in it. Checking membership keeps a retired subtask from being offered as ready.
+    if subtask.state == SubtaskState::Pending
+        && !settled.contains(subtask.id.as_str())
+        && satisfied
+        && children_settled
+    {
         Some(subtask)
     } else {
         None
