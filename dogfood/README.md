@@ -43,6 +43,13 @@ model that could not do the job. `tests/dogfood.rs` therefore applies the smalle
 each goal asks for (a real one: the `BTreeSet` in `dedupe` is the refactor, not a stub) and requires
 its gate to pass. Red before, green after, both run in CI.
 
+The rehearsal runs twice, because the seam between the run and the wire is its own kind of code:
+once with a model injected (`ServerState::with_model`) and once with none, so the run builds the
+real `LlmModel` and speaks HTTP to a scripted server. The second pass covers the streaming decoder,
+the tool-call reassembly and the retry policy — the code a live backend exercises and nothing else
+does — and it costs no network. It also had to teach the mock one thing: the reviewer calls
+`turn_blocking`, which asks for `stream: false`, so its answer is JSON and not SSE.
+
 There is a third way the gate can never go green, and it is the one that looks like success until
 you watch it: the gate is `cargo test`, whose diff is taken against the worktree and includes every
 untracked file. Without a `.gitignore` the gate's own `target/` enters that diff, the sanity scan

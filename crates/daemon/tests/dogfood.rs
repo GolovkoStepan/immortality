@@ -297,7 +297,7 @@ fn an_admitted_task_is_a_git_repository_of_its_own() {
 /// spec is the bar and not the truth — but a rehearsal that ships a knowingly wrong fix proves
 /// less than one that ships a right one. A real model would call `read_file` first; this answers
 /// with the edit directly, because the point here is the gate and not the exploration.
-const LINE_COUNT_FIX: &str = r#"{"path":"src/count.rs","old":"    text.split('\\n').count()","new":"    text.split('\\n').count() - usize::from(text.ends_with('\\n'))"}"#;
+const LINE_COUNT_FIX_ARGS: &str = r#"{"path":"src/count.rs","old":"    text.split('\\n').count()","new":"    text.split('\\n').count() - usize::from(text.ends_with('\\n'))"}"#;
 
 /// A model that answers every role, and for the executor performs one real edit.
 ///
@@ -438,7 +438,7 @@ fn a_dogfood_task_reaches_ready_for_review_through_the_real_gate() {
         panic!("the admitted gate is green before the work: {message}");
     }
 
-    let model = Rehearsal::new(LINE_COUNT_FIX);
+    let model = Rehearsal::new(LINE_COUNT_FIX_ARGS);
     let (_state_dir, state) = rehearsal_state(&repo, model.clone());
 
     let answer = tokio::runtime::Builder::new_current_thread()
@@ -606,4 +606,100 @@ fn every_dogfood_task_can_be_made_green_by_a_plausible_fix() {
             String::from_utf8_lossy(&gate.stderr)
         );
     }
+}
+
+// ── the same path, with the real HTTP client ────────────────────────────────────────────
+//
+// The rehearsal above builds `ServerState::with_model`, so it covers every seam except the one
+// between the run and the wire. That seam is `LlmModel`: `execute` constructs it when the state
+// has no model, and its streaming path, retry policy and tool-call reassembly are the code a live
+// backend exercises and nothing else does. A scripted server speaks the protocol, so the whole
+// chain — `start` → `LlmModel` → HTTP → `RealGates` → `ready_for_review` — runs with no network
+// and no live model.
+
+/// `Config` pointed at a scripted backend instead of `llm-server`.
+fn rehearsal_config(repo: &Path, base_url: &str) -> Config {
+    let mut config = Config {
+        policy: Policy {
+            workspace_root: repo.parent().expect("parent").to_path_buf(),
+            ..Policy::default()
+        },
+        ..Config::default()
+    };
+    config.backend.base_url = base_url.to_string();
+    // The mock answers immediately; the real timeout would only make a hang slow to detect.
+    config.backend.request_timeout_secs = 10;
+    config
+}
+
+#[test]
+fn the_same_task_reaches_ready_for_review_through_the_http_client() {
+    // Everything the previous test proves, plus the model client. No `with_model`: the run builds
+    // `LlmModel` from the config's `base_url`, exactly as it does against `llm-server:47832`.
+    let scratch = tempfile::tempdir().expect("tempdir");
+    let repo = scratch.path().join("repo");
+    admit_into("line-count", &repo);
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("mock runtime");
+    // Three requests, in order: the executor's edit, the executor's claim, and the reviewer's
+    // verdict. The last reply repeats, so a re-request after a retry would still be answered
+    // rather than hanging, and `request_count` below says whether that happened.
+    let server = runtime.block_on(immortality_testkit::MockServer::start(vec![
+        immortality_testkit::Reply::streamed_tool_call("call_edit", "edit_file", LINE_COUNT_FIX_ARGS),
+        immortality_testkit::Reply::streamed_tool_call(
+            "call_finish",
+            FINISH_SUBTASK,
+            r#"{"summary":"fixed the trailing newline"}"#,
+        ),
+        // The reviewer goes through `turn_blocking`, which sets `stream: false`: a scripted SSE
+        // answer here would be a test that does not speak the protocol the caller asked for.
+        immortality_testkit::Reply::json_turn(r#"{"verdict":"approve"}"#),
+    ]));
+
+    let state = tempfile::tempdir().expect("state dir");
+    std::fs::write(state.path().join("daemon.token"), "fixture-token").expect("token");
+    let mut registry =
+        Registry::open(state.path().join(immortality_core::registry::FILE_NAME)).expect("registry");
+    registry.register(&repo, None).expect("register");
+    let server_state = ServerState::discover(state.path())
+        .expect("state")
+        .with_config(&rehearsal_config(&repo, &server.base_url()))
+        .with_events(Events::new());
+
+    let answer = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime")
+        .block_on(start::start(
+            &server_state,
+            &serde_json::json!({ "project": repo, "goal": "fix the line count" }),
+        ))
+        .map_err(|error| error.message)
+        .expect("the task must be admitted");
+    let task = answer["task"].as_str().expect("a task id").to_string();
+
+    let states = wait_for_state(&repo, &task, TaskState::ReadyForReview);
+    assert_eq!(states.last().map(String::as_str), Some("ready_for_review"));
+
+    // The edit reached the worktree through the client's tool-call reassembly — one character at
+    // a time on the wire, one string in the tool call — which is the bug a happy-path mock hides.
+    let worktree = immortality_core::worktree::WorktreeManager::new(&repo).path_for(&task);
+    let count = std::fs::read_to_string(worktree.join("src").join("count.rs")).expect("count.rs");
+    assert!(
+        count.contains("ends_with('\\n')"),
+        "the streamed tool call did not reach the tree:\n{count}"
+    );
+
+    // Exactly three requests: a retry would have spent more, and a client that sent the same
+    // request twice would show here rather than as a mysterious delay.
+    assert_eq!(
+        server.request_count(),
+        3,
+        "the run made an unexpected number of model calls: {:?}",
+        server.requests().len()
+    );
 }
