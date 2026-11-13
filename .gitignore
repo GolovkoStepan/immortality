@@ -17,3 +17,9 @@ daemon.token
 .idea/
 .vscode/
 *.swp
+
+# Dogfood runs write their plan, journal and worktrees into the fixture repository and next to
+# it; those are run artefacts, not fixtures. The task plans under `dogfood/tasks/` are committed.
+/dogfood/repo/.agent
+/dogfood/repo/target
+/dogfood/repo-agent
