@@ -19,6 +19,7 @@ mod macros;
 
 pub mod artifacts;
 pub mod atomic;
+pub mod cache;
 pub mod checkpoint;
 pub mod config;
 pub mod context;

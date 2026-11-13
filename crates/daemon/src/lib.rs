@@ -12,6 +12,7 @@
 pub mod checkpoints;
 pub mod doctor;
 pub mod gates;
+pub mod recovery;
 pub mod rpc;
 pub mod runner;
 pub mod server;

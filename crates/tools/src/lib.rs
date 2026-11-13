@@ -32,7 +32,10 @@ pub use git::Git;
 pub use glob::{Glob, GlobError, PatternSet};
 pub use notify::{MacNotifier, Notifier, Silent};
 pub use policy::{Denial, Escalation, PathUse, PolicyGate, Verdict};
-pub use processes::{KillProcess, Liveness, ProcessRecord, ProcessRegistry, ReadProcess, StartProcess};
+pub use processes::{
+    KillProcess, Liveness, ProcessRecord, ProcessRegistry, ReadProcess, StartProcess, probe_started,
+    start_digest as process_start_digest,
+};
 pub use read::{ReadFile, looks_binary};
 pub use search::Grep;
 pub use shell::{CommandOutput, run_command};

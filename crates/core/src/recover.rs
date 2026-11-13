@@ -311,6 +311,21 @@ impl RecoveryReport {
         if let Some(reason) = &self.blocked_reason {
             parts.push(format!("blocked: {reason}"));
         }
+        // A preserve-only repair explains nothing above, and an empty `daemon_recovered` summary
+        // reads as "nothing happened" for the one repair a human most needs to find: the agent's
+        // uncommitted work was snapshotted and is sitting on a checkpoint branch.
+        if self
+            .steps
+            .iter()
+            .any(|step| matches!(step, RecoveryStep::PreserveDirtyWork { .. }))
+        {
+            parts.push("preserved uncommitted work".into());
+        }
+        if parts.is_empty() {
+            // Every repair counted above; this arm exists so a future step kind cannot make the
+            // audit record silent.
+            parts.push(format!("{} repairs", self.steps.len()));
+        }
         parts.join("; ")
     }
 }
@@ -525,8 +540,17 @@ fn reclaim_calls(input: &RecoveryInput<'_>, prober: &impl Prober, verdict: &mut 
 }
 
 /// Append the `record_recovery` step, which must come after the repair it describes.
+///
+/// # Why a blocked report gets no `RecordRecovery`
+///
+/// The only way to block is a journal whose chain is broken or whose sequence has a gap, and a
+/// journal in that state cannot be *opened* for writing — `Journal::open` refuses rather than
+/// appending after a break. A `RecordRecovery` step would therefore be a step whose only possible
+/// outcome is an error, queued after the block it is meant to describe. The reason is carried in
+/// `blocked_reason`, which the executor persists to `panic.json` and the escalation queue: places
+/// that are readable without the journal, which is the property the audit record was wanted for.
 fn finish(mut report: RecoveryReport) -> RecoveryReport {
-    if report.verdict != Verdict::Healthy {
+    if report.verdict != Verdict::Healthy && report.verdict != Verdict::Blocked {
         let summary = report.summary();
         report.steps.push(RecoveryStep::RecordRecovery { summary });
     }
@@ -1082,9 +1106,11 @@ mod tests {
         );
         // No worktree repair, no probes: an untrustworthy journal makes every later decision a
         // guess about a history that may not have happened.
-        assert_eq!(report.steps.len(), 2, "block + record, got {:?}", report.steps);
+        //
+        // Only the block: a `RecordRecovery` step would target the journal that was just declared
+        // unopenable, so the reason travels in `blocked_reason` instead.
+        assert_eq!(report.steps.len(), 1, "block only, got {:?}", report.steps);
         assert!(matches!(report.steps[0], RecoveryStep::BlockTask { .. }));
-        assert!(matches!(report.steps[1], RecoveryStep::RecordRecovery { .. }));
         assert_eq!(report.divergences.len(), 0);
     }
 
@@ -2191,7 +2217,10 @@ mod tests {
     }
 
     #[test]
-    fn a_blocked_task_still_records_why() {
+    fn a_blocked_task_carries_its_reason_outside_the_journal() {
+        // The journal that blocks a task is the one that cannot be written, so the reason has to
+        // be carried on the report. This test pins that the reason survives, and that no step
+        // targets the broken journal.
         let mut journal = clean_journal();
         journal.problems.push(ReadProblem::ChainBreak {
             segment: "JOURNAL.jsonl".into(),
@@ -2202,11 +2231,16 @@ mod tests {
             &input(&journal, WorkspaceFacts::absent(), PersistedState::default()),
             &NoProbe,
         );
-        let Some(RecoveryStep::RecordRecovery { summary }) = report.steps.last() else {
-            panic!("a blocked task must still journal the reason");
-        };
-        assert!(summary.contains("blocked"), "{summary}");
-        assert!(summary.contains("chain broken"), "{summary}");
+        let reason = report.blocked_reason.as_deref().unwrap_or_default();
+        assert!(reason.contains("chain broken"), "{reason}");
+        assert!(
+            !report
+                .steps
+                .iter()
+                .any(|step| matches!(step, RecoveryStep::RecordRecovery { .. })),
+            "a record_recovery step would target the unopenable journal: {:?}",
+            report.steps
+        );
     }
 
     // ── interrupted L3 restarts ───────────────────────────────────────────────────────────
