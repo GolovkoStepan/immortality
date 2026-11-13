@@ -396,6 +396,118 @@ pub fn log(result: &Value, style: Style) -> String {
     out
 }
 
+/// The v0.1 numbers, as a human reads them.
+///
+/// One block per task with the counts that decide the milestone: subtasks closed by green gates,
+/// how many of those closed with an escalation open, detector firings by `detector/level`, and the
+/// restarts and escalations that say how much of the run was the agent and how much was the
+/// ladder. A task whose journal cannot be read is reported as unreadable rather than as zeros —
+/// zero and "unknown" are different facts, and only one of them is evidence.
+#[must_use]
+pub fn metrics(result: &Value, style: Style) -> String {
+    use std::fmt::Write as _;
+
+    let tasks = result
+        .get("tasks")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    if tasks.is_empty() {
+        return format!("{}\n", style.dim("no tasks yet."));
+    }
+    let mut out = String::new();
+    for task in tasks {
+        let id = text(task, "task");
+        if let Some(reason) = task.get("unreadable").and_then(Value::as_str) {
+            let _ = writeln!(out, "{} {}", style.bold(&id), style.red("unreadable"));
+            let _ = writeln!(out, "  {}", style.dim(reason));
+            continue;
+        }
+
+        let closed = task.get("closed_green").and_then(Value::as_u64).unwrap_or(0);
+        let with_escalation = task
+            .get("closed_with_escalation")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let _ = writeln!(
+            out,
+            "{} {} closed by a green gate, {} of them with an escalation open",
+            style.bold(&id),
+            style.green(&closed.to_string()),
+            with_escalation
+        );
+
+        let subtasks = task
+            .get("subtasks")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        for subtask in subtasks {
+            let state = text(subtask, "state");
+            let painted = if state == "done" {
+                style.green(&state)
+            } else {
+                style.yellow(&state)
+            };
+            let aid = subtask.get("closed_with_escalation").and_then(Value::as_bool);
+            let _ = writeln!(
+                out,
+                "  {} {}{}",
+                painted,
+                style.dim(&text(subtask, "subtask")),
+                if aid == Some(true) {
+                    style.dim(" (escalation open)")
+                } else {
+                    String::new()
+                }
+            );
+        }
+
+        let restarts = task.get("restarts").and_then(Value::as_u64).unwrap_or(0);
+        let total = task.get("escalations_total").and_then(Value::as_u64).unwrap_or(0);
+        let pending = task
+            .get("escalations_pending")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let _ = writeln!(
+            out,
+            "  {}",
+            style.dim(&format!(
+                "restarts {restarts}, escalations {total} ({pending} still open)"
+            ))
+        );
+
+        let detectors = task
+            .get("detectors")
+            .and_then(Value::as_object)
+            .map(|object| {
+                let mut pairs: Vec<(&String, u64)> = object
+                    .iter()
+                    .map(|(name, count)| (name, count.as_u64().unwrap_or(0)))
+                    .collect();
+                pairs.sort();
+                pairs
+            })
+            .unwrap_or_default();
+        if detectors.is_empty() {
+            let _ = writeln!(out, "  {}", style.dim("no detector fired."));
+        } else {
+            for (name, count) in detectors {
+                let _ = writeln!(out, "  {name} {}", style.yellow(&count.to_string()));
+            }
+        }
+
+        if task.get("corrupt").and_then(Value::as_bool) == Some(true) {
+            let _ = writeln!(
+                out,
+                "  {}",
+                style.red("the journal fails its own chain check; these counts are incomplete")
+            );
+        }
+    }
+    out
+}
+
 /// What `gc` did, or what it would do.
 #[must_use]
 pub fn gc_report(result: &Value, style: Style) -> String {
@@ -1569,6 +1681,90 @@ mod tests {
             PLAIN,
         );
         assert!(out.contains("nothing needed collecting"), "{out}");
+    }
+
+    #[test]
+    fn metrics_show_the_counts_that_decide_the_milestone() {
+        let out = metrics(
+            &json!({"count": 1, "tasks": [{
+                "task": "tsk_01A",
+                "closed_green": 3,
+                "closed_with_escalation": 1,
+                "subtasks": [
+                    {"subtask": "sub_A", "state": "done", "closed_with_escalation": false},
+                    {"subtask": "sub_B", "state": "done", "closed_with_escalation": true},
+                    {"subtask": "sub_C", "state": "blocked", "closed_with_escalation": false},
+                ],
+                "detectors": {"d1/l1": 2, "d5/l3": 1},
+                "escalations_total": 1,
+                "escalations_pending": 0,
+                "restarts": 2,
+                "records": 40,
+                "corrupt": false,
+            }]}),
+            PLAIN,
+        );
+        assert!(out.contains("tsk_01A"), "{out}");
+        assert!(out.contains("3 closed by a green gate"), "{out}");
+        assert!(out.contains("1 of them with an escalation open"), "{out}");
+        assert!(out.contains("sub_A"), "{out}");
+        assert!(out.contains("(escalation open)"), "{out}");
+        assert!(out.contains("blocked"), "{out}");
+        assert!(out.contains("restarts 2"), "{out}");
+        assert!(out.contains("d1/l1"), "{out}");
+        assert!(out.contains("d5/l3"), "{out}");
+    }
+
+    #[test]
+    fn a_clean_run_says_no_detector_fired_instead_of_nothing() {
+        // Silence and "zero" are different claims. A reader checking the detector claim needs to
+        // see that the run had none, not an absent line they must interpret.
+        let out = metrics(
+            &json!({"count": 1, "tasks": [{
+                "task": "tsk_01A", "closed_green": 1, "closed_with_escalation": 0,
+                "subtasks": [], "detectors": {}, "escalations_total": 0,
+                "escalations_pending": 0, "restarts": 0, "records": 5, "corrupt": false,
+            }]}),
+            PLAIN,
+        );
+        assert!(out.contains("no detector fired"), "{out}");
+    }
+
+    #[test]
+    fn an_unreadable_journal_is_reported_as_unreadable_not_as_zeros() {
+        // Zero closed subtasks is evidence of a run that did nothing; an unreadable journal is
+        // evidence of nothing. Printing the first for the second is the one lie metrics must not
+        // tell.
+        let out = metrics(
+            &json!({"count": 1, "tasks": [{
+                "task": "tsk_01A",
+                "unreadable": "the chain breaks at seq 41",
+            }]}),
+            PLAIN,
+        );
+        assert!(out.contains("unreadable"), "{out}");
+        assert!(out.contains("chain breaks"), "{out}");
+        assert!(!out.contains("closed by a green gate"), "{out}");
+    }
+
+    #[test]
+    fn metrics_with_no_tasks_says_so() {
+        let out = metrics(&json!({"count": 0, "tasks": []}), PLAIN);
+        assert!(out.contains("no tasks yet"), "{out}");
+    }
+
+    #[test]
+    fn a_corrupt_chain_is_flagged_next_to_the_numbers_it_weakens() {
+        let out = metrics(
+            &json!({"count": 1, "tasks": [{
+                "task": "tsk_01A", "closed_green": 1, "closed_with_escalation": 0,
+                "subtasks": [], "detectors": {}, "escalations_total": 0,
+                "escalations_pending": 0, "restarts": 0, "records": 5, "corrupt": true,
+            }]}),
+            PLAIN,
+        );
+        assert!(out.contains("fails its own chain check"), "{out}");
+        assert!(out.contains("incomplete"), "{out}");
     }
 
     #[test]

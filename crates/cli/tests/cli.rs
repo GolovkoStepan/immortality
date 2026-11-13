@@ -230,6 +230,8 @@ fn every_command_without_a_daemon_says_so_and_changes_nothing() {
         vec!["escalations"],
         vec!["plan"],
         vec!["log"],
+        vec!["metrics"],
+        vec!["metrics", task],
         vec!["gc"],
         vec!["gc", "--dry-run"],
         vec!["merge", task],

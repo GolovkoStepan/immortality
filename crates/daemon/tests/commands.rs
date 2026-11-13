@@ -522,3 +522,107 @@ fn plan_shows_the_state_each_subtask_is_in() {
     .expect("plan");
     assert_eq!(result["subtasks"][0]["state"], "done");
 }
+
+// ── metrics ────────────────────────────────────────────────────────────────────────────
+
+/// Append to this fixture's journal the records a run would leave.
+fn record_run(fixture: &Fixture, records: &[(Kind, serde_json::Value)]) {
+    let mut journal = fixture.journal();
+    for (kind, payload) in records {
+        journal
+            .append_event(immortality_core::time::now(), *kind, payload.clone())
+            .expect("append");
+    }
+    journal.close().expect("close");
+}
+
+#[test]
+fn metrics_count_what_the_journal_recorded_for_the_task() {
+    // The document claims "three subtasks closed with green gates". This is the assertion that
+    // the number the daemon prints is the number in the file — two closed, one blocked.
+    let fixture = Fixture::new();
+    record_run(
+        &fixture,
+        &[
+            (
+                Kind::SubtaskState,
+                serde_json::json!({"subtask": "sub_A", "state": "running"}),
+            ),
+            (
+                Kind::SubtaskState,
+                serde_json::json!({"subtask": "sub_A", "state": "done"}),
+            ),
+            (
+                Kind::DetectorFired,
+                serde_json::json!({"detector": "d1", "level": "l1", "metric": 1}),
+            ),
+            (
+                Kind::SubtaskState,
+                serde_json::json!({"subtask": "sub_B", "state": "blocked"}),
+            ),
+            (Kind::AttemptRestarted, serde_json::json!({"next": 2})),
+        ],
+    );
+
+    let result = commands::metrics(
+        &fixture.state(),
+        &params(serde_json::json!({"task": task().as_str()})),
+    )
+    .expect("metrics");
+    assert_eq!(result["count"], 1, "{result}");
+    let report = &result["tasks"][0];
+    assert_eq!(report["task"], task().as_str());
+    assert_eq!(report["closed_green"], 1);
+    assert_eq!(report["closed_with_escalation"], 0);
+    assert_eq!(report["restarts"], 1);
+    assert_eq!(report["detectors"]["d1/l1"], 1);
+    assert_eq!(report["corrupt"], false);
+    assert_eq!(report["subtasks"].as_array().expect("subtasks").len(), 2);
+}
+
+#[test]
+fn metrics_for_an_unregistered_task_names_it_instead_of_returning_nothing() {
+    // An empty list of numbers is indistinguishable from "this task did fine", so an unknown id
+    // has to be a refusal.
+    let fixture = Fixture::new();
+    let error = commands::metrics(
+        &fixture.state(),
+        &params(serde_json::json!({"task": "tsk_01ARZ3NDEKTSV4RRFFQ69G5FZZ"})),
+    )
+    .expect_err("must refuse");
+    assert_eq!(error.code, ErrorCode::NotFound);
+    assert!(
+        error.message.contains("01ARZ3NDEKTSV4RRFFQ69G5FZZ"),
+        "{}",
+        error.message
+    );
+}
+
+#[test]
+fn metrics_without_a_task_report_every_task_the_daemon_knows() {
+    // The multi-task shape is what `docs/metrics-v0.1.md` reads when it says "the three dogfood
+    // runs". One task per repository, so the fixture needs a second journal in the same repo.
+    let fixture = Fixture::new();
+    record_run(
+        &fixture,
+        &[(
+            Kind::SubtaskState,
+            serde_json::json!({"subtask": "sub_A", "state": "done"}),
+        )],
+    );
+    let other = TaskId::from_suffix("01ARZ3NDEKTSV4RRFFQ69G5FZZ");
+    {
+        let mut theirs = Journal::open(fixture.repo.join(".agent"), other).expect("journal");
+        theirs
+            .append_event(
+                immortality_core::time::now(),
+                Kind::SubtaskState,
+                serde_json::json!({"subtask": "sub_Z", "state": "blocked"}),
+            )
+            .expect("append");
+        theirs.close().expect("close");
+    }
+
+    let result = commands::metrics(&fixture.state(), &params(serde_json::json!({}))).expect("metrics");
+    assert_eq!(result["count"], 2, "{result}");
+}

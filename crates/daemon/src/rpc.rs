@@ -204,6 +204,7 @@ pub const METHODS: &[&str] = &[
     "attach",
     "plan",
     "log",
+    "metrics",
     "gc",
     "merge",
     "start",

@@ -133,6 +133,14 @@ enum Command {
     },
     /// Print a human-readable transcript of a run. (M5)
     Log { task: Option<String> },
+    /// Print the v0.1 numbers computed from journals. (M6)
+    ///
+    /// The figures `docs/metrics-v0.1.md` quotes, computed from the same files rather than
+    /// transcribed by hand: closed subtasks, detector firings, escalations and restarts.
+    Metrics {
+        /// One task, instead of every task this daemon knows.
+        task: Option<String>,
+    },
     /// Merge a finished task branch into main. Human action only. (M5)
     Merge { task: String },
     /// Rotate logs and prune artefacts.
@@ -193,6 +201,7 @@ async fn main() -> Result<()> {
         Command::Attach { task, since_seq } => attach_command(task, since_seq, cli.json).await,
         Command::Status { task } => status_command(task, cli.json).await,
         Command::Log { task } => log_command(task, cli.json).await,
+        Command::Metrics { task } => metrics_command(task, cli.json).await,
         Command::Merge { task } => merge_command(&task, cli.json).await,
         Command::Serve => serve::run().await,
         Command::Service { action } => service_command(&action, cli.json),
@@ -451,6 +460,22 @@ async fn log_command(task: Option<String>, json: bool) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&result)?);
     } else {
         print!("{}", render::log(&result, style()));
+    }
+    Ok(())
+}
+
+/// `metrics`: the v0.1 numbers, computed by the daemon from the journals.
+async fn metrics_command(task: Option<String>, json: bool) -> Result<()> {
+    let mut client = connect().await?;
+    let params = task.map_or_else(
+        || serde_json::json!({}),
+        |task| serde_json::json!({ "task": task }),
+    );
+    let result = take(client.request("metrics", params).await?)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    } else {
+        print!("{}", render::metrics(&result, style()));
     }
     Ok(())
 }

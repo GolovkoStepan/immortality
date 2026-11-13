@@ -5,7 +5,8 @@
 залипает в бесконечных рассуждениях.
 
 > **Статус: M5.8 завершена — прогон живёт в демоне; M6.1 завершена — тестовый репозиторий и
-> три задачи.** Workspace собирается, 1681 тест зелёный, живая модель для тестов не нужна.
+> три задачи; M6.3 — частично: метрики считаются из журналов, прогоны ждут бэкенд.**
+> Workspace собирается, 1698 тестов зелёные, живая модель для тестов не нужна.
 > `immortality start "<цель>"` доводит задачу до `ready_for_review` внутри демона: планирует,
 > если плана нет, уважает правки человека без `--force`, держит слот прогона, строит worktree,
 > ведёт журнал и публикует записи в `attach` из самого процесса записи. `kill -9` посреди
@@ -13,8 +14,9 @@
 > чтение (`read_file`, `glob`, `grep`), запись (`write_file`, `edit_file`), `shell`, реестр
 > процессов (`start_process`, `read_process`, `kill_process`), `git` с менеджером worktree
 > на задачу, состояние (`read_state`, `update_state`, `grep_journal`), очередь эскалаций
-> (`escalate`), делегирование (`delegate`) и unix-сокет с клиентом (`status`,
-> `escalations`, `approve`, `attach`). `immortality serve` поднимает демон в foreground:
+> (`escalate`), делегирование (`delegate`), unix-сокет с клиентом (`status`,
+> `escalations`, `approve`, `attach`) и `metrics` — числа вехи, посчитанные из журнала.
+> `immortality serve` поднимает демон в foreground:
 > файловая блокировка не даёт второму экземпляру снести сокет живого, токен чеканится
 > один раз с правами `0600`, `SIGTERM` и Ctrl-C убирают сокет и блокировку, а рестарт
 > после `kill -9` проходит по оставшемуся сокету (D-073). `attach` рисует поток блоками —
@@ -142,6 +144,7 @@ immortality serve
 | [docs/spike-findings.md](docs/spike-findings.md) | Результаты S1: 7 сценариев на живой модели, что подтвердилось и что нет |
 | [docs/roadmap.md](docs/roadmap.md) | Вехи S1, M0–M6 с разбивкой на шаги и оценками, критерии готовности, план тестирования |
 | [docs/non-goals-v0.1.md](docs/non-goals-v0.1.md) | Что сознательно не входит в v0.1 |
+| [docs/metrics-v0.1.md](docs/metrics-v0.1.md) | Чем подтверждается планка v0.1: что считает `immortality metrics` и почему |
 | [docs/decisions.md](docs/decisions.md) | Журнал принятых решений и их обоснование |
 | [CHANGELOG.md](CHANGELOG.md) | История изменений (Keep a Changelog) |
 

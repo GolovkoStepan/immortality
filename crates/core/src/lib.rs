@@ -33,6 +33,7 @@ pub mod gc;
 pub mod ids;
 pub mod journal;
 pub mod logging;
+pub mod metrics;
 pub mod paths;
 pub mod plan;
 pub mod planner;

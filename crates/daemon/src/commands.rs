@@ -29,6 +29,7 @@ use immortality_core::checkpoint::GitRepo;
 use immortality_core::domain::{TaskId, TaskState, TaskTrigger};
 use immortality_core::gc;
 use immortality_core::journal::{Journal, JournalReader, JournalRecord, Kind};
+use immortality_core::metrics;
 use immortality_core::plan::Plan;
 use immortality_core::registry::{Project, Registry};
 
@@ -163,6 +164,68 @@ pub fn log(state: &ServerState, params: &serde_json::Value) -> Result<serde_json
         "next_seq": owned.last().map_or(0, |record| record.fields.seq + 1),
         "corrupt": outcome.is_corrupt(),
         "torn_tail": outcome.has_torn_tail,
+    }))
+}
+
+/// `metrics`: the v0.1 numbers for one task or every task the daemon knows.
+///
+/// Read-only, and computed from journals rather than from a file a human maintains: a document
+/// claiming "three subtasks closed unaided" has to be reproducible by whoever has the journal.
+pub fn metrics(state: &ServerState, params: &serde_json::Value) -> Result<serde_json::Value, RpcError> {
+    let registry = Registry::open(state.registry_path()).map_err(|error| internal(error.to_string()))?;
+
+    let wanted: Option<TaskId> = params
+        .get("task")
+        .and_then(serde_json::Value::as_str)
+        .map(|text| TaskId::parse(text).map_err(|error| bad_params(error.to_string())))
+        .transpose()?;
+
+    // Every owned task, or just the one asked for. `Registry::tasks` also checks the state
+    // directories, so a task whose journal was rotated away is still reported — as a task with no
+    // records, which is a fact a reader needs rather than an error.
+    let mut known: Vec<(Project, TaskId, PathBuf)> = registry
+        .tasks(&state.state_root)
+        .map_err(|error| internal(error.to_string()))?;
+    known.retain(|(_, task, _)| wanted.as_ref().is_none_or(|wanted| wanted == task));
+    if let Some(wanted) = &wanted
+        && !known.iter().any(|(_, task, _)| task == wanted)
+    {
+        return Err(not_found(format!("no project owns task {wanted}")));
+    }
+    known.sort_by(|left, right| left.1.cmp(&right.1));
+
+    let mut reports = Vec::new();
+    for (project, task, _) in known {
+        let outcome = JournalReader::open(project.agent_dir(), &task).and_then(|reader| reader.read());
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            // An unreadable journal is the one case where metrics must not be invented: the
+            // chain is broken, so every count below it is a guess. The error names the task.
+            Err(error) => {
+                reports.push(serde_json::json!({
+                    "task": task,
+                    "unreadable": error.to_string(),
+                }));
+                continue;
+            }
+        };
+        let owned: Vec<JournalRecord> = outcome
+            .records
+            .iter()
+            .filter(|record| record.fields.task == task)
+            .cloned()
+            .collect();
+        let mut report = metrics::compute(task.as_str(), &owned);
+        report.corrupt = outcome.is_corrupt();
+        reports.push(
+            serde_json::to_value(&report)
+                .map_err(|error| internal(format!("cannot encode the metrics: {error}")))?,
+        );
+    }
+
+    Ok(serde_json::json!({
+        "tasks": reports,
+        "count": reports.len(),
     }))
 }
 

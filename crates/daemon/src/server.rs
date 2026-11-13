@@ -663,6 +663,7 @@ async fn dispatch(request: &Request, state: &ServerState) -> Result<Value, RpcEr
             }
         }
         "log" => crate::commands::log(state, &request.params),
+        "metrics" => crate::commands::metrics(state, &request.params),
         "gc" => crate::commands::collect_garbage(state, &request.params),
         "merge" => crate::commands::merge(state, &request.params),
         // One method, two shapes, like `plan`: with `task` it resumes an existing task, with
