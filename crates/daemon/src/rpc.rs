@@ -206,6 +206,7 @@ pub const METHODS: &[&str] = &[
     "log",
     "gc",
     "merge",
+    "start",
 ];
 
 /// Whether `method` is one this build knows.

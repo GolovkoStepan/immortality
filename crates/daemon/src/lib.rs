@@ -11,6 +11,7 @@
 
 pub mod checkpoints;
 pub mod commands;
+pub mod cycle;
 pub mod doctor;
 pub mod gates;
 pub mod planner;
@@ -20,6 +21,7 @@ pub mod runner;
 pub mod scheduling;
 pub mod server;
 pub mod service;
+pub mod start;
 pub mod startup;
 pub mod toolset;
 

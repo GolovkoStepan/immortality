@@ -71,10 +71,23 @@ enum Command {
     Doctor,
     /// Create the `.agent/` directory and a starter config. (M4)
     Init,
-    /// Start a task. (M4)
+    /// Start a task, or resume one, and run it in the daemon.
+    ///
+    /// With a goal this admits a new task: a plan already on disk is respected, and one that is
+    /// missing is planned first. With `--task` it resumes a task that already exists — the same
+    /// path a restarted daemon takes.
     Start {
-        /// What to accomplish.
-        goal: String,
+        /// What to accomplish. Omit only when resuming with `--task`.
+        goal: Option<String>,
+        /// Resume this task instead of creating one.
+        #[arg(long)]
+        task: Option<String>,
+        /// A registered project path. Defaults to the current directory.
+        #[arg(long)]
+        project: Option<String>,
+        /// Re-plan an existing tree instead of running the one on disk. Needs a goal.
+        #[arg(long)]
+        force: bool,
     },
     /// Attach to running events. (M3)
     Attach {
@@ -170,12 +183,12 @@ async fn main() -> Result<()> {
         Command::Escalations { task } => escalations_command(task, cli.json).await,
         Command::Approve { id, answer } => approve_command(&id, &answer, cli.json).await,
         Command::Init => init_command(&loaded, cli.json),
-        Command::Start { goal } => {
-            if goal.trim().is_empty() {
-                anyhow::bail!("goal must not be empty");
-            }
-            not_yet("start", "M5.8")
-        }
+        Command::Start {
+            goal,
+            task,
+            project,
+            force,
+        } => start_command(goal, task, project, force, cli.json).await,
         Command::Plan { project, goal, force } => plan_command(project, goal, force, cli.json).await,
         Command::Attach { task, since_seq } => attach_command(task, since_seq, cli.json).await,
         Command::Status { task } => status_command(task, cli.json).await,
@@ -296,8 +309,75 @@ fn service_status(json: bool) -> Result<()> {
     Ok(())
 }
 
-fn not_yet(command: &str, milestone: &str) -> Result<()> {
-    anyhow::bail!("`{command}` is not implemented until {milestone}; see docs/roadmap.md")
+/// `start`: admit a task, or resume one, and report the admission.
+///
+/// The run itself belongs to the daemon (D-088's rule, and the milestone's): the client sends a
+/// goal or a task id and prints the answer, which is "started", not "finished". Everything that
+/// decides whether the run may begin — the plan, the depth limit, the single run slot — is the
+/// daemon's, because a client that duplicated those rules would be a second, stale answer.
+async fn start_command(
+    goal: Option<String>,
+    task: Option<String>,
+    project: Option<String>,
+    force: bool,
+    json: bool,
+) -> Result<()> {
+    let params = start_params(goal, task, project, force)?;
+    let mut client = connect().await?;
+    let result = take(client.request("start", params).await?)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    } else {
+        print!("{}", render::admitted(&result, style()));
+    }
+    Ok(())
+}
+
+/// What `start` sends, or why the two arguments it was given cannot both be honoured.
+///
+/// Kept out of [`start_command`] so the refusal is testable without a daemon: "a goal and `--task`
+/// together" is a usage error the human should hear immediately, not after a socket round trip.
+fn start_params(
+    goal: Option<String>,
+    task: Option<String>,
+    project: Option<String>,
+    force: bool,
+) -> Result<serde_json::Value> {
+    match (goal, task) {
+        (Some(_), Some(_)) => anyhow::bail!(
+            "give either a goal or `--task`, not both: a goal admits a new task, \
+             `--task` resumes an existing one"
+        ),
+        (Some(goal), None) => {
+            if goal.trim().is_empty() {
+                anyhow::bail!("the goal must not be empty; say what the task should accomplish");
+            }
+            let project = match project {
+                Some(project) => PathBuf::from(project),
+                // The daemon cannot see this process's working directory, and its own is `/` under
+                // launchd, so the client always says which repository it means.
+                None => std::env::current_dir().context("cannot read the current directory")?,
+            };
+            Ok(serde_json::json!({
+                "project": project,
+                "goal": goal,
+                "force": force,
+            }))
+        }
+        (None, Some(task)) => {
+            if force {
+                anyhow::bail!(
+                    "`--force` re-plans, and re-planning needs a goal; a resume runs the plan \
+                     already on disk"
+                );
+            }
+            Ok(serde_json::json!({ "task": task }))
+        }
+        (None, None) => anyhow::bail!(
+            "say what to do — `immortality start \"what to do\"` — or resume a task with \
+             `immortality start --task <id>`"
+        ),
+    }
 }
 
 /// `status`: what this daemon knows, as a table or raw JSON.
@@ -771,12 +851,15 @@ mod tests {
     }
 
     #[test]
-    fn not_yet_names_the_milestone() {
-        let Err(err) = not_yet("attach", "M5") else {
-            panic!("`not_yet` must fail");
+    fn start_refuses_a_goal_with_no_task_and_no_plan() {
+        // The daemon knows whether a plan exists; the client only reports what it was told. This
+        // test pins the client half: `--task` and a goal together are a usage error, because the
+        // two request different things and guessing which was meant would run the wrong one.
+        let Err(error) = start_params(Some("do it".to_string()), Some("tsk_x".to_string()), None, false)
+        else {
+            panic!("a goal and a task together must be refused");
         };
-        let text = err.to_string();
-        assert!(text.contains("attach"), "{text}");
-        assert!(text.contains("M5"), "{text}");
+        let text = error.to_string();
+        assert!(text.contains("--task"), "{text}");
     }
 }

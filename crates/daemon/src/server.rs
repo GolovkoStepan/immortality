@@ -64,6 +64,18 @@ pub struct ServerState {
     /// makes every model-touching method testable without a server — the same seam
     /// [`crate::runner::Model`] gives the loop.
     pub model: Option<std::sync::Arc<dyn crate::runner::Model>>,
+    /// The broadcast a run announces its journal records to.
+    ///
+    /// `None` when the state was built without one (a direct handler test), which is exactly the
+    /// case where nobody is attached. The server always supplies it, because `attach` is only
+    /// useful if the run writes into the same channel.
+    pub events: Option<Events>,
+    /// Tasks with a live run in *this* process.
+    ///
+    /// The journal is single-writer (D-001), so two runs of one task would fork its chain. The set
+    /// is in memory on purpose: a restart means the previous writer is gone, and recovery repairs
+    /// the tail before a new run starts.
+    pub running: std::sync::Arc<std::sync::Mutex<std::collections::BTreeSet<TaskId>>>,
 }
 
 impl ServerState {
@@ -90,6 +102,8 @@ impl ServerState {
             token,
             config: immortality_core::config::Config::default(),
             model: None,
+            events: None,
+            running: std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::new())),
         })
     }
 
@@ -112,6 +126,17 @@ impl ServerState {
     #[must_use]
     pub fn with_model(mut self, model: std::sync::Arc<dyn crate::runner::Model>) -> Self {
         self.model = Some(model);
+        self
+    }
+
+    /// The same state, announcing runs to `events`.
+    ///
+    /// The server shares its broadcast with the runs so `attach` is a live window: a run that
+    /// wrote to a different channel would make an attached terminal show an idle task for hours
+    /// and then a finished one, which is precisely the silence this project refuses.
+    #[must_use]
+    pub fn with_events(mut self, events: Events) -> Self {
+        self.events = Some(events);
         self
     }
 
@@ -230,6 +255,18 @@ impl Events {
 impl Default for Events {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// The daemon's broadcast is the journal's sink.
+///
+/// This is what makes `attach` show a *running* task rather than only its finished journal. The
+/// writer hands over each record immediately after it is durable, and `publish` is a bounded
+/// `broadcast` send: it never blocks the run and never panics, which is the whole contract
+/// [`immortality_core::journal::Sink`] asks for.
+impl immortality_core::journal::Sink for Events {
+    fn appended(&self, record: &JournalRecord) {
+        self.publish(std::sync::Arc::new(record.clone()));
     }
 }
 
@@ -628,6 +665,10 @@ async fn dispatch(request: &Request, state: &ServerState) -> Result<Value, RpcEr
         "log" => crate::commands::log(state, &request.params),
         "gc" => crate::commands::collect_garbage(state, &request.params),
         "merge" => crate::commands::merge(state, &request.params),
+        // One method, two shapes, like `plan`: with `task` it resumes an existing task, with
+        // `goal` it admits a new one. The answer is an admission, not a result — the run is
+        // hours, and a client that waited for it would be a client that timed out.
+        "start" => crate::start::start(state, &request.params).await,
         "hello" => Ok(json!({"version": rpc::VERSION})),
         other => Err(RpcError::new(
             ErrorCode::UnknownMethod,

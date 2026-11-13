@@ -303,6 +303,42 @@ fn render_subtask_line(out: &mut String, subtask: &Value, depth: usize, style: S
     }
 }
 
+/// An admission: the task id, where it runs, and what to type to watch it.
+///
+/// The first thing a human needs after `immortality start` is the id, because every other command
+/// takes it; the second is that the run is *theirs to watch* and not already over. That is why the
+/// next command is printed rather than described.
+#[must_use]
+pub fn admitted(result: &Value, style: Style) -> String {
+    use std::fmt::Write as _;
+
+    let task = text(result, "task");
+    let resumed = result.get("resumed").and_then(Value::as_bool) == Some(true);
+    let planned = result.get("planned").and_then(Value::as_bool) == Some(true);
+    let mut out = String::new();
+    let verb = if resumed { "resumed" } else { "started" };
+    let _ = writeln!(out, "{}", style.green(&format!("{verb} {task}")));
+    let _ = writeln!(out, "  project:  {}", text(result, "path"));
+    let _ = writeln!(out, "  state:    {}", text(result, "state"));
+    if let Some(goal) = result.get("goal").and_then(Value::as_str)
+        && !goal.is_empty()
+    {
+        let _ = writeln!(out, "  goal:     {goal}");
+    }
+    if let Some(count) = result.get("subtasks").and_then(Value::as_u64) {
+        let _ = writeln!(out, "  subtasks: {count}");
+    }
+    if planned {
+        let _ = writeln!(
+            out,
+            "  planned:  the tree was just written; edit .agent/TASKS.json if you want to \
+             change it before the first subtask runs"
+        );
+    }
+    let _ = writeln!(out, "watch it with `immortality attach {task}`");
+    out
+}
+
 /// A transcript: every record, one block or line each, in journal order.
 ///
 /// Rendered through the same [`Renderer`] as `attach`, because a transcript that looked different

@@ -206,10 +206,15 @@ pub async fn run() -> Result<()> {
     for warning in &loaded.warnings {
         tracing::warn!("{warning}");
     }
+    // One broadcast for the whole daemon, shared with every run it starts: `attach` subscribes to
+    // this channel, and a run writing into a *different* one would give an attached terminal
+    // hours of silence followed by a finished task.
+    let events = Events::new();
     let server_state = ServerState::discover(&root)
         .map_err(|error| anyhow::anyhow!("{error}"))
         .context("the daemon cannot start")?
-        .with_config(&loaded.config);
+        .with_config(&loaded.config)
+        .with_events(events.clone());
 
     // Recovery runs before the socket is bound, so no client can observe a task mid-repair. It is
     // blocking work (journals, git, the filesystem) with nothing else competing for the runtime —

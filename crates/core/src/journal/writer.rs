@@ -42,6 +42,31 @@ use crate::time::{Clock, SystemClock};
 /// without thinking about it.
 pub const SEGMENT_LIMIT_BYTES: u64 = 8 * 1024 * 1024;
 
+/// Notified after a record is durably on disk.
+///
+/// # Why this is a hook and not a reader
+///
+/// A human watching a run must see records as they happen, not when the run ends: the daemon
+/// answers `start` in milliseconds and then runs for hours, and `attach` is the only window into
+/// that run. Polling the file from the server would be a second, slower source of truth with its
+/// own lag; a hook called by the writer is the same record the journal just chained, delivered
+/// once, in order.
+///
+/// # Why it is called *after* the write
+///
+/// The journal is the record of what happened. A subscriber that saw a record the file does not
+/// hold would be watching a run that never was, so the notification follows `sync_data`.
+///
+/// # Contract
+///
+/// A sink is called from the writing thread while the journal is borrowed. It must be quick and
+/// must not panic: `Events::publish` hands the record to a bounded `broadcast`, which neither
+/// blocks nor panics, and it is the only implementation.
+pub trait Sink: std::fmt::Debug + Send + Sync {
+    /// One record, exactly as it was written.
+    fn appended(&self, record: &JournalRecord);
+}
+
 /// The active journal segment.
 ///
 /// One instance per task per process. There is no internal locking: `&mut self` is the lock.
@@ -56,6 +81,9 @@ pub struct Journal {
     task: TaskId,
     next_seq: u64,
     last_digest: Option<Digest>,
+    /// Where every appended record is also announced. `None` for a one-shot process that has no
+    /// subscribers, which is every writer except the daemon's run cycle.
+    sink: Option<std::sync::Arc<dyn Sink>>,
     /// Bytes written to the active segment, tracked in memory rather than `fstat`ed on every
     /// append: the only writer is this struct, so the count cannot drift.
     written: u64,
@@ -108,6 +136,7 @@ impl Journal {
             task,
             next_seq: tail.next_seq,
             last_digest: tail.last_digest,
+            sink: None,
             written: tail.valid_bytes,
             clock: std::sync::Arc::new(SystemClock),
         };
@@ -138,6 +167,16 @@ impl Journal {
     /// keeps the default.
     pub fn set_clock(&mut self, clock: std::sync::Arc<dyn Clock>) {
         self.clock = clock;
+    }
+
+    /// Announce every record appended from now on to `sink`.
+    ///
+    /// The daemon installs its event broadcast here before a run starts, which is what makes
+    /// `immortality attach` show a progressing run instead of only its finished journal. Called
+    /// once, by the process that owns the journal: a second call replaces the first, and there is
+    /// only ever one subscriber set.
+    pub fn set_sink(&mut self, sink: std::sync::Arc<dyn Sink>) {
+        self.sink = Some(sink);
     }
 
     /// The current instant on this journal's clock.
@@ -187,6 +226,11 @@ impl Journal {
         self.last_digest = Some(hash_line(line.as_bytes()));
         self.next_seq += 1;
         self.written += line.len() as u64;
+        // Announce only after the bytes are durable: a subscriber must never see a record the
+        // file does not hold. `sync_data` happened inside `write_line`.
+        if let Some(sink) = &self.sink {
+            sink.appended(&record);
+        }
         Ok(record)
     }
 
@@ -776,6 +820,49 @@ mod tests {
         let text = std::fs::read_to_string(dir.path().join("JOURNAL.jsonl")).unwrap();
         assert_eq!(text.lines().count(), 1);
         assert!(text.ends_with('\n'));
+    }
+
+    #[test]
+    fn the_sink_is_called_only_after_the_bytes_are_on_disk() {
+        // A subscriber must never be told about a record the file does not hold: `attach`
+        // would then print a line that no recovery could find. The sink therefore reads the
+        // file it was just told about, which is only possible if `write_line` ran first.
+        use std::sync::Mutex;
+
+        #[derive(Debug)]
+        struct ReadsTheFile {
+            path: std::path::PathBuf,
+            seen: Mutex<Vec<(u64, usize)>>,
+        }
+
+        impl Sink for ReadsTheFile {
+            fn appended(&self, record: &JournalRecord) {
+                let text = std::fs::read_to_string(&self.path).unwrap_or_default();
+                let lines = text.lines().count();
+                self.seen.lock().expect("seen").push((record.fields.seq, lines));
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let watcher = std::sync::Arc::new(ReadsTheFile {
+            path: dir.path().join("JOURNAL.jsonl"),
+            seen: Mutex::new(Vec::new()),
+        });
+        let mut writer = journal(dir.path());
+        writer.set_sink(watcher.clone());
+        for n in 0..4 {
+            writer
+                .append_event(at(), Kind::TaskState, serde_json::json!({ "n": n }))
+                .unwrap();
+        }
+        let seen = watcher.seen.lock().unwrap();
+        let found: Vec<(u64, usize)> = seen.clone();
+        drop(seen);
+        // Each notification saw its own record already written, and counted every record so far.
+        for (index, (seq, lines)) in found.iter().enumerate() {
+            assert_eq!(*seq, index as u64);
+            assert_eq!(*lines, index + 1, "the sink ran before the bytes: {found:?}");
+        }
     }
 
     #[test]

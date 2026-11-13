@@ -218,8 +218,9 @@ fn every_command_without_a_daemon_says_so_and_changes_nothing() {
     // refused" alone sends a human looking for a network problem that does not exist, and silence
     // would look like success.
     //
-    // `start` is on the list with a milestone instead of a socket error, because the run loop
-    // lands in M5.8 — the message has to name what it waits for rather than pretend to work.
+    // `start` now reaches the daemon like every other command, so it answers a missing daemon the
+    // same way: with the socket path, not with a milestone placeholder. Both of its shapes are
+    // exercised — a goal to admit and a task to resume.
     let dir = tempfile::tempdir().expect("tempdir");
     let config = dead_backend_config(dir.path());
     let task = "tsk_01ARZ3NDEKTSV4RRFFQ69G5FAV";
@@ -233,6 +234,8 @@ fn every_command_without_a_daemon_says_so_and_changes_nothing() {
         vec!["gc", "--dry-run"],
         vec!["merge", task],
         vec!["attach"],
+        vec!["start", "do a thing"],
+        vec!["start", "--task", task],
     ] {
         binary()
             .arg("--global-config")
@@ -243,14 +246,6 @@ fn every_command_without_a_daemon_says_so_and_changes_nothing() {
             .stderr(predicate::str::contains("daemon.sock"))
             .stderr(predicate::str::contains("nothing was changed"));
     }
-
-    binary()
-        .arg("--global-config")
-        .arg(&config)
-        .args(["start", "do a thing"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("M5.8"));
 }
 
 #[test]

@@ -53,20 +53,18 @@ use std::time::{Duration, Instant};
 use immortality_core::artifacts::ArtifactStore;
 use immortality_core::config::{Detectors, Policy};
 use immortality_core::context::{Budget, CharsCounter};
-use immortality_core::domain::{Dod, DodCheck, Subtask, SubtaskState, TaskState, TaskTrigger, Timestamp};
-use immortality_core::gate::{
-    ChangedFile, Diff, FileStatus, GateRecord, Gates, ReviewRequest, Reviewer, evaluate,
-};
+use immortality_core::domain::{Dod, DodCheck, Subtask, TaskState, Timestamp};
+use immortality_core::gate::{ChangedFile, Diff, FileStatus, Gates, ReviewRequest, Reviewer};
 use immortality_core::ids::{SubtaskId, TaskId};
-use immortality_core::journal::{Journal, JournalReader, JournalRecord, Kind, ReadOutcome, Scope};
+use immortality_core::journal::{Journal, JournalReader, JournalRecord, Kind, ReadOutcome};
 use immortality_core::plan::{Plan, SCHEMA_VERSION};
 use immortality_core::protocol::Probe as ProbeAnswer;
 use immortality_core::recover::{
     self, LastCheckpoint, PersistedState, Prober, RecoveryInput, RecoveryStep, Verdict, WorkspaceFacts,
 };
-use immortality_core::restart::{Allowance, Checkpoints, Snapshot, Stop};
-use immortality_core::scheduler;
+use immortality_core::restart::{Checkpoints, Snapshot, Stop};
 use immortality_core::time::{Clock as _, FixedClock};
+use immortality_daemon::cycle;
 use immortality_daemon::runner::{AttemptLimits, FINISH_SUBTASK, Model, Reply, Runner};
 use immortality_llm::wire::ChatRequest;
 use immortality_tools::{PolicyGate, ReadFile, Registry, WriteFile};
@@ -384,172 +382,31 @@ fn run_cycle(sim: &Sim, script: Vec<Reply>) -> CycleEnd {
     let runner = sim.runner(Arc::clone(&model) as Arc<dyn Model>);
     let mut journal = sim.journal();
     let mut plan = sim.plan();
-    let mut state = TaskState::Queued;
 
-    // ── planning ────────────────────────────────────────────────────────────────────────
-    for (trigger, next) in [
-        (TaskTrigger::StartPlanning, TaskState::Planning),
-        (TaskTrigger::PlanWritten, TaskState::AwaitingPlanApproval),
-        (TaskTrigger::PlanApproved, TaskState::Running),
-    ] {
-        state = state
-            .trigger(trigger)
-            .expect("the lifecycle table allows this edge");
-        debug_assert_eq!(state, next);
-        record_task_state(&mut journal, &sim.clock, state);
-    }
-
-    // ── subtasks ────────────────────────────────────────────────────────────────────────
-    let stop = drive_subtasks(sim, &runner, &mut plan, &mut journal);
-
-    // ── verification ────────────────────────────────────────────────────────────────────
-    state = state
-        .trigger(TaskTrigger::ExecutionFinished)
-        .expect("execution finished");
-    record_task_state(&mut journal, &sim.clock, state);
-    let green = task_gates(&mut journal, &runner, &sim.clock);
-    let trigger = if green {
-        TaskTrigger::GatesPassed
-    } else {
-        TaskTrigger::GatesFailed
-    };
-    state = state.trigger(trigger).expect("the verdict has an edge");
-    record_task_state(&mut journal, &sim.clock, state);
+    // The loop itself is `immortality_daemon::cycle::run` — the same function the daemon calls
+    // for `immortality start`. That is the point of this file after M5.8: a scenario that passes
+    // here is a statement about the shipped cycle, not about a copy of it kept beside the tests.
+    // What stays local is the fake world (model, clock, git, gates), which is what makes a run
+    // take microseconds.
+    let outcome = cycle::run(
+        &runner,
+        &mut plan,
+        &mut journal,
+        &cycle::Start::resuming(TaskState::Queued, "extend the existing parser", None),
+        cycle::Limits {
+            attempts: 3,
+            restarts: 2,
+            max_depth: 2,
+        },
+    )
+    .expect("the cycle writes its own records");
     journal.close().expect("close journal");
 
     CycleEnd {
-        state,
-        stop,
+        state: outcome.state,
+        stop: outcome.stop,
         model_calls: model.calls(),
     }
-}
-
-/// Run subtasks until none may run, and say why the last one stopped.
-fn drive_subtasks(sim: &Sim, runner: &Runner, plan: &mut Plan, journal: &mut Journal) -> Stop {
-    let mut last = Stop::Done;
-    for _ in 0..32 {
-        let Some(subtask) = plan.next_ready().cloned() else {
-            match scheduler::next(plan) {
-                scheduler::Next::Finished => return last,
-                scheduler::Next::Stuck { open } => {
-                    panic!(
-                        "the cycle stalled with {} open subtask(s): {:?}",
-                        open.len(),
-                        open.iter().map(|s| s.id.to_string()).collect::<Vec<_>>()
-                    )
-                }
-                scheduler::Next::Run(_) => continue,
-            }
-        };
-        plan.set_state(&subtask.id, SubtaskState::Running, sim.clock.now())
-            .expect("mark running");
-        let mut running = plan.subtask(&subtask.id).cloned().expect("just loaded");
-        running.state = SubtaskState::Running;
-        let mut session = runner
-            .session(&running, next_attempt_number(&running))
-            .with_strategy("extend the existing parser");
-        let end = session
-            .drive(
-                Allowance {
-                    attempts_left: 3,
-                    restarts_left: 2,
-                },
-                journal,
-            )
-            .expect("the session writes its own records");
-        last = end.stop.clone();
-        match &end.stop {
-            Stop::Done => {
-                // Tree first, then journal: a crash between the two leaves a `done` tree with a
-                // missing audit line, which reads as "settled, nothing to say". The other order
-                // would announce a closure the plan never received.
-                plan.set_state(&subtask.id, SubtaskState::Done, sim.clock.now())
-                    .expect("mark done");
-                journal
-                    .append_scoped(
-                        sim.clock.now(),
-                        Kind::SubtaskState,
-                        serde_json::json!({ "subtask": subtask.id.to_string(), "state": "done" }),
-                        &Scope::subtask(subtask.id.clone()),
-                    )
-                    .expect("subtask_state");
-            }
-            Stop::Split => {
-                let pieces = match &end.outcome.ending {
-                    immortality_daemon::runner::Ending::SplitRequested(pieces) => pieces.clone(),
-                    other => panic!("a split stop without pieces: {other:?}"),
-                };
-                scheduler::apply_split(plan, journal, &subtask.id, &pieces, 2, sim.clock.now())
-                    .expect("the tree decides whether the split is legal");
-            }
-            Stop::Exhausted(_) => {
-                plan.set_state(&subtask.id, SubtaskState::Blocked, sim.clock.now())
-                    .expect("mark blocked");
-                journal
-                    .append_scoped(
-                        sim.clock.now(),
-                        Kind::SubtaskState,
-                        serde_json::json!({ "subtask": subtask.id.to_string(), "state": "blocked" }),
-                        &Scope::subtask(subtask.id.clone()),
-                    )
-                    .expect("subtask_state");
-            }
-            Stop::Abandoned | Stop::Blocked(_) => return end.stop,
-        }
-    }
-    panic!("the cycle did not converge in 32 subtask passes");
-}
-
-/// The attempt number a resumed subtask starts from.
-fn next_attempt_number(subtask: &Subtask) -> u32 {
-    u32::try_from(subtask.attempts.len())
-        .unwrap_or(0)
-        .saturating_add(1)
-}
-
-/// Run the task-level gates over the whole change, and journal one record per gate.
-///
-/// Not the runner's `evaluate_gates`: that one judges an *attempt* against its `DoD` and writes
-/// at attempt scope. This is the acceptance check the task as a whole must pass before
-/// `ready_for_review`, and its records belong to the task, so recovery can tell "the task was
-/// verified" from "an attempt was".
-fn task_gates(journal: &mut Journal, runner: &Runner, clock: &FixedClock) -> bool {
-    let dod = Dod {
-        statement: "the acceptance checks pass".to_string(),
-        checks: vec![
-            DodCheck {
-                id: "build".to_string(),
-                command: "cargo build".to_string(),
-                required: true,
-            },
-            DodCheck {
-                id: "test".to_string(),
-                command: "cargo test".to_string(),
-                required: true,
-            },
-        ],
-        review: true,
-    };
-    let gates = runner.gates.as_deref().expect("the scenario wires gates");
-    let reviewer = runner.reviewer.as_deref().map(|it| it as &dyn Reviewer);
-    let report = evaluate(&dod, gates, reviewer, None).expect("the diff is available");
-    for record in GateRecord::of(&report) {
-        let payload = serde_json::to_value(&record).expect("a record is JSON");
-        journal
-            .append_scoped(clock.now(), Kind::GateResult, payload, &Scope::task())
-            .expect("gate_result");
-    }
-    report.is_green()
-}
-
-fn record_task_state(journal: &mut Journal, clock: &FixedClock, state: TaskState) {
-    journal
-        .append_event(
-            clock.now(),
-            Kind::TaskState,
-            serde_json::json!({ "state": state.as_str() }),
-        )
-        .expect("task_state");
 }
 
 // ── the scenario ────────────────────────────────────────────────────────────────────────
