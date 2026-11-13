@@ -23,6 +23,7 @@ use immortality_core::config::{self, Overrides};
 use immortality_core::paths::StatePaths;
 use immortality_core::{logging, paths::RepoPaths};
 use immortality_daemon::doctor::{self, Report, Status};
+use immortality_daemon::service::{self, Agent, ServiceSpec};
 
 mod client;
 mod render;
@@ -110,6 +111,21 @@ enum Command {
     Gc,
     /// Run the daemon in the foreground until killed.
     Serve,
+    /// Manage the launchd agent that runs the daemon in the background.
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ServiceAction {
+    /// Install and load the agent. Idempotent; a healthy daemon is never restarted.
+    Install,
+    /// Unload the agent and remove its plist. Idempotent.
+    Uninstall,
+    /// Show whether the plist is installed and whether launchd is running it.
+    Status,
 }
 
 #[tokio::main]
@@ -147,7 +163,118 @@ async fn main() -> Result<()> {
         Command::Log { task: _ } => not_yet("log", "M5"),
         Command::Merge { task: _ } => not_yet("merge", "M5"),
         Command::Serve => serve::run().await,
+        Command::Service { action } => service_command(&action, cli.json),
     }
+}
+
+/// `service`: the launchd agent behind a background daemon.
+///
+/// Not `async`: nothing here talks to the daemon. `install`/`uninstall`/`status` drive `launchctl`
+/// and the filesystem, and making them async would only obscure that they are blocking calls.
+fn service_command(action: &ServiceAction, json: bool) -> Result<()> {
+    match action {
+        ServiceAction::Install => service_install(json),
+        ServiceAction::Uninstall => service_uninstall(json),
+        ServiceAction::Status => service_status(json),
+    }
+}
+
+/// `service install`: write the plist and load the agent, disturbing nothing that works.
+fn service_install(json: bool) -> Result<()> {
+    let spec = ServiceSpec::discover().map_err(|error| anyhow::anyhow!("{error}"))?;
+    let agent = Agent::discover().map_err(|error| anyhow::anyhow!("{error}"))?;
+    let outcome = agent.install(&spec).map_err(|error| anyhow::anyhow!("{error}"))?;
+    let plist = agent.plist().to_path_buf();
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "installed": match outcome {
+                    service::Installed::Fresh => "fresh",
+                    service::Installed::Unchanged => "unchanged",
+                    service::Installed::Reloaded => "reloaded",
+                },
+                "plist": plist,
+            }))?
+        );
+        return Ok(());
+    }
+    match outcome {
+        service::Installed::Fresh => {
+            println!("installed {} and started the daemon", service::LABEL);
+        }
+        service::Installed::Unchanged => {
+            println!("{} is already installed and running", service::LABEL);
+        }
+        service::Installed::Reloaded => {
+            println!(
+                "reinstalled {} and restarted it to pick up the change",
+                service::LABEL
+            );
+        }
+    }
+    println!("  plist: {}", plist.display());
+    println!(
+        "  state: {}\n  logs:  {}",
+        spec.state_root.display(),
+        spec.log_path.display()
+    );
+    Ok(())
+}
+
+/// `service uninstall`: unload and remove. Idempotent, for scripts.
+fn service_uninstall(json: bool) -> Result<()> {
+    Agent::discover()
+        .map_err(|error| anyhow::anyhow!("{error}"))?
+        .uninstall()
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    if json {
+        println!("{}", serde_json::json!({ "installed": false }));
+    } else {
+        println!("uninstalled {}", service::LABEL);
+    }
+    Ok(())
+}
+
+/// `service status`: installed and running are two separate facts.
+fn service_status(json: bool) -> Result<()> {
+    // `discover` failing means there is no agent to report on, which is a different answer from
+    // "not installed": the latter is a state a human can fix with `service install`.
+    let agent = Agent::discover().map_err(|error| anyhow::anyhow!("{error}"))?;
+    let status = agent.status();
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "installed": status.installed,
+                "running": status.running,
+                "pid": status.pid,
+                "plist": status.plist,
+            }))?
+        );
+        return Ok(());
+    }
+    // Reported separately on purpose: a crashed job inside its throttle window is installed and
+    // not running, and answering only "installed" would tell a human the opposite of what they
+    // need to know.
+    println!("installed: {}", if status.installed { "yes" } else { "no" });
+    if status.installed {
+        println!("  plist:   {}", status.plist.display());
+    }
+    println!(
+        "running:   {}",
+        match (status.running, status.pid) {
+            (true, Some(pid)) => format!("yes (pid {pid})"),
+            (true, None) => "yes".to_string(),
+            (false, _) => "no".to_string(),
+        }
+    );
+    if !status.installed {
+        println!("Install it with `immortality service install`.");
+    } else if !status.running {
+        println!("launchd is not running it. `immortality service install` reloads the agent.");
+    }
+    Ok(())
 }
 
 fn not_yet(command: &str, milestone: &str) -> Result<()> {

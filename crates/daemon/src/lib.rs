@@ -16,6 +16,7 @@ pub mod recovery;
 pub mod rpc;
 pub mod runner;
 pub mod server;
+pub mod service;
 pub mod startup;
 pub mod toolset;
 
