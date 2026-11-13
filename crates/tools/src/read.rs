@@ -206,7 +206,7 @@ fn clip_line(line: &str) -> (String, bool) {
 ///
 /// Public within the crate because `grep` uses the same sniff: two definitions of "binary" in one
 /// crate would drift, and the one that drifted would be the one that dumped a PNG into a prompt.
-pub(crate) fn looks_binary(bytes: &[u8]) -> bool {
+pub fn looks_binary(bytes: &[u8]) -> bool {
     binary_kind(bytes).is_some()
 }
 

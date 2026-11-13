@@ -462,6 +462,69 @@ fn stream_of(captured: &Captured) -> Option<Box<dyn std::io::Read>> {
         .map(|file| Box::new(BufReader::new(file)) as Box<dyn std::io::Read>)
 }
 
+/// What a command run outside the model's tool loop produced.
+///
+/// The gate runner and `doctor` need the same guarantees `shell` gives the model — a closed
+/// stdin, its own process group, the whole group killed on a deadline, output captured to files
+/// instead of pipes — but they are not tool calls: there is no model to hand an observation to and
+/// no policy decision to make here, because the caller already made it. Exposing the machinery
+/// rather than a tool keeps those two callers from re-implementing the guards, which is how one of
+/// them ends up hanging on a credential prompt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandOutput {
+    /// `None` when the process was killed and never reported a code.
+    pub exit_code: Option<i32>,
+    pub timed_out: bool,
+    pub duration: Duration,
+    /// The last [`SHOWN_LINES`] lines of stdout, then of stderr, already labelled.
+    pub tail: String,
+    pub stdout_lines: usize,
+    pub stderr_lines: usize,
+}
+
+impl CommandOutput {
+    /// Whether the command ran to completion and exited zero.
+    #[must_use]
+    pub fn succeeded(&self) -> bool {
+        !self.timed_out && self.exit_code == Some(0)
+    }
+}
+
+/// Run one command in `directory` with no stdin, a deadline and a killed process group.
+///
+/// `timeout` is clamped to [`MAX_TIMEOUT_SECS`]: the cap exists because a single gate command is
+/// not allowed to turn a verification step into an hour of silence, and a caller that could pass
+/// a larger number would be a caller that can.
+///
+/// # Errors
+/// The command could not be spawned, or its capture files could not be created.
+pub fn run_command(command: &str, directory: &Path, timeout: Duration) -> Result<CommandOutput, ToolError> {
+    let timeout = timeout.clamp(Duration::from_secs(1), Duration::from_secs(MAX_TIMEOUT_SECS));
+    let finished = run(command, directory, &[], timeout)?;
+    let mut tail = String::new();
+    for (label, captured) in [("stdout", &finished.stdout), ("stderr", &finished.stderr)] {
+        if captured.bytes == 0 {
+            continue;
+        }
+        if !tail.is_empty() {
+            tail.push('\n');
+        }
+        let _ = writeln!(tail, "--- {label} ---");
+        tail.push_str(&captured.tail);
+        if captured.omitted > 0 {
+            let _ = writeln!(tail, "… {} earlier line(s) not shown", captured.omitted);
+        }
+    }
+    Ok(CommandOutput {
+        exit_code: finished.status.and_then(|status| status.code()),
+        timed_out: finished.timed_out,
+        duration: finished.duration,
+        tail,
+        stdout_lines: finished.stdout.total_lines,
+        stderr_lines: finished.stderr.total_lines,
+    })
+}
+
 /// Wrap a command so its `cwd` and exit code survive the `sh` that ran it.
 ///
 /// The braces matter: without them `cmd; __s=$?` in a command ending in `&` would put the
@@ -1253,5 +1316,63 @@ mod tests {
         let status = Command::new("/bin/sh").arg("-c").arg(&script).status().unwrap();
         assert_eq!(status.code(), Some(7));
         let _ = std::fs::remove_file(&marker);
+    }
+    // ── run_command: the seam the gate runner uses ────────────────────────────
+
+    #[test]
+    fn run_command_reports_the_exit_code_and_the_output_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = run_command(
+            "printf 'error[E0308]: mismatched types\\n' >&2; exit 101",
+            dir.path(),
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        assert_eq!(out.exit_code, Some(101));
+        assert!(!out.succeeded());
+        assert!(out.tail.contains("error[E0308]"), "{}", out.tail);
+        assert_eq!(out.stderr_lines, 1);
+    }
+
+    #[test]
+    fn run_command_treats_a_closed_stdin_as_eof() {
+        // The whole reason the tool layer owns the spawner: `cat` here must not wait for input.
+        let dir = tempfile::tempdir().unwrap();
+        let out = run_command("cat; echo done", dir.path(), Duration::from_secs(10)).unwrap();
+        assert!(out.succeeded(), "{out:?}");
+        assert!(out.duration < Duration::from_secs(5), "{:?}", out.duration);
+    }
+
+    #[test]
+    fn run_command_kills_the_whole_group_on_timeout() {
+        // `sh -c 'sleep 60; echo after'` keeps `sh` resident with `sleep` as a child. Killing only
+        // the direct child would orphan the sleep and let it outlive the check.
+        let dir = tempfile::tempdir().unwrap();
+        let out = run_command("sleep 60; echo never", dir.path(), Duration::from_secs(1)).unwrap();
+        assert!(out.timed_out);
+        assert!(!out.succeeded());
+        assert!(!out.tail.contains("never"), "{}", out.tail);
+    }
+
+    #[test]
+    fn run_command_clamps_a_timeout_above_the_cap() {
+        // A check that can ask for an hour is a check that can hold a verification step for an
+        // hour; the cap is the point.
+        let dir = tempfile::tempdir().unwrap();
+        let out = run_command("true", dir.path(), Duration::from_secs(100_000)).unwrap();
+        assert!(out.succeeded());
+    }
+
+    #[test]
+    fn run_command_runs_in_the_directory_it_was_given() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("marker.txt"), "x").unwrap();
+        let out = run_command(
+            "test -f marker.txt && echo found",
+            dir.path(),
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        assert!(out.tail.contains("found"), "{}", out.tail);
     }
 }

@@ -38,8 +38,9 @@
 //! # What ends an attempt
 //!
 //! The model calling `finish_subtask`, or a budget: steps, tokens, or wall time. `finish_subtask`
-//! is a *claim*, not a verdict — the gates decide, and they are M4.6. Until then the runner
-//! records the claim and returns the report, which is the honest contract.
+//! is a *claim*, not a verdict: the gates decide ([`Runner::settle_claim`]). A green verdict closes
+//! the attempt `Succeeded`; a red one closes it `Failed` with the gate's reason, and the report
+//! carries what the gate said so the next attempt can act on it instead of re-guessing.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -52,6 +53,7 @@ use immortality_core::context::{
 };
 use immortality_core::detect::{Detector, Level, Reaction, Signals, Stream, StreamVerdict, Thresholds};
 use immortality_core::domain::{Attempt, AttemptTrigger, FailureReason, Subtask, SubtaskReport};
+use immortality_core::gate::{GateRecord, GateVerdict, Gates, Reviewer, evaluate};
 use immortality_core::ids::TaskId;
 use immortality_core::journal::{Journal, Kind, Scope};
 use immortality_core::protocol::{CallId, Intent, ToolCallLog};
@@ -368,6 +370,13 @@ pub struct RunOutcome {
     pub report: SubtaskReport,
     /// Steps used.
     pub steps: u32,
+    /// What the gates said about the claim, when there was a claim to judge.
+    ///
+    /// `None` for every ending that is not a claim. `Some(Passed)` is the only value that licenses
+    /// closing the subtask, and closing it is the scheduler's job: the runner owns the attempt,
+    /// the tree belongs to the plan, and a runner that wrote `done` into a tree it cannot see
+    /// would be deciding what the next subtask is.
+    pub gates: Option<GateVerdict>,
 }
 
 impl RunOutcome {
@@ -375,6 +384,12 @@ impl RunOutcome {
     #[must_use]
     pub const fn claimed_done(&self) -> bool {
         matches!(self.ending, Ending::Claimed)
+    }
+
+    /// Whether the claim passed every gate, and the subtask may be closed.
+    #[must_use]
+    pub fn verified(&self) -> bool {
+        self.gates.as_ref().is_some_and(GateVerdict::is_passed)
     }
 }
 
@@ -405,6 +420,19 @@ pub struct Runner {
     pub task: TaskId,
     /// Detector thresholds, read from config once.
     pub detectors: Detectors,
+    /// The world the gates read: git, the policy gate, the command runner.
+    ///
+    /// `None` is not "no gates needed" — the `DoD` decides that. It is "nothing can verify a
+    /// claim", and a claim that nothing verified does not close the subtask. An `Option` rather
+    /// than a required field so a test that exercises the loop without a repository does not
+    /// have to invent one, and fail-closed so that decision cannot become a bypass.
+    pub gates: Option<Arc<dyn Gates + Send + Sync>>,
+    /// The reviewer, wired only when the daemon has a model to call.
+    ///
+    /// Separate from [`Self::gates`] because a `DoD` with `review: false` never needs it, and
+    /// because the reviewer is a model call: a caller that wants the command gates without
+    /// paying for a review passes `None` and gets exactly that.
+    pub reviewer: Option<Arc<dyn Reviewer + Send + Sync>>,
     /// How deep the tree may grow, from `LoopLimits::max_subtask_depth`.
     ///
     /// The runner does not enforce it — the scheduler does — but the brief has to know whether
@@ -465,19 +493,8 @@ impl Runner {
         attempt.steps_used = state.steps;
         attempt.tokens_used = state.tokens;
         let report = state.report(&ending);
-        // A claim does not close the attempt. `AttemptState::Succeeded` means "the model claimed
-        // done and every gate passed", and the gates are M4.6 — a runner that wrote `Succeeded`
-        // here would be grading its own work, and `status` would show a success that no check
-        // ever confirmed. The attempt stays `Running`, which is exactly true while the gates run,
-        // and the scheduler closes it. A crash in that window is closed by recovery like any
-        // other open attempt.
         if ending == Ending::Claimed {
-            return Ok(RunOutcome {
-                attempt,
-                ending,
-                report,
-                steps: state.steps,
-            });
+            return self.settle_claim(subtask, attempt, report, state.steps, journal);
         }
 
         let trigger = match &ending {
@@ -515,8 +532,134 @@ impl Runner {
             ending,
             report,
             steps: state.steps,
+            gates: None,
         })
     }
+
+    /// Turn a claim into a closed attempt, if and only if the gates are green.
+    ///
+    /// # Why this is a separate step
+    ///
+    /// A claim is one model sentence; closing a subtask is a verdict about work. Putting the
+    /// evaluation here rather than inline in [`Self::run`] keeps the loop free of git, the
+    /// policy gate and the reviewer, and it keeps the one rule that matters visible in one
+    /// place: `Succeeded` is written **after** the verdict, never before it.
+    ///
+    /// # Why fail-closed on a missing gate world
+    ///
+    /// [`Self::gates`] is `None` when a caller wired no way to verify anything. Treating that as
+    /// "no gates needed" would make every anemic caller a bypass, so it is a failed gate with a
+    /// reason that names the wiring bug. The subtask does not close, and the report says why.
+    ///
+    /// # Errors
+    /// The journal cannot be written.
+    fn settle_claim(
+        &self,
+        subtask: &Subtask,
+        mut attempt: Attempt,
+        mut report: SubtaskReport,
+        steps: u32,
+        journal: &mut Journal,
+    ) -> immortality_core::Result<RunOutcome> {
+        let verdict = self.evaluate_gates(subtask, attempt.number, journal)?;
+        match &verdict {
+            GateVerdict::Passed => {
+                attempt
+                    .finish(AttemptTrigger::Succeed, None, immortality_core::time::now())
+                    .map_err(|error| immortality_core::Error::Protocol(error.to_string()))?;
+                // Nothing is written about the subtask here. Closing it means writing `done` into
+                // `TASKS.json` and then the journal (D-078's order), and only the scheduler holds
+                // the tree. A runner that wrote the record without the tree would leave a journal
+                // claiming a closure the plan never received.
+            }
+            GateVerdict::Failed { reason, why } => {
+                attempt
+                    .finish(AttemptTrigger::Fail, Some(*reason), immortality_core::time::now())
+                    .map_err(|error| immortality_core::Error::Protocol(error.to_string()))?;
+                journal.append_scoped(
+                    immortality_core::time::now(),
+                    Kind::AttemptFailed,
+                    serde_json::json!({
+                        "attempt": attempt.id.to_string(),
+                        "state": attempt.state.as_str(),
+                        "ending": "gate",
+                        "failure": reason,
+                        "why": why,
+                        "steps": attempt.steps_used,
+                        "tokens": attempt.tokens_used,
+                    }),
+                    &Scope::attempt(subtask.id.clone(), attempt.number),
+                )?;
+                // The claim was rejected, so the report must not read as an achievement: the
+                // next attempt's brief is where the reason does its work.
+                report
+                    .rejected_ideas
+                    .push(format!("the claim was rejected: {why}"));
+                report.outcome = format!(
+                    "claimed `{}` done, but the gates rejected it: {why}",
+                    subtask.title
+                );
+            }
+        }
+        Ok(RunOutcome {
+            attempt,
+            ending: Ending::Claimed,
+            report,
+            steps,
+            gates: Some(verdict),
+        })
+    }
+
+    /// Run every gate the subtask's `DoD` asks for, journalling each observation.
+    ///
+    /// One `gate_result` per gate, in the order it ran, plus the verdict last. Written before
+    /// the attempt is closed so that a crash between the evaluation and the close leaves a
+    /// journal that says "the gates ran and here is what they saw" — recovery then closes the
+    /// attempt like any other open one, and the next pass has real evidence.
+    fn evaluate_gates(
+        &self,
+        subtask: &Subtask,
+        attempt_number: u32,
+        journal: &mut Journal,
+    ) -> immortality_core::Result<GateVerdict> {
+        let scope = Scope::attempt(subtask.id.clone(), attempt_number);
+        let Some(gates) = self.gates.as_deref() else {
+            // No way to verify. Reported through the same channel as a red gate so nothing
+            // downstream has to distinguish "unwired" from "failed": both mean "do not close".
+            let verdict = GateVerdict::Failed {
+                reason: FailureReason::GateFailed,
+                why: "no gate runner is wired, so the claim cannot be verified".to_string(),
+            };
+            record_gate(
+                journal,
+                &scope,
+                &GateRecord::Verdict {
+                    passed: false,
+                    reason: verdict.failure(),
+                    why: verdict.why().map(str::to_string),
+                },
+            )?;
+            return Ok(verdict);
+        };
+        // `Option<&dyn A + B>` does not coerce to `Option<&dyn A>`; the map is what lets the
+        // `Send + Sync` bounds stay on the field without leaking into the pure signature.
+        let reviewer = self.reviewer.as_deref().map(|it| it as &dyn Reviewer);
+        let report = evaluate(&subtask.dod, gates, reviewer).map_err(|why| {
+            immortality_core::Error::Protocol(format!("the gate diff could not be produced: {why}"))
+        })?;
+        for record in GateRecord::of(&report) {
+            record_gate(journal, &scope, &record)?;
+        }
+        Ok(report.verdict())
+    }
+}
+
+/// Append one `gate_result` record.
+fn record_gate(journal: &mut Journal, scope: &Scope, record: &GateRecord) -> immortality_core::Result<()> {
+    let payload =
+        serde_json::to_value(record).map_err(|error| immortality_core::Error::Protocol(error.to_string()))?;
+    journal.append_scoped(immortality_core::time::now(), Kind::GateResult, payload, scope)?;
+    Ok(())
 }
 
 /// The mutable part of one run: context, counters, and the last thing that happened.
@@ -1567,6 +1710,10 @@ mod tests {
             task: TaskId::from_suffix("01ARZ3NDEKTSV4RRFFQ69G5FAA"),
             detectors: Detectors::default(),
             max_subtask_depth: 2,
+            // A green world by default: these tests are about the loop, and a fixture that
+            // failed its own gates would make every claim test assert a failure instead.
+            gates: Some(Arc::new(FakeGates::green())),
+            reviewer: Some(Arc::new(FakeReviewer::approving())),
         };
         (dir, runner)
     }
@@ -1577,6 +1724,110 @@ mod tests {
             TaskId::from_suffix("01ARZ3NDEKTSV4RRFFQ69G5FAJ"),
         )
         .expect("journal")
+    }
+
+    /// The gate world a test sees: a diff it returns and command results it scripts.
+    ///
+    /// `Mutex` rather than `RefCell` because [`Runner`] holds `Arc<dyn Gates + Send + Sync>`: a
+    /// fake that is not `Sync` would force every runner test onto a different trait object than
+    /// production uses, and then the seam would not be the seam.
+    #[derive(Debug, Default)]
+    struct FakeGates {
+        diff: Mutex<immortality_core::gate::Diff>,
+        refused: Mutex<Vec<String>>,
+        runs: Mutex<Vec<String>>,
+        failing: Mutex<Vec<String>>,
+    }
+
+    impl FakeGates {
+        fn green() -> Self {
+            Self::default()
+        }
+
+        fn with_diff(diff: immortality_core::gate::Diff) -> Self {
+            Self {
+                diff: Mutex::new(diff),
+                ..Self::default()
+            }
+        }
+
+        fn refusing(command: &str) -> Self {
+            let gates = Self::default();
+            gates.refused.lock().expect("lock").push(command.to_string());
+            gates
+        }
+
+        fn failing(command: &str) -> Self {
+            let gates = Self::default();
+            gates.failing.lock().expect("lock").push(command.to_string());
+            gates
+        }
+
+        fn ran(&self) -> Vec<String> {
+            self.runs.lock().map(|runs| runs.clone()).unwrap_or_default()
+        }
+    }
+
+    impl Gates for FakeGates {
+        fn diff(&self) -> Result<immortality_core::gate::Diff, String> {
+            Ok(self.diff.lock().map(|diff| diff.clone()).unwrap_or_default())
+        }
+
+        fn authorise(&self, command: &str) -> Result<(), String> {
+            let refused = self.refused.lock().map(|r| r.clone()).unwrap_or_default();
+            if refused.iter().any(|item| item == command) {
+                return Err("the command needs a human".to_string());
+            }
+            Ok(())
+        }
+
+        fn run(&self, command: &str) -> Result<immortality_core::gate::CommandRun, String> {
+            if let Ok(mut runs) = self.runs.lock() {
+                runs.push(command.to_string());
+            }
+            let failed = self
+                .failing
+                .lock()
+                .is_ok_and(|failing| failing.iter().any(|item| item == command));
+            Ok(immortality_core::gate::CommandRun {
+                exit_code: Some(i32::from(failed)),
+                timed_out: false,
+                duration_ms: 1,
+                output_tail: if failed { "boom".to_string() } else { String::new() },
+            })
+        }
+    }
+
+    /// A reviewer with a scripted answer, and no model behind it.
+    #[derive(Debug)]
+    struct FakeReviewer {
+        answer: Result<String, String>,
+    }
+
+    impl FakeReviewer {
+        fn approving() -> Self {
+            Self {
+                answer: Ok(r#"{"verdict":"approve"}"#.to_string()),
+            }
+        }
+
+        fn rejecting(issue: &str) -> Self {
+            Self {
+                answer: Ok(format!(r#"{{"verdict":"request_changes","issues":["{issue}"]}}"#)),
+            }
+        }
+
+        fn broken() -> Self {
+            Self {
+                answer: Err("the backend is down".to_string()),
+            }
+        }
+    }
+
+    impl Reviewer for FakeReviewer {
+        fn review(&self, _request: &immortality_core::gate::ReviewRequest) -> Result<String, String> {
+            self.answer.clone()
+        }
     }
 
     fn registry(tools: Vec<Arc<dyn immortality_tools::Tool>>) -> Registry {
@@ -1604,18 +1855,335 @@ mod tests {
     }
 
     #[test]
-    fn a_claim_leaves_the_attempt_running_because_the_gates_have_not_run() {
-        // `Succeeded` means "claimed done and every gate passed". The runner has no gates, so
-        // writing it here would report a success no check ever confirmed — and `status` would
-        // show a finished attempt the scheduler never verified.
+    fn a_claim_with_green_gates_closes_the_attempt_and_the_subtask() {
+        // The one path that writes `Succeeded`: the model claimed, and every gate the `DoD`
+        // asked for actually passed.
+        let mut subtask = subtask();
+        subtask.dod = Dod::reviewed("trailing commas parse");
+        let gates = Arc::new(FakeGates::green());
         let model = Scripted::new(vec![Ok(finish())]);
-        let (dir, runner) = runner(model, registry(vec![Arc::new(Touch)]));
+        let (dir, mut runner) = runner(model, registry(vec![Arc::new(Touch)]));
+        runner.gates = Some(gates);
+        let mut journal = journal(&dir);
+        let outcome = runner.run(&subtask, 1, "", &mut journal).expect("run");
+
+        assert_eq!(outcome.attempt.state, AttemptState::Succeeded);
+        assert_eq!(outcome.attempt.failure, None);
+        assert!(outcome.attempt.finished_at.is_some());
+        // The runner closes the attempt and hands the verdict up. Writing `done` into the tree is
+        // the scheduler's job (D-078's order is tree first, then journal), so a `subtask_state`
+        // record here would be a closure the plan never received.
+        assert!(outcome.verified(), "{:?}", outcome.gates);
+        assert_eq!(
+            subtask_states(&dir),
+            Vec::new(),
+            "the runner must not announce the subtask done"
+        );
+    }
+
+    #[test]
+    fn a_claim_without_a_gate_runner_does_not_close_anything() {
+        // The wiring bug this closes: a runner that could not verify anything treated "no gates"
+        // as "no gates needed", and every caller that forgot to wire them was a bypass.
+        let model = Scripted::new(vec![Ok(finish())]);
+        let (dir, mut runner) = runner(model, registry(vec![Arc::new(Touch)]));
+        runner.gates = None;
         let mut journal = journal(&dir);
         let outcome = runner.run(&subtask(), 1, "", &mut journal).expect("run");
 
-        assert_eq!(outcome.attempt.state, AttemptState::Running);
-        assert_eq!(outcome.attempt.failure, None);
-        assert_eq!(outcome.attempt.finished_at, None);
+        assert_eq!(outcome.attempt.state, AttemptState::Failed);
+        assert_eq!(outcome.attempt.failure, Some(FailureReason::GateFailed));
+        assert!(
+            outcome.report.outcome.contains("cannot be verified"),
+            "{:?}",
+            outcome.report.outcome
+        );
+        assert!(
+            !subtask_states(&dir)
+                .iter()
+                .any(|(_, state)| *state == SubtaskState::Done)
+        );
+    }
+
+    #[test]
+    fn a_red_required_check_leaves_the_attempt_failed_and_names_it() {
+        let mut subtask = subtask();
+        subtask.dod = Dod {
+            statement: "the build is green".to_string(),
+            checks: vec![immortality_core::domain::DodCheck {
+                id: "build".to_string(),
+                command: "cargo build".to_string(),
+                required: true,
+            }],
+            review: false,
+        };
+        let gates = Arc::new(FakeGates::failing("cargo build"));
+        let model = Scripted::new(vec![Ok(finish())]);
+        let (dir, mut runner) = runner(model, registry(vec![Arc::new(Touch)]));
+        runner.gates = Some(gates);
+        let mut journal = journal(&dir);
+        let outcome = runner.run(&subtask, 1, "", &mut journal).expect("run");
+
+        assert_eq!(outcome.attempt.state, AttemptState::Failed);
+        assert_eq!(outcome.attempt.failure, Some(FailureReason::GateFailed));
+        assert!(
+            outcome.report.outcome.contains("build"),
+            "the next brief must name the check: {:?}",
+            outcome.report.outcome
+        );
+        assert!(
+            outcome
+                .report
+                .rejected_ideas
+                .iter()
+                .any(|idea| idea.contains("rejected")),
+            "{:?}",
+            outcome.report.rejected_ideas
+        );
+        assert!(
+            !subtask_states(&dir)
+                .iter()
+                .any(|(_, state)| *state == SubtaskState::Done)
+        );
+    }
+
+    #[test]
+    fn a_red_optional_check_does_not_block_the_close() {
+        // `cargo outdated` printing something is information. The flag is what distinguishes it
+        // from a gate, and this is the test that says so end to end.
+        let mut subtask = subtask();
+        subtask.dod = Dod {
+            statement: "the build is green".to_string(),
+            checks: vec![
+                immortality_core::domain::DodCheck {
+                    id: "outdated".to_string(),
+                    command: "cargo outdated".to_string(),
+                    required: false,
+                },
+                immortality_core::domain::DodCheck {
+                    id: "build".to_string(),
+                    command: "cargo build".to_string(),
+                    required: true,
+                },
+            ],
+            review: false,
+        };
+        let model = Scripted::new(vec![Ok(finish())]);
+        let (dir, mut runner) = runner(model, registry(vec![Arc::new(Touch)]));
+        runner.gates = Some(Arc::new(FakeGates::failing("cargo outdated")));
+        let mut journal = journal(&dir);
+        let outcome = runner.run(&subtask, 1, "", &mut journal).expect("run");
+
+        assert_eq!(
+            outcome.attempt.state,
+            AttemptState::Succeeded,
+            "{:?}",
+            outcome.attempt
+        );
+    }
+
+    #[test]
+    fn a_refused_check_is_not_a_passing_one_end_to_end() {
+        // The policy said no, so nothing ran. A gate that counted a refusal as success would be
+        // the exact bypass this milestone exists to close.
+        let mut subtask = subtask();
+        subtask.dod = Dod {
+            statement: "the tests pass".to_string(),
+            checks: vec![immortality_core::domain::DodCheck {
+                id: "test".to_string(),
+                command: "sudo cargo test".to_string(),
+                required: true,
+            }],
+            review: false,
+        };
+        let gates = Arc::new(FakeGates::refusing("sudo cargo test"));
+        let model = Scripted::new(vec![Ok(finish())]);
+        let (dir, mut runner) = runner(model, registry(vec![Arc::new(Touch)]));
+        runner.gates = Some(gates.clone());
+        let mut journal = journal(&dir);
+        let outcome = runner.run(&subtask, 1, "", &mut journal).expect("run");
+
+        assert_eq!(outcome.attempt.state, AttemptState::Failed);
+        assert_eq!(outcome.attempt.failure, Some(FailureReason::GateFailed));
+        assert_eq!(gates.ran(), Vec::<String>::new(), "nothing may run");
+    }
+
+    #[test]
+    fn a_reviewer_rejection_is_its_own_failure_reason() {
+        let model = Scripted::new(vec![Ok(finish())]);
+        let (dir, mut runner) = runner(model, registry(vec![Arc::new(Touch)]));
+        runner.reviewer = Some(Arc::new(FakeReviewer::rejecting(
+            "src/parser.rs still drops the trailing comma",
+        )));
+        let mut journal = journal(&dir);
+        let outcome = runner.run(&subtask(), 1, "", &mut journal).expect("run");
+
+        assert_eq!(outcome.attempt.state, AttemptState::Failed);
+        assert_eq!(outcome.attempt.failure, Some(FailureReason::ReviewRejected));
+        assert!(
+            outcome
+                .report
+                .rejected_ideas
+                .iter()
+                .any(|idea| idea.contains("trailing comma")),
+            "{:?}",
+            outcome.report.rejected_ideas
+        );
+    }
+
+    #[test]
+    fn a_missing_reviewer_with_a_reviewing_dod_does_not_close() {
+        // `DoD::reviewed` asks for a review. No reviewer means the gate could not run, and a gate
+        // that could not run is not an approval.
+        let model = Scripted::new(vec![Ok(finish())]);
+        let (dir, mut runner) = runner(model, registry(vec![Arc::new(Touch)]));
+        runner.reviewer = None;
+        let mut journal = journal(&dir);
+        let outcome = runner.run(&subtask(), 1, "", &mut journal).expect("run");
+
+        assert_eq!(outcome.attempt.state, AttemptState::Failed);
+        assert_eq!(outcome.attempt.failure, Some(FailureReason::ReviewRejected));
+    }
+
+    #[test]
+    fn a_reviewer_outage_is_not_an_approval() {
+        let model = Scripted::new(vec![Ok(finish())]);
+        let (dir, mut runner) = runner(model, registry(vec![Arc::new(Touch)]));
+        runner.reviewer = Some(Arc::new(FakeReviewer::broken()));
+        let mut journal = journal(&dir);
+        let outcome = runner.run(&subtask(), 1, "", &mut journal).expect("run");
+
+        assert_eq!(outcome.attempt.state, AttemptState::Failed);
+        assert_eq!(outcome.attempt.failure, Some(FailureReason::ReviewRejected));
+    }
+
+    #[test]
+    fn a_sanity_finding_stops_the_commands_and_the_reviewer() {
+        // Cheap-first is a token budget: a diff that adds a private key is already failed, and
+        // paying for a two-minute suite and a model call before saying so is waste.
+        let mut subtask = subtask();
+        subtask.dod = Dod {
+            statement: "the build is green".to_string(),
+            checks: vec![immortality_core::domain::DodCheck {
+                id: "build".to_string(),
+                command: "cargo build".to_string(),
+                required: true,
+            }],
+            review: true,
+        };
+        let mut diff = immortality_core::gate::Diff::default();
+        diff.files.push(immortality_core::gate::ChangedFile {
+            path: PathBuf::from("src/config.rs"),
+            status: immortality_core::gate::FileStatus::Modified,
+            binary: false,
+            added_lines: vec!["-----BEGIN RSA PRIVATE KEY-----".to_string()],
+        });
+        let gates = Arc::new(FakeGates::with_diff(diff));
+        let model = Scripted::new(vec![Ok(finish())]);
+        let (dir, mut runner) = runner(model, registry(vec![Arc::new(Touch)]));
+        runner.gates = Some(gates.clone());
+        // A reviewer that rejects everything: if it were called, the failure reason would be
+        // `ReviewRejected`, so the assertion below also proves it was not.
+        runner.reviewer = Some(Arc::new(FakeReviewer::rejecting("anything")));
+        let mut journal = journal(&dir);
+        let outcome = runner.run(&subtask, 1, "", &mut journal).expect("run");
+
+        assert_eq!(outcome.attempt.failure, Some(FailureReason::GateFailed));
+        assert_eq!(gates.ran(), Vec::<String>::new(), "no command may run");
+        assert!(
+            outcome.report.outcome.contains("private key"),
+            "{:?}",
+            outcome.report.outcome
+        );
+    }
+
+    #[test]
+    fn the_gate_records_are_written_in_the_order_they_ran() {
+        // The journal is the post-mortem. A verdict written before the check it decided would
+        // read as a cause after its effect.
+        let mut subtask = subtask();
+        subtask.dod = Dod::reviewed("trailing commas parse");
+        let model = Scripted::new(vec![Ok(finish())]);
+        let (dir, mut runner) = runner(model, registry(vec![Arc::new(Touch)]));
+        runner.gates = Some(Arc::new(FakeGates::green()));
+        let mut journal = journal(&dir);
+        runner.run(&subtask, 1, "", &mut journal).expect("run");
+
+        let gates: Vec<String> = journal_records(&dir)
+            .into_iter()
+            .filter(|record| record.fields.kind == Kind::GateResult)
+            .filter_map(|record| {
+                record
+                    .event
+                    .payload
+                    .get("gate")
+                    .and_then(|gate| gate.as_str())
+                    .map(str::to_string)
+            })
+            .collect();
+        assert_eq!(gates, vec!["sanity", "review", "verdict"], "{gates:?}");
+    }
+
+    #[test]
+    fn a_gate_record_carries_the_attempt_scope() {
+        // Recovery keys attempts by `(subtask, attempt)`. A gate record without the scope is
+        // invisible to it, which is how a rejected claim would look like an open attempt.
+        let model = Scripted::new(vec![Ok(finish())]);
+        let (dir, runner) = runner(model, registry(vec![Arc::new(Touch)]));
+        let subtask = subtask();
+        let mut journal = journal(&dir);
+        runner.run(&subtask, 3, "", &mut journal).expect("run");
+
+        let gate_records: Vec<_> = journal_records(&dir)
+            .into_iter()
+            .filter(|record| record.fields.kind == Kind::GateResult)
+            .collect();
+        assert_ne!(gate_records, Vec::new());
+        for record in gate_records {
+            assert_eq!(record.fields.subtask.as_ref(), Some(&subtask.id));
+            assert_eq!(record.fields.attempt, Some(3));
+        }
+    }
+
+    #[test]
+    fn the_verdict_record_is_last_and_says_whether_the_claim_passed() {
+        let model = Scripted::new(vec![Ok(finish())]);
+        let (dir, runner) = runner(model, registry(vec![Arc::new(Touch)]));
+        let mut journal = journal(&dir);
+        runner.run(&subtask(), 1, "", &mut journal).expect("run");
+
+        let verdict = journal_records(&dir)
+            .into_iter()
+            .rfind(|record| record.fields.kind == Kind::GateResult)
+            .expect("a gate record")
+            .event
+            .payload;
+        assert_eq!(verdict["gate"], "verdict");
+        assert_eq!(verdict["passed"], true);
+    }
+
+    /// The subtask-state records in the journal, as `(kind, state)` pairs.
+    fn subtask_states(dir: &tempfile::TempDir) -> Vec<(Kind, SubtaskState)> {
+        journal_records(dir)
+            .into_iter()
+            .filter(|record| record.fields.kind == Kind::SubtaskState)
+            .filter_map(|record| {
+                let state: SubtaskState =
+                    serde_json::from_value(record.event.payload.get("state")?.clone()).ok()?;
+                Some((record.fields.kind, state))
+            })
+            .collect()
+    }
+
+    fn journal_records(dir: &tempfile::TempDir) -> Vec<immortality_core::journal::JournalRecord> {
+        immortality_core::journal::JournalReader::open(
+            dir.path().join("journal"),
+            &TaskId::from_suffix("01ARZ3NDEKTSV4RRFFQ69G5FAJ"),
+        )
+        .expect("reader")
+        .read()
+        .expect("records")
+        .records
     }
 
     #[test]

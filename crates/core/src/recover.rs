@@ -633,8 +633,15 @@ struct AttemptSets {
 
 /// Attempts the journal started, and attempts it closed.
 ///
-/// Closed means *ended*: failed, restarted, or implicitly succeeded when the subtask was marked
-/// done. There is no `attempt_succeeded` kind, because success is a property of the subtask.
+/// Closed means *ended*: failed, restarted, passed its gates, or implicitly succeeded when the
+/// subtask was marked done. There is no `attempt_succeeded` kind, because success is a property
+/// of the gates rather than of the attempt: the runner writes its `gate_result` verdict and stops,
+/// and the scheduler closes the subtask afterwards.
+///
+/// The green-verdict arm is load-bearing rather than decorative. A verified attempt has no
+/// `attempt_failed` record — it did not fail — so without this rule it would look open to
+/// recovery, and the next start would abandon an attempt whose work is exactly what the tree is
+/// about to close.
 fn attempt_sets(input: &RecoveryInput<'_>) -> AttemptSets {
     let mut started = BTreeSet::new();
     let mut closed = BTreeSet::new();
@@ -650,6 +657,9 @@ fn attempt_sets(input: &RecoveryInput<'_>) -> AttemptSets {
             Kind::AttemptFailed | Kind::AttemptRestarted => {
                 closed.insert(key);
             }
+            Kind::GateResult if gate_verdict_passed(record) => {
+                closed.insert(key);
+            }
             Kind::SubtaskState if subtask_state_of(record) == Some(SubtaskState::Done) => {
                 closed.insert(key);
             }
@@ -657,6 +667,16 @@ fn attempt_sets(input: &RecoveryInput<'_>) -> AttemptSets {
         }
     }
     AttemptSets { started, closed }
+}
+
+/// Whether a record is the `gate_result` verdict that says the claim passed.
+///
+/// Anything unreadable is not a pass: a malformed verdict record must not be the reason an
+/// attempt is considered closed, because closing means "this work is verified".
+fn gate_verdict_passed(record: &JournalRecord) -> bool {
+    let payload = &record.event.payload;
+    payload.get("gate").and_then(|gate| gate.as_str()) == Some("verdict")
+        && payload.get("passed").and_then(serde_json::Value::as_bool) == Some(true)
 }
 
 /// Compare the cache files with what the journal actually says.
@@ -1699,6 +1719,117 @@ mod tests {
             report.divergences.as_slice(),
             [Divergence::AttemptClosedInJournal { number: 1, .. }]
         ));
+    }
+
+    #[test]
+    fn a_green_gate_verdict_closes_the_attempt_without_a_subtask_state() {
+        // A verified attempt has no `attempt_failed`: it did not fail. If only `attempt_failed`
+        // and `subtask_state = done` closed attempts, a crash between the verdict and the
+        // scheduler's write would make recovery abandon work the tree is about to close.
+        let journal = outcome(vec![
+            scoped(0, 1, Kind::AttemptStarted, serde_json::json!({})),
+            scoped(
+                1,
+                1,
+                Kind::GateResult,
+                serde_json::json!({ "gate": "verdict", "passed": true }),
+            ),
+        ]);
+        let persisted = PersistedState {
+            attempts: vec![PersistedAttempt {
+                subtask: subtask(),
+                number: 1,
+                finished: false,
+            }],
+            subtasks: Vec::new(),
+        };
+        let report = plan(
+            &input(
+                &journal,
+                WorkspaceFacts::healthy("agent/tsk_01", "abc"),
+                persisted,
+            ),
+            &NoProbe,
+        );
+        assert!(matches!(
+            report.divergences.as_slice(),
+            [Divergence::AttemptClosedInJournal { number: 1, .. }]
+        ));
+    }
+
+    #[test]
+    fn a_red_gate_verdict_does_not_close_the_attempt() {
+        // A red claim is closed by `attempt_failed`, which the runner writes. Treating a red
+        // verdict as a closure here would make a failed attempt look finished and successful.
+        let journal = outcome(vec![
+            scoped(0, 1, Kind::AttemptStarted, serde_json::json!({})),
+            scoped(
+                1,
+                1,
+                Kind::GateResult,
+                serde_json::json!({ "gate": "verdict", "passed": false }),
+            ),
+        ]);
+        let persisted = PersistedState {
+            attempts: vec![PersistedAttempt {
+                subtask: subtask(),
+                number: 1,
+                finished: true,
+            }],
+            subtasks: Vec::new(),
+        };
+        let report = plan(
+            &input(
+                &journal,
+                WorkspaceFacts::healthy("agent/tsk_01", "abc"),
+                persisted,
+            ),
+            &NoProbe,
+        );
+        assert!(matches!(
+            report.divergences.as_slice(),
+            [Divergence::AttemptOpenInJournal { number: 1, .. }]
+        ));
+    }
+
+    #[test]
+    fn a_malformed_gate_record_is_not_a_pass() {
+        // `passed: "yes"` and a missing `gate` tag are both "not the verdict". A lenient read
+        // here would let a corrupt line close an attempt nobody verified.
+        for payload in [
+            serde_json::json!({ "gate": "verdict", "passed": "yes" }),
+            serde_json::json!({ "passed": true }),
+            serde_json::json!({ "gate": "check", "passed": true }),
+            serde_json::json!({}),
+        ] {
+            let journal = outcome(vec![
+                scoped(0, 1, Kind::AttemptStarted, serde_json::json!({})),
+                scoped(1, 1, Kind::GateResult, payload.clone()),
+            ]);
+            let persisted = PersistedState {
+                attempts: vec![PersistedAttempt {
+                    subtask: subtask(),
+                    number: 1,
+                    finished: true,
+                }],
+                subtasks: Vec::new(),
+            };
+            let report = plan(
+                &input(
+                    &journal,
+                    WorkspaceFacts::healthy("agent/tsk_01", "abc"),
+                    persisted,
+                ),
+                &NoProbe,
+            );
+            assert!(
+                matches!(
+                    report.divergences.as_slice(),
+                    [Divergence::AttemptOpenInJournal { number: 1, .. }]
+                ),
+                "{payload} was read as a closure"
+            );
+        }
     }
 
     #[test]

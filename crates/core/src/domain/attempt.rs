@@ -28,7 +28,10 @@ use super::{AttemptId, NonceTag, StatusError, SubtaskId, Timestamp};
 pub enum AttemptState {
     /// Steps are being executed right now.
     Running,
-    /// The model claimed done and every gate passed.
+    /// The model claimed done and every gate the `DoD` asked for passed.
+    ///
+    /// Written by the runner after the verdict, never on the claim alone: a claim is one model
+    /// sentence, and `Succeeded` means the system verified the work (D-079).
     Succeeded,
     /// The attempt ended without passing: budget exhausted, tool error, or a red gate.
     Failed,

@@ -100,7 +100,7 @@ logs/2026-10.log.gz      # архивы по месяцам
 | `checkpoint_created` | git-чекпоинт и его SHA |
 | `detector_fired` | `d1`…`d5`, уровень `l1`…`l3`, счётчик-метрика; одна запись на шаг (D-077) |
 | `compaction` | компактация контекста |
-| `gate_result` | сборка/тесты/линт/reviewer |
+| `gate_result` | один гейт: тег `gate` — `sanity` (находки), `check` (id, команда, код, длительность, required), `review` (одобрено, проблемы) или `verdict` (прошло, причина, почему). Вердикт всегда последний; `gate: verdict` + `passed: true` закрывает попытку и в recovery (D-079) |
 | `escalation_opened`, `escalation_resolved` | очередь эскалаций (D-067) |
 | `backend_unavailable`, `backend_restored` | сеть/бэкенд |
 | `cache_stats` | `cache_n` / `prompt_n` на запрос — метрика здоровья кэша |

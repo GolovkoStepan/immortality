@@ -10,6 +10,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 pub mod doctor;
+pub mod gates;
 pub mod rpc;
 pub mod runner;
 pub mod server;

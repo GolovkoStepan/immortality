@@ -27,6 +27,7 @@ pub mod detect;
 pub mod domain;
 pub mod error;
 pub mod escalation;
+pub mod gate;
 pub mod gc;
 pub mod ids;
 pub mod journal;
