@@ -545,6 +545,31 @@ async fn status_counts_the_open_escalations() {
     assert_eq!(result["tasks"][0]["open_escalations"], 2);
 }
 
+// ── metrics ───────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn metrics_is_reachable_over_the_socket_and_counts_this_tasks_records() {
+    // `METHODS` advertises the method, and the refusal for an unknown one lists it, so a method
+    // that is listed but has no dispatch arm would tell a client to call something that always
+    // fails. Calling it through the transport is what proves the arm exists.
+    let fixture = Fixture::new();
+    fixture.journal_records(&task(), 3);
+    std::fs::create_dir_all(fixture.task_dir(&task())).unwrap();
+    let _server = fixture.serve();
+
+    let mut client = fixture.client().await;
+    let result = client
+        .request("metrics", json!({"task": task().as_str()}))
+        .await
+        .result
+        .expect("metrics must be dispatched");
+    assert_eq!(result["count"], 1);
+    assert_eq!(result["tasks"][0]["task"], task().as_str());
+    // Three `task_state` records and no subtask announcement: the task ran and nothing settled.
+    assert_eq!(result["tasks"][0]["records"], 3);
+    assert_eq!(result["tasks"][0]["closed_green"], 0);
+}
+
 // ── escalations and approve ───────────────────────────────────────────────────
 
 #[tokio::test]
