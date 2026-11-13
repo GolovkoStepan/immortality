@@ -166,7 +166,18 @@ impl Events {
     /// A fresh broadcast channel.
     #[must_use]
     pub fn new() -> Self {
-        let (sender, _) = broadcast::channel(EVENT_BUFFER);
+        Self::with_capacity(EVENT_BUFFER)
+    }
+
+    /// A channel that holds `capacity` records before the oldest are dropped.
+    ///
+    /// The capacity is a parameter because a test that must observe a *laggard* cannot write the
+    /// production thousand-and-one records: each append is an `fsync`, so the test would spend
+    /// seconds proving a buffer size rather than the catch-up path. Production only ever calls
+    /// [`Events::new`], which supplies [`EVENT_BUFFER`].
+    #[must_use]
+    pub fn with_capacity(capacity: usize) -> Self {
+        let (sender, _) = broadcast::channel(capacity.max(1));
         Self { sender }
     }
 
@@ -183,6 +194,17 @@ impl Events {
     #[must_use]
     pub fn subscribe(&self) -> broadcast::Receiver<Arc<JournalRecord>> {
         self.sender.subscribe()
+    }
+
+    /// How many subscriptions are live right now.
+    ///
+    /// Not used in the daemon's own logic: this is the honest way for a test to tell "the
+    /// connection ended" from "the connection ended and took its subscription with it". A
+    /// connection task that outlives its socket keeps a slot in the broadcast forever, and a long
+    /// run with a few reconnects a day accumulates them invisibly.
+    #[must_use]
+    pub fn receiver_count(&self) -> usize {
+        self.sender.receiver_count()
     }
 }
 
@@ -347,8 +369,8 @@ async fn connection(stream: UnixStream, state: &ServerState, events: &Events) ->
                 .get("task")
                 .and_then(Value::as_str)
                 .and_then(|task| TaskId::parse(task).ok());
-            // From here the connection is a stream until the client leaves or falls behind.
-            return stream_events(&mut write, &mut subscriber, task.as_ref(), after).await;
+            // From here the connection is a stream until the client leaves.
+            return stream_events(state, &mut write, &mut subscriber, task.as_ref(), after).await;
         }
     }
 }
@@ -431,35 +453,92 @@ async fn read_bounded_line<R: tokio::io::AsyncBufRead + Unpin>(
 /// was already filtered: the broadcast carries every task of every project on this daemon, so a
 /// stream without these two guards would hand a client another task's work.
 async fn stream_events(
+    state: &ServerState,
     write: &mut tokio::net::unix::OwnedWriteHalf,
     subscriber: &mut broadcast::Receiver<Arc<JournalRecord>>,
     task: Option<&TaskId>,
     after: u64,
 ) -> std::io::Result<()> {
+    // The highest sequence number this client has been sent. It is the watermark both paths use:
+    // the broadcast is dropped below it (a duplicate), and the catch-up reads above it (a gap).
+    let mut watermark = after;
     loop {
         match subscriber.recv().await {
             Ok(record) => {
-                if record.fields.seq < after {
+                if record.fields.seq < watermark {
                     continue;
                 }
                 if task.is_some_and(|task| &record.fields.task != task) {
                     continue;
                 }
-                let event = Event {
-                    record: serde_json::to_value(&*record).map_err(|error| encode_error(&error))?,
-                };
-                write_line(write, &event).await?;
+                write_record(write, &record).await?;
+                watermark = record.fields.seq + 1;
             }
-            // The client fell behind and the buffer dropped records. The journal is the source
-            // of truth, so the honest answer is to stop and let it re-attach with `since_seq`
-            // rather than to serve it a stream with a hole in it.
+            // The client fell behind and the broadcast dropped `skipped` records. The journal is
+            // the source of truth and holds every one of them, so the honest answer is to read
+            // them back and keep streaming — not to close the connection and hope the client
+            // notices. A client that re-attached on every lag would lose the tail again while it
+            // reconnected, which is how a human watching a long run ends up with holes.
             Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                tracing::debug!("attached client lagged by {skipped} records; closing");
-                return Ok(());
+                tracing::debug!("attached client lagged by {skipped} records; catching up from the journal");
+                match catch_up(state, write, task, watermark).await {
+                    Ok(Some(last)) => watermark = last,
+                    // No journal to read (the task is gone, or the file cannot be parsed). Closing
+                    // is correct here: a stream with an unexplained hole is worse than one that
+                    // ends, and the client's own re-attach is what surfaces the reason.
+                    Ok(None) => return Ok(()),
+                    Err(error) => return Err(error),
+                }
             }
             Err(broadcast::error::RecvError::Closed) => return Ok(()),
         }
     }
+}
+
+/// Send every record after `after` from the journal, returning the next sequence number.
+///
+/// Returns `Ok(None)` when there is no journal to catch up from, which the caller treats as "end
+/// the stream": a laggard whose records cannot be read is better off re-attaching and getting the
+/// error than watching a stream that silently skipped a stretch of a day's work.
+async fn catch_up(
+    state: &ServerState,
+    write: &mut tokio::net::unix::OwnedWriteHalf,
+    task: Option<&TaskId>,
+    after: u64,
+) -> std::io::Result<Option<u64>> {
+    // A catch-up without a task is not possible: the journal is per repository, and without the
+    // filter the client would receive every other task's records too. `attach` always names one,
+    // so this is a caller that reached the stream some other way.
+    let Some(task) = task else {
+        return Ok(None);
+    };
+    let Ok(dir) = state.journal_dir(task) else {
+        return Ok(None);
+    };
+    let Ok(outcome) = JournalReader::open(&dir, task).and_then(|reader| reader.read()) else {
+        return Ok(None);
+    };
+    let mut last = after;
+    for record in outcome
+        .records
+        .iter()
+        .filter(|record| &record.fields.task == task && record.fields.seq >= after)
+    {
+        write_record(write, record).await?;
+        last = record.fields.seq + 1;
+    }
+    Ok(Some(last))
+}
+
+/// One record as an event line.
+async fn write_record(
+    write: &mut tokio::net::unix::OwnedWriteHalf,
+    record: &JournalRecord,
+) -> std::io::Result<()> {
+    let event = Event {
+        record: serde_json::to_value(record).map_err(|error| encode_error(&error))?,
+    };
+    write_line(write, &event).await
 }
 
 /// A serialization failure, as an I/O error the connection loop already handles.

@@ -1052,3 +1052,197 @@ fn escalation_answers_keep_their_wire_names() {
     assert_eq!(Answer::ALL.len(), 3);
     assert_eq!(Answer::AllowOnce.as_str(), "allow_once");
 }
+
+// ── attach and disconnect ────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn a_disconnected_client_stops_receiving_and_takes_its_subscription_with_it() {
+    // The roadmap's "unsubscribe without leaks". The broadcast keeps a slot per live receiver; a
+    // connection task that outlived its socket would hold one forever, and a long run with a few
+    // reconnects per day would accumulate them.
+    //
+    // What is observable from outside is the consequence: after the client is gone, publishing
+    // must not fail, and a fresh client must still see the backlog. A daemon that kept the dead
+    // subscription would still pass that, so the assertion is on the broadcast's receiver count —
+    // the one number that says whether the task ended.
+    let fixture = Fixture::new();
+    std::fs::create_dir_all(fixture.task_dir(&task())).unwrap();
+
+    let listener = server::bind(&fixture.socket).unwrap();
+    let state = fixture.server_state();
+    let events = Events::new();
+    let server_events = events.clone();
+    let server = tokio::spawn(async move {
+        let _ = server::serve(listener, state, events).await;
+    });
+
+    // Subscribe directly, too, so the count is comparable before and after the connection dies.
+    let before = server_events.receiver_count();
+
+    let mut client = fixture.client().await;
+    client
+        .request("attach", json!({"task": task().as_str()}))
+        .await
+        .result
+        .unwrap();
+    assert_eq!(
+        server_events.receiver_count(),
+        before + 1,
+        "an attached client is one receiver"
+    );
+
+    drop(client);
+
+    // The daemon notices the closed socket on its next write; publishing gives it that write.
+    let mut journal = Journal::open(fixture.agent_dir(), task()).unwrap();
+    let record = journal
+        .append_event(immortality_core::time::now(), Kind::TaskState, json!({"n": 0}))
+        .unwrap();
+    server_events.publish(Arc::new(record));
+
+    // Give the connection task a chance to observe the broken pipe and return.
+    for _ in 0..50 {
+        if server_events.receiver_count() == before {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        server_events.receiver_count(),
+        before,
+        "a disconnected client must not leave its subscription behind"
+    );
+
+    // And the daemon is still serving: a new client gets the backlog.
+    let mut fresh = fixture.client().await;
+    let result = fresh
+        .request("attach", json!({"task": task().as_str()}))
+        .await
+        .result
+        .unwrap();
+    assert_eq!(result["backlog"].as_array().unwrap().len(), 1);
+    server.abort();
+}
+
+// ── a lagging client ─────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn a_client_that_falls_behind_catches_up_from_the_journal_instead_of_losing_records() {
+    // The roadmap's "a client ten thousand events behind catches up" requirement, made testable:
+    // the broadcast buffers a few records, the client stops reading while more arrive, and the
+    // daemon must read the missing stretch back from the journal.
+    //
+    // Closing the connection here — what the daemon used to do — is not a catch-up. The client
+    // would re-attach, race another batch, and a human watching a long run would see holes with
+    // no explanation.
+    let fixture = Fixture::new();
+    std::fs::create_dir_all(fixture.task_dir(&task())).unwrap();
+
+    // A buffer of three, so the tenth publish certainly overruns it.
+    let listener = server::bind(&fixture.socket).unwrap();
+    let state = fixture.server_state();
+    let events = Events::with_capacity(3);
+    let server_events = events.clone();
+    tokio::spawn(async move {
+        let _ = server::serve(listener, state, events).await;
+    });
+
+    let mut client = fixture.client().await;
+    let result = client
+        .request("attach", json!({"task": task().as_str()}))
+        .await
+        .result
+        .unwrap();
+    assert_eq!(result["next_seq"], 0);
+
+    // No reading in between: the connection's socket buffer fills, then the broadcast overruns.
+    let mut written = Vec::new();
+    {
+        let mut journal = Journal::open(fixture.agent_dir(), task()).unwrap();
+        for index in 0..10 {
+            let record = journal
+                .append_event(
+                    immortality_core::time::now(),
+                    Kind::ToolCallCompleted,
+                    json!({"call": format!("call_{index}"), "n": index}),
+                )
+                .unwrap();
+            written.push(record.fields.seq);
+            server_events.publish(Arc::new(record));
+        }
+    }
+
+    // Every record, in order, exactly once. A duplicate would be caught by the set; a gap by the
+    // sequence check. Both matter: `tool_call_completed` twice is what recovery is built to
+    // distrust, and a missing one is a step the human never sees.
+    let mut seen = Vec::new();
+    for _ in 0..written.len() {
+        let event = client.read_event().await;
+        seen.push(event["seq"].as_u64().unwrap());
+    }
+    assert_eq!(
+        seen, written,
+        "the catch-up must deliver every record once, in order"
+    );
+}
+
+#[tokio::test]
+async fn a_lagging_client_gets_the_right_tasks_records_and_no_others() {
+    // The catch-up reads the repository-wide journal, so it needs the same filter the live stream
+    // has. Without it, a laggard is served another task's work as if it were its own.
+    let fixture = Fixture::new();
+    std::fs::create_dir_all(fixture.task_dir(&task())).unwrap();
+    std::fs::create_dir_all(fixture.task_dir(&other_task())).unwrap();
+
+    let listener = server::bind(&fixture.socket).unwrap();
+    let state = fixture.server_state();
+    let events = Events::with_capacity(2);
+    let server_events = events.clone();
+    tokio::spawn(async move {
+        let _ = server::serve(listener, state, events).await;
+    });
+
+    let mut client = fixture.client().await;
+    client
+        .request("attach", json!({"task": task().as_str()}))
+        .await
+        .result
+        .unwrap();
+
+    // Genuinely interleaved, and more than the buffer holds: the catch-up reads one journal that
+    // contains both tasks, so a block layout would let an unfiltered read look correct simply
+    // because this task's records happened to come first.
+    let mut mine = Vec::new();
+    let mut journal = Journal::open(fixture.agent_dir(), task()).unwrap();
+    let mut theirs = Journal::open(fixture.agent_dir(), other_task()).unwrap();
+    for index in 0..6 {
+        let mine_record = journal
+            .append_event(
+                immortality_core::time::now(),
+                Kind::ToolCallCompleted,
+                json!({"call": format!("mine_{index}")}),
+            )
+            .unwrap();
+        mine.push(mine_record.fields.seq);
+        server_events.publish(Arc::new(mine_record));
+
+        let theirs_record = theirs
+            .append_event(
+                immortality_core::time::now(),
+                Kind::ToolCallCompleted,
+                json!({"call": format!("theirs_{index}")}),
+            )
+            .unwrap();
+        server_events.publish(Arc::new(theirs_record));
+    }
+
+    for expected in &mine {
+        let event = client.read_event().await;
+        assert_eq!(
+            event["seq"].as_u64().unwrap(),
+            *expected,
+            "a gap or another task's record"
+        );
+        assert_eq!(event["task"], task().as_str());
+    }
+}
