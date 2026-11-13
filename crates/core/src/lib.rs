@@ -31,6 +31,7 @@ pub mod ids;
 pub mod journal;
 pub mod logging;
 pub mod paths;
+pub mod plan;
 pub mod protocol;
 pub mod recover;
 pub mod registry;
