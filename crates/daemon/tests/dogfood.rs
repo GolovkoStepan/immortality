@@ -139,6 +139,22 @@ fn every_dogfood_task_has_the_three_files_the_daemon_reads() {
     }
 }
 
+/// Apply `patches` (path, `old`, `new`) to the admitted repository, the way a model would.
+///
+/// Exact text replacement rather than a whole-file write: a patch that no longer matches is a
+/// fixture that drifted, and silently writing a file would hide that.
+fn apply(repo: &Path, patches: &[(&str, &str, &str)]) {
+    for (path, old, new) in patches {
+        let full = repo.join(path);
+        let text = std::fs::read_to_string(&full).expect("read the file to patch");
+        assert!(
+            text.contains(old),
+            "the patch for {path} no longer matches; the fixture drifted:\n{text}"
+        );
+        std::fs::write(&full, text.replacen(old, new, 1)).expect("write the patch");
+    }
+}
+
 /// Whether `cargo test --offline` in `dir` fails, with its output for the message.
 fn gate_fails(dir: &Path) -> Result<(), String> {
     let gate = Command::new("cargo")
@@ -492,4 +508,102 @@ fn a_dogfood_task_reaches_ready_for_review_through_the_real_gate() {
     assert_eq!(report.closed_green, 1, "{report:?}");
     assert_eq!(report.closed_with_escalation, 0, "{report:?}");
     assert_eq!(report.escalations_pending, 0, "{report:?}");
+}
+
+/// The smallest honest fix for each task, as a model reading the failing spec would write it.
+///
+/// # Why this is a test
+///
+/// A fixture whose gate cannot go green is worse than no fixture: it reports "the model failed"
+/// for a task no model could pass, and the milestone's bar would be unreachable for a reason
+/// outside the agent. Red-before-work is only half the property; green-after-a-real-fix is the
+/// other half, and it is the half nobody notices is missing until three live runs fail the same
+/// way.
+fn fixes(name: &str) -> Vec<(&'static str, &'static str, &'static str)> {
+    match name {
+        "line-count" => vec![(
+            "src/count.rs",
+            "    text.split('\\n').count()",
+            "    text.split('\\n').count() - usize::from(text.ends_with('\\n'))",
+        )],
+        "word-count" => vec![
+            (
+                "src/count.rs",
+                "/// Number of distinct words, compared case-insensitively.",
+                "/// Number of words that appear exactly once, compared case-insensitively.\n\
+                 pub fn once_words(text: &str) -> usize {\n\
+                 \x20   let mut counts: std::collections::BTreeMap<String, usize> =\n\
+                 \x20       std::collections::BTreeMap::new();\n\
+                 \x20   for word in text.split_whitespace() {\n\
+                 \x20       *counts.entry(normalise(word)).or_default() += 1;\n\
+                 \x20   }\n\
+                 \x20   counts.values().filter(|count| **count == 1).count()\n\
+                 }\n\n\
+                 /// Number of distinct words, compared case-insensitively.",
+            ),
+            (
+                "src/main.rs",
+                "    println!(\"unique: {}\", count::unique_words(&text));",
+                "    println!(\"unique: {}\", count::unique_words(&text));\n\
+                 \x20   println!(\"once: {}\", count::once_words(&text));",
+            ),
+        ],
+        "dedupe" => vec![(
+            "src/count.rs",
+            "pub fn unique_words(text: &str) -> usize {\n\
+             \x20   let mut seen: Vec<String> = Vec::new();\n\
+             \x20   for word in text.split_whitespace() {\n\
+             \x20       let normalised = normalise(word);\n\
+             \x20       if !seen.contains(&normalised) {\n\
+             \x20           seen.push(normalised);\n\
+             \x20       }\n\
+             \x20   }\n\
+             \x20   seen.len()\n\
+             }",
+            "pub fn unique_words(text: &str) -> usize {\n\
+             \x20   unique_words_sorted(text).len()\n\
+             }\n\n\
+             /// The same normalised words as [`unique_words`], sorted.\n\
+             pub fn unique_words_sorted(text: &str) -> Vec<String> {\n\
+             \x20   let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();\n\
+             \x20   for word in text.split_whitespace() {\n\
+             \x20       seen.insert(normalise(word));\n\
+             \x20   }\n\
+             \x20   seen.into_iter().collect()\n\
+             }",
+        )],
+        other => panic!("no fix recorded for `{other}`; every dogfood task needs one"),
+    }
+}
+
+#[test]
+fn every_dogfood_task_can_be_made_green_by_a_plausible_fix() {
+    // The other half of "the gate is red before the work". A gate that nothing can satisfy makes
+    // every run fail for a reason that has nothing to do with the agent, and the failure reads
+    // exactly like a model that could not do the job. So each task's spec must be green after the
+    // kind of edit the goal asks for, and the existing tests must stay green with it.
+    for task in tasks() {
+        let name = task.file_name().expect("name").to_string_lossy().into_owned();
+        let scratch = tempfile::tempdir().expect("tempdir");
+        let target = scratch.path().join("repo");
+        admit_into(&name, &target);
+        if let Err(message) = gate_fails(&target) {
+            panic!("{name} is green before the fix: {message}");
+        }
+
+        apply(&target, &fixes(&name));
+
+        let gate = Command::new("cargo")
+            .args(["test", "--offline", "--quiet"])
+            .current_dir(&target)
+            .env("CARGO_TERM_COLOR", "never")
+            .output()
+            .expect("run the gate");
+        assert!(
+            gate.status.success(),
+            "{name} is still red after a plausible fix, so no run could pass it; stdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&gate.stdout),
+            String::from_utf8_lossy(&gate.stderr)
+        );
+    }
 }

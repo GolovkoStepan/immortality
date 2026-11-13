@@ -37,6 +37,12 @@ The specifications live in `tests/` rather than inside `src/count.rs` for a seco
 that does not exist yet is not a gate at all. `cargo test nothing_matches` exits zero, so "the test
 the agent has not written" would be green for free.
 
+The other half of that property is that the gate **can** go green. A task no honest fix can
+satisfy reports "the model failed" for a reason outside the agent, and it reads exactly like a
+model that could not do the job. `tests/dogfood.rs` therefore applies the smallest plausible fix
+each goal asks for (a real one: the `BTreeSet` in `dedupe` is the refactor, not a stub) and requires
+its gate to pass. Red before, green after, both run in CI.
+
 There is a third way the gate can never go green, and it is the one that looks like success until
 you watch it: the gate is `cargo test`, whose diff is taken against the worktree and includes every
 untracked file. Without a `.gitignore` the gate's own `target/` enters that diff, the sanity scan
