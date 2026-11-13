@@ -702,7 +702,11 @@ fn tear_tail(dir: &Path) {
 struct Fixed(ProbeAnswer);
 
 impl Prober for Fixed {
-    fn probe(&self, _intent: &immortality_core::protocol::Intent) -> ProbeAnswer {
+    fn probe(
+        &self,
+        _intent: &immortality_core::protocol::Intent,
+        _arguments: Option<&serde_json::Value>,
+    ) -> ProbeAnswer {
         self.0
     }
 }

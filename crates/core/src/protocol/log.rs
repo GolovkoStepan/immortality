@@ -234,6 +234,13 @@ fn with_call(call: &CallId, payload: serde_json::Value) -> serde_json::Value {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FoundOpenCall {
     pub open: OpenCall,
+    /// The tool arguments, as the `intent` record stored them.
+    ///
+    /// Carried because "did this write land?" is unanswerable from the metadata alone: the
+    /// digest says *which* arguments were used, but comparing the file on disk needs the
+    /// content, and `None` here (an older record without `arguments`, or a truncated payload)
+    /// means a `ByContent` probe cannot answer anything but `Unknown`.
+    pub arguments: Option<serde_json::Value>,
     /// `seq` of the `intent` record, so a human can jump to it in the file.
     pub intent_seq: u64,
     /// `seq` of the `started` record, if any.
@@ -282,6 +289,7 @@ pub fn open_calls(records: &[crate::journal::JournalRecord]) -> Vec<FoundOpenCal
                             started: false,
                             marked_unknown: false,
                         },
+                        arguments: record.event.payload.get("arguments").cloned(),
                         intent_seq: record.fields.seq,
                         started_seq: None,
                     },
@@ -503,6 +511,35 @@ mod tests {
         );
         assert_eq!(found[0].intent_seq, 0);
         assert_eq!(found[0].started_seq, None);
+    }
+
+    #[test]
+    fn open_calls_carries_the_stored_arguments() {
+        // The probe for a `ByContent` call has to compare the file against the requested
+        // content. The digest says which arguments were used but cannot be compared to bytes,
+        // so losing the object here would make every interrupted write answer `Unknown` and roll
+        // back work that had actually landed.
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal = open(dir.path());
+        {
+            let mut log = ToolCallLog::new(&mut journal);
+            let call = intent("call_args", Idempotency::ByContent);
+            log.intent(
+                &call,
+                &serde_json::json!({"path": "src/lib.rs", "content": "fn main() {}\n"}),
+            )
+            .unwrap();
+            log.started(&call.call, serde_json::json!(null)).unwrap();
+        }
+        journal.close().unwrap();
+
+        let reader = JournalReader::open(dir.path(), &task()).unwrap();
+        let found = open_calls(&reader.read().unwrap().records);
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            found[0].arguments,
+            Some(serde_json::json!({"path": "src/lib.rs", "content": "fn main() {}\n"}))
+        );
     }
 
     #[test]

@@ -142,7 +142,7 @@ impl Scenario {
 pub struct Fixed(pub Probe);
 
 impl Prober for Fixed {
-    fn probe(&self, _intent: &Intent) -> Probe {
+    fn probe(&self, _intent: &Intent, _arguments: Option<&serde_json::Value>) -> Probe {
         self.0
     }
 }

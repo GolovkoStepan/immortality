@@ -302,9 +302,17 @@ impl RecoveryReport {
 ///
 /// Implemented by the tool layer, which knows that a `git commit` is found by its nonce and that
 /// a `shell` command is judged by the tree it produced. Core only needs the verdict.
+///
+/// `arguments` is the call's stored argument object, exactly as the `intent` record holds it.
+/// It is not part of [`Intent`] because that type is compared and stored, and a multi-kilobyte
+/// string there would make an accidental `PartialEq` the basis of a decision. It is a separate
+/// parameter rather than extra fields on `Intent` for the same reason — but the probe genuinely
+/// needs it: a `write_file` probe answers "the file already has this content" only by knowing
+/// which content. `None` means the record did not carry it, and a probe that cannot work
+/// without the arguments must answer [`Probe::Unknown`] rather than guess.
 pub trait Prober {
     /// `Unknown` is a valid and expected answer, not a failure of the probe.
-    fn probe(&self, intent: &Intent) -> Probe;
+    fn probe(&self, intent: &Intent, arguments: Option<&serde_json::Value>) -> Probe;
 }
 
 /// A prober that refuses to guess. The default for callers that cannot probe yet.
@@ -312,7 +320,7 @@ pub trait Prober {
 pub struct NoProbe;
 
 impl Prober for NoProbe {
-    fn probe(&self, _intent: &Intent) -> Probe {
+    fn probe(&self, _intent: &Intent, _arguments: Option<&serde_json::Value>) -> Probe {
         Probe::Unknown
     }
 }
@@ -413,34 +421,10 @@ pub fn plan(input: &RecoveryInput<'_>, prober: &impl Prober) -> RecoveryReport {
     }
 
     // ── 4. Unfinished tool calls ───────────────────────────────────────────────────────────
-    //
-    // The dispositions are split into two lists because their order is not the journal's order.
-    // A rollback rewrites the tree, so any retry that ran before it would have its effect thrown
-    // away, and a synthesized observation would describe a world that no longer exists. Every
-    // rollback therefore runs before any call is retried or answered, whichever order the calls
-    // appear in the journal.
-    let mut calls = Vec::new();
-    let mut actions = Vec::new();
-    let mut rollbacks = Vec::new();
-    // Goes first in the rollback list because it describes a rollback the runner had already
-    // decided on before the crash: it is not speculation about an unfinished call.
-    if let Some(step) = interrupted_rollback(input, &mut verdict) {
-        rollbacks.push(step);
-    }
-    for FoundOpenCall { open, .. } in crate::protocol::open_calls(&input.journal.records) {
-        let recovered = reclaim_call(&open, prober, input, &mut actions, &mut rollbacks, &mut verdict);
-        calls.push(recovered);
-    }
-    // Two unknown calls often answer `Unknown` for the same reason and point at the same
-    // checkpoint. Resetting twice rewrites the same tree, so duplicates are dropped: one reset is
-    // enough, and the second would only obscure which call forced it.
-    let mut seen = BTreeSet::new();
-    rollbacks.retain(|step| match step {
-        RecoveryStep::RollbackToCheckpoint { sha, .. } => seen.insert(sha.clone()),
-        _ => true,
-    });
-    steps.append(&mut rollbacks);
-    steps.append(&mut actions);
+    let reclaimed = reclaim_calls(input, prober, &mut verdict);
+    let calls = reclaimed.calls;
+    steps.extend(reclaimed.rollbacks);
+    steps.extend(reclaimed.actions);
 
     // ── 5. Attempts ───────────────────────────────────────────────────────────────────────
     //
@@ -478,6 +462,57 @@ pub fn plan(input: &RecoveryInput<'_>, prober: &impl Prober) -> RecoveryReport {
         blocked_reason: None,
         steps,
     })
+}
+
+/// What reclaiming the journal's unfinished calls decided.
+struct Reclaimed {
+    calls: Vec<CallRecovery>,
+    /// Steps that rewrite the tree. They run before anything that reads or finishes it.
+    rollbacks: Vec<RecoveryStep>,
+    /// Steps that answer or re-issue a call.
+    actions: Vec<RecoveryStep>,
+}
+
+/// Give every open call a disposition, in two ordered lists.
+///
+/// The order is not the journal's order. A rollback rewrites the tree, so a retry placed before it
+/// would have its effect thrown away, and a synthesized observation would describe a world that no
+/// longer exists. Every rollback therefore comes before every retry, whichever order the calls
+/// appear in the journal.
+fn reclaim_calls(input: &RecoveryInput<'_>, prober: &impl Prober, verdict: &mut Verdict) -> Reclaimed {
+    let mut calls = Vec::new();
+    let mut actions = Vec::new();
+    let mut rollbacks = Vec::new();
+    // Goes first in the rollback list because it describes a rollback the runner had already
+    // decided on before the crash: it is not speculation about an unfinished call.
+    if let Some(step) = interrupted_rollback(input, verdict) {
+        rollbacks.push(step);
+    }
+    for FoundOpenCall { open, arguments, .. } in crate::protocol::open_calls(&input.journal.records) {
+        let recovered = reclaim_call(
+            &open,
+            arguments.as_ref(),
+            prober,
+            input,
+            &mut actions,
+            &mut rollbacks,
+            verdict,
+        );
+        calls.push(recovered);
+    }
+    // Two unknown calls often answer `Unknown` for the same reason and point at the same
+    // checkpoint. Resetting twice rewrites the same tree, so duplicates are dropped: one reset is
+    // enough, and the second would only obscure which call forced it.
+    let mut seen = BTreeSet::new();
+    rollbacks.retain(|step| match step {
+        RecoveryStep::RollbackToCheckpoint { sha, .. } => seen.insert(sha.clone()),
+        _ => true,
+    });
+    Reclaimed {
+        calls,
+        rollbacks,
+        actions,
+    }
 }
 
 /// Append the `record_recovery` step, which must come after the repair it describes.
@@ -548,6 +583,7 @@ fn worktree_action(input: &RecoveryInput<'_>) -> WorktreeAction {
 /// before anything else, `actions` collects the rest. See the caller for why.
 fn reclaim_call(
     open: &OpenCall,
+    arguments: Option<&serde_json::Value>,
     prober: &impl Prober,
     input: &RecoveryInput<'_>,
     actions: &mut Vec<RecoveryStep>,
@@ -583,7 +619,7 @@ fn reclaim_call(
             });
         }
         RecoveryAction::Probe | RecoveryAction::VerifyContent => {
-            let answer = prober.probe(&open.intent);
+            let answer = prober.probe(&open.intent, arguments);
             effect = Some(answer);
             *verdict = Verdict::Repaired;
             match answer {
@@ -926,7 +962,7 @@ mod tests {
     struct Fixed(Probe);
 
     impl Prober for Fixed {
-        fn probe(&self, _intent: &Intent) -> Probe {
+        fn probe(&self, _intent: &Intent, _arguments: Option<&serde_json::Value>) -> Probe {
             self.0
         }
     }
@@ -1346,6 +1382,58 @@ mod tests {
         );
         assert_eq!(report.calls[0].action, RecoveryAction::VerifyContent);
         assert_eq!(report.calls[0].effect, Some(Probe::Applied));
+    }
+
+    #[test]
+    fn the_prober_receives_the_stored_arguments() {
+        // `VerifyContent` exists for writes, and a write's content is the arguments. A planner
+        // that handed the prober only the intent would force every `ByContent` probe to answer
+        // `Unknown`, which rolls the tree back to the last checkpoint and discards a file that
+        // may be exactly what the crash left complete.
+        use std::sync::Mutex;
+
+        #[derive(Debug)]
+        struct Recording(Mutex<Vec<Option<serde_json::Value>>>);
+
+        impl Prober for Recording {
+            fn probe(&self, _intent: &Intent, arguments: Option<&serde_json::Value>) -> Probe {
+                self.0.lock().unwrap().push(arguments.cloned());
+                Probe::Applied
+            }
+        }
+
+        let journal = outcome(vec![
+            record(
+                0,
+                Kind::ToolCallIntent,
+                serde_json::json!({
+                    "call": "call_write",
+                    "tool": "write_file",
+                    "idempotency": "by_content",
+                    "expected_effect": "write src/lib.rs",
+                    "arguments": {"path": "src/lib.rs", "content": "fn main() {}\n"},
+                }),
+            ),
+            record(1, Kind::ToolCallStarted, started_payload("call_write")),
+        ]);
+        let recorder = Recording(Mutex::new(Vec::new()));
+        let report = plan(
+            &input(
+                &journal,
+                WorkspaceFacts::healthy("agent/tsk_01", "abc"),
+                PersistedState::default(),
+            ),
+            &recorder,
+        );
+
+        assert_eq!(report.calls[0].action, RecoveryAction::VerifyContent);
+        assert_eq!(
+            recorder.0.lock().unwrap().as_slice(),
+            [Some(serde_json::json!({
+                "path": "src/lib.rs",
+                "content": "fn main() {}\n",
+            }))]
+        );
     }
 
     #[test]
