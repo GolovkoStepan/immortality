@@ -128,15 +128,30 @@ pub struct LoopLimits {
 }
 
 /// Detector thresholds.
+///
+/// The names follow the ladder they trigger: `warn` is L1 (a nudge), `strategy` is L2 (a forced
+/// step), `stop` is L3 (a restart). A detector with no `stop` never asks for a restart on its
+/// own; that is deliberate for D2, where a repeated output of two different commands is a hint
+/// rather than evidence that the attempt is hopeless.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Detectors {
     pub exact_repeat_warn: u32,
     pub exact_repeat_strategy: u32,
     pub exact_repeat_stop: u32,
+    /// D2, L1. Counts repeated outputs, not consecutive calls: two different commands that
+    /// print the same thing are the signal.
+    pub semantic_repeat_warn: u32,
+    /// D2, L2.
+    pub semantic_repeat_strategy: u32,
+    /// D3, L2: steps without new information.
     pub progress_stall_warn: u32,
+    /// D3, L3.
     pub progress_stall_stop: u32,
+    /// D4: how long an n-gram must be to count as a repeated phrase.
     pub reasoning_repeat_ngram: u32,
+    /// D4: how many times that n-gram must repeat before the stream is aborted.
+    pub reasoning_repeat_count: u32,
 }
 
 /// Logging.
@@ -239,9 +254,12 @@ impl Default for Detectors {
             exact_repeat_warn: 3,
             exact_repeat_strategy: 5,
             exact_repeat_stop: 8,
+            semantic_repeat_warn: 2,
+            semantic_repeat_strategy: 3,
             progress_stall_warn: 15,
             progress_stall_stop: 25,
             reasoning_repeat_ngram: 40,
+            reasoning_repeat_count: 3,
         }
     }
 }
@@ -347,9 +365,12 @@ pub struct RawDetectors {
     pub exact_repeat_warn: Option<u32>,
     pub exact_repeat_strategy: Option<u32>,
     pub exact_repeat_stop: Option<u32>,
+    pub semantic_repeat_warn: Option<u32>,
+    pub semantic_repeat_strategy: Option<u32>,
     pub progress_stall_warn: Option<u32>,
     pub progress_stall_stop: Option<u32>,
     pub reasoning_repeat_ngram: Option<u32>,
+    pub reasoning_repeat_count: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -576,11 +597,18 @@ fn apply_non_policy(config: &mut Config, raw: RawConfig) {
         target.exact_repeat_warn = raw.exact_repeat_warn.unwrap_or(target.exact_repeat_warn);
         target.exact_repeat_strategy = raw.exact_repeat_strategy.unwrap_or(target.exact_repeat_strategy);
         target.exact_repeat_stop = raw.exact_repeat_stop.unwrap_or(target.exact_repeat_stop);
+        target.semantic_repeat_warn = raw.semantic_repeat_warn.unwrap_or(target.semantic_repeat_warn);
+        target.semantic_repeat_strategy = raw
+            .semantic_repeat_strategy
+            .unwrap_or(target.semantic_repeat_strategy);
         target.progress_stall_warn = raw.progress_stall_warn.unwrap_or(target.progress_stall_warn);
         target.progress_stall_stop = raw.progress_stall_stop.unwrap_or(target.progress_stall_stop);
         target.reasoning_repeat_ngram = raw
             .reasoning_repeat_ngram
             .unwrap_or(target.reasoning_repeat_ngram);
+        target.reasoning_repeat_count = raw
+            .reasoning_repeat_count
+            .unwrap_or(target.reasoning_repeat_count);
     }
     if let Some(raw) = raw.logging {
         let target = &mut config.logging;
@@ -670,6 +698,7 @@ fn validate(config: &Config) -> Result<()> {
             "loop.max_subtask_depth above 3 is not supported: context quality collapses".into(),
         ));
     }
+    validate_detectors(&config.detectors)?;
     if config.storage.disk_pause_bytes >= config.storage.disk_warn_bytes {
         return Err(Error::ConfigInvalid(format!(
             "storage.disk_pause_bytes ({}) must be smaller than disk_warn_bytes ({})",
@@ -699,6 +728,72 @@ fn validate(config: &Config) -> Result<()> {
         return Err(Error::ConfigInvalid(format!(
             "backend host `{host}` is not in policy.trusted_hosts; every model call would \
              require approval. Add it to the global config's [policy].trusted_hosts."
+        )));
+    }
+    Ok(())
+}
+
+/// Refuse detector thresholds that cannot produce a working ladder.
+///
+/// The checks are monotonicity rather than bounds: any positive number is meaningful on its own,
+/// but a `warn` above its `stop` means L1 fires only after L3 already gave up on the attempt, and
+/// a zero threshold fires a detector on every step. Both are configuration mistakes that would
+/// look like a model problem in production, so they are refused at load time.
+fn validate_detectors(detectors: &Detectors) -> Result<()> {
+    let ladder = [
+        (
+            "detectors.exact_repeat_warn",
+            detectors.exact_repeat_warn,
+            "detectors.exact_repeat_strategy",
+            detectors.exact_repeat_strategy,
+        ),
+        (
+            "detectors.exact_repeat_strategy",
+            detectors.exact_repeat_strategy,
+            "detectors.exact_repeat_stop",
+            detectors.exact_repeat_stop,
+        ),
+        (
+            "detectors.semantic_repeat_warn",
+            detectors.semantic_repeat_warn,
+            "detectors.semantic_repeat_strategy",
+            detectors.semantic_repeat_strategy,
+        ),
+        (
+            "detectors.progress_stall_warn",
+            detectors.progress_stall_warn,
+            "detectors.progress_stall_stop",
+            detectors.progress_stall_stop,
+        ),
+    ];
+    for (warn_name, warn, stop_name, stop) in ladder {
+        if warn == 0 || stop == 0 {
+            return Err(Error::ConfigInvalid(format!(
+                "`{warn_name}` and `{stop_name}` must be at least 1: a zero threshold fires the \
+                 detector on every step"
+            )));
+        }
+        if warn > stop {
+            return Err(Error::ConfigInvalid(format!(
+                "`{warn_name}` ({warn}) must not exceed `{stop_name}` ({stop}): the ladder would \
+                 reach the harsher level first"
+            )));
+        }
+    }
+    if detectors.reasoning_repeat_ngram == 0 {
+        return Err(Error::ConfigInvalid(
+            "detectors.reasoning_repeat_ngram must be at least 1: a zero-length n-gram repeats \
+             trivially"
+                .into(),
+        ));
+    }
+    // A count below two makes every occurrence of the n-gram an abort, which would cut a stream
+    // on its first mention of a long phrase.
+    if detectors.reasoning_repeat_count < 2 {
+        return Err(Error::ConfigInvalid(format!(
+            "detectors.reasoning_repeat_count ({}) must be at least 2: repetition is counted from \
+             the second occurrence",
+            detectors.reasoning_repeat_count
         )));
     }
     Ok(())
@@ -1043,5 +1138,57 @@ mod tests {
         std::fs::write(&fx.project, "[loop]\nstall_steps = 7\n").unwrap();
         let loaded = load(&overrides_for(&fx)).unwrap();
         assert_eq!(loaded.config.loop_.stall_steps, 7);
+    }
+
+    #[test]
+    fn detector_thresholds_are_read_from_the_project_file() {
+        let fx = fixture();
+        std::fs::write(
+            &fx.project,
+            "[detectors]\nexact_repeat_warn = 4\nsemantic_repeat_strategy = 6\n\
+             reasoning_repeat_count = 5\n",
+        )
+        .unwrap();
+        let config = load(&overrides_for(&fx)).unwrap().config.detectors;
+        assert_eq!(config.exact_repeat_warn, 4);
+        assert_eq!(config.semantic_repeat_strategy, 6);
+        assert_eq!(config.reasoning_repeat_count, 5);
+        // The untouched keys keep their defaults rather than becoming zero.
+        assert_eq!(config.semantic_repeat_warn, 2);
+        assert_eq!(config.exact_repeat_stop, 8);
+    }
+
+    #[test]
+    fn a_ladder_rung_above_its_harsher_one_is_refused() {
+        // L1 firing after L3 already gave up is a config that would look like a model problem.
+        let fx = fixture();
+        std::fs::write(
+            &fx.project,
+            "[detectors]\nexact_repeat_strategy = 12\nexact_repeat_stop = 8\n",
+        )
+        .unwrap();
+        let error = load(&overrides_for(&fx)).unwrap_err().to_string();
+        assert!(error.contains("exact_repeat_strategy"), "{error}");
+        assert!(error.contains("harsher"), "{error}");
+    }
+
+    #[test]
+    fn a_zero_detector_threshold_is_refused() {
+        // A zero threshold fires its detector on every step.
+        let fx = fixture();
+        std::fs::write(&fx.project, "[detectors]\nsemantic_repeat_warn = 0\n").unwrap();
+        let error = load(&overrides_for(&fx)).unwrap_err().to_string();
+        assert!(error.contains("semantic_repeat_warn"), "{error}");
+        assert!(error.contains("at least 1"), "{error}");
+    }
+
+    #[test]
+    fn a_repeat_count_below_two_is_refused() {
+        // Repetition is counted from the second occurrence; one would abort on the first mention
+        // of any long phrase.
+        let fx = fixture();
+        std::fs::write(&fx.project, "[detectors]\nreasoning_repeat_count = 1\n").unwrap();
+        let error = load(&overrides_for(&fx)).unwrap_err().to_string();
+        assert!(error.contains("reasoning_repeat_count"), "{error}");
     }
 }

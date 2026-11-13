@@ -46,9 +46,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use immortality_core::artifacts::ArtifactStore;
+use immortality_core::config::Detectors;
 use immortality_core::context::{
     Budget, Context, Entry, StableLayers, TokenCounter, ToolCall, Verdict, artifact_hint, truncate_output,
 };
+use immortality_core::detect::{Detector, Level, Reaction, Signals, Stream, StreamVerdict, Thresholds};
 use immortality_core::domain::{Attempt, AttemptTrigger, FailureReason, Subtask, SubtaskReport};
 use immortality_core::ids::TaskId;
 use immortality_core::journal::{Journal, Kind, Scope};
@@ -138,6 +140,45 @@ pub trait Model: Send + Sync + std::fmt::Debug {
     /// # Errors
     /// The request failed in a way the loop cannot act on; the attempt ends.
     fn complete(&self, request: &ChatRequest) -> Result<Reply, String>;
+
+    /// Answer one step, letting a watcher see the text as it arrives.
+    ///
+    /// `watch` is called with each piece of content; returning `false` aborts the request. An
+    /// aborted request returns [`Streamed::Aborted`] with the text seen so far, which is what
+    /// D4 needs: the detector has decided the model is looping, and the loop must be able to
+    /// journal the abort and react without having paid for the rest of the message.
+    ///
+    /// The default implementation calls [`Model::complete`] and watches the finished text in one
+    /// go. That is correct for a fake and useless for D4 — a stream has to be interruptible
+    /// mid-message to save anything — so [`LlmModel`] overrides it. A test that asserts the abort
+    /// path must therefore use a model that overrides it too.
+    ///
+    /// # Errors
+    /// See [`Model::complete`].
+    fn complete_watched(
+        &self,
+        request: &ChatRequest,
+        watch: &mut dyn FnMut(&str) -> bool,
+    ) -> Result<Streamed, String> {
+        let reply = self.complete(request)?;
+        if watch(&reply.content) {
+            Ok(Streamed::Complete(reply))
+        } else {
+            Ok(Streamed::Aborted { seen: reply.content })
+        }
+    }
+}
+
+/// What a watched request produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Streamed {
+    /// The turn finished.
+    Complete(Reply),
+    /// The watcher aborted it; this is the text that arrived before the abort.
+    Aborted {
+        /// The content seen so far, for the journal and for the next brief.
+        seen: String,
+    },
 }
 
 /// The real client, blocking.
@@ -185,6 +226,29 @@ impl Model for LlmModel {
             .map_err(|failure| failure.to_string())?;
         Ok(reply_from_turn(&turn))
     }
+
+    fn complete_watched(
+        &self,
+        request: &ChatRequest,
+        watch: &mut dyn FnMut(&str) -> bool,
+    ) -> Result<Streamed, String> {
+        // `ChatRequest::new` already asks for a stream; `turn_blocking` is the one that turns it
+        // off. Going through the streaming path is the only way to abort mid-message.
+        let mut seen = String::new();
+        let outcome = self
+            .runtime
+            .block_on(self.backend.turn_streaming(request, |delta| {
+                seen.push_str(delta);
+                watch(delta)
+            }));
+        match outcome {
+            Ok(turn) => Ok(Streamed::Complete(reply_from_turn(&turn))),
+            // A cancelled stream is not a backend failure: the watcher ended it. The partial text
+            // is what the journal records and what the next brief calls "what you were writing".
+            Err(immortality_llm::Failure::Cancelled) => Ok(Streamed::Aborted { seen }),
+            Err(failure) => Err(failure.to_string()),
+        }
+    }
 }
 
 /// Convert a client turn into the loop's reply.
@@ -221,6 +285,12 @@ pub enum Ending {
     Backend { detail: String },
     /// Nothing progressed for `stall_steps` steps.
     Stalled,
+    /// A detector ended the attempt and asked for a new one (L3).
+    ///
+    /// Distinct from the budget endings above: those say *which* budget ran out, and this says
+    /// *which signal* concluded that another step in this attempt was worthless. The strategy of
+    /// the next attempt is written from the detector's name and metric.
+    Looped(Reaction),
 }
 
 impl Ending {
@@ -237,6 +307,10 @@ impl Ending {
             Self::Time => Some(FailureReason::TimeExhausted),
             Self::Backend { .. } => Some(FailureReason::BackendUnavailable),
             Self::Empty | Self::UnknownTool { .. } => Some(FailureReason::ToolError),
+            // D-006: a task that loops is not a tool error and not a budget. It has its own
+            // reason, so a metric query can separate "the model gave up" from "the model ran out
+            // of room".
+            Self::Looped(_) => Some(FailureReason::Looped),
         }
     }
 
@@ -252,6 +326,7 @@ impl Ending {
             Self::UnknownTool { .. } => "unknown_tool",
             Self::Backend { .. } => "backend",
             Self::Stalled => "stalled",
+            Self::Looped(_) => "looped",
         }
     }
 }
@@ -303,6 +378,8 @@ pub struct Runner {
     pub counter: Arc<dyn TokenCounter>,
     /// The task the subtask belongs to, for journal records.
     pub task: TaskId,
+    /// Detector thresholds, read from config once.
+    pub detectors: Detectors,
 }
 
 impl std::fmt::Debug for Runner {
@@ -358,7 +435,6 @@ impl Runner {
         attempt.steps_used = state.steps;
         attempt.tokens_used = state.tokens;
         let report = state.report(&ending);
-
         // A claim does not close the attempt. `AttemptState::Succeeded` means "the model claimed
         // done and every gate passed", and the gates are M4.6 — a runner that wrote `Succeeded`
         // here would be grading its own work, and `status` would show a success that no check
@@ -396,6 +472,10 @@ impl Runner {
                 "ending": ending.as_str(),
                 "steps": attempt.steps_used,
                 "tokens": attempt.tokens_used,
+                // For `looped` this is the strategy the restart exists for; every other ending
+                // leaves the field out rather than writing `null`, which reads as "unknown".
+                "detector": state.stopped_by.map(|reaction| reaction.detector.as_str()),
+                "level": state.stopped_by.map(|reaction| reaction.level.as_str()),
             }),
             &Scope::attempt(subtask.id.clone(), attempt_number),
         )?;
@@ -430,6 +510,15 @@ struct StepLoop<'a> {
     /// Preferred over `last_text` for the report because it is a deliberate summary rather than
     /// whatever happened to be observed last — the next attempt inherits it.
     claim_summary: Option<String>,
+    /// What D1–D3 have seen so far, and what they have already announced.
+    signals: Signals,
+    /// The thresholds, read from config once.
+    thresholds: Thresholds,
+    /// The detector that asked for the restart, if one did.
+    ///
+    /// A restarted attempt is not a failed one in the same way as a step budget: the report has
+    /// to say *which* signal gave up, because the next attempt's strategy is written from it.
+    stopped_by: Option<Reaction>,
     started: Instant,
 }
 
@@ -455,6 +544,9 @@ impl<'a> StepLoop<'a> {
             touched: Vec::new(),
             last_text: String::new(),
             claim_summary: None,
+            signals: Signals::default(),
+            thresholds: Thresholds::from_config(&runner.detectors),
+            stopped_by: None,
             started: Instant::now(),
         }
     }
@@ -463,11 +555,28 @@ impl<'a> StepLoop<'a> {
     fn drive(&mut self, journal: &mut Journal) -> immortality_core::Result<Ending> {
         loop {
             if let Some(ending) = self.exhausted() {
+                // D5 is a detector like the others, and the journal is where the metric lives:
+                // without this record a budget ending is indistinguishable from the loop quietly
+                // stopping at a step count someone has to look up in config.
+                self.record_reaction(journal, ending_reaction(&ending), None)?;
                 return Ok(ending);
             }
-            let reply = match self.runner.model.complete(&self.request()) {
-                Ok(reply) => reply,
-                Err(detail) => return Ok(Ending::Backend { detail }),
+            let reply = match self.step(journal)? {
+                Step::Reply(reply) => reply,
+                // D4 aborts the stream and applies L2: the attempt continues, but the next step
+                // is a forced strategy rather than another tool call. It counts as an idle step
+                // so that a model which loops in every message still reaches D3's restart.
+                Step::Looping => {
+                    self.steps = self.steps.saturating_add(1);
+                    self.stalled = self.stalled.saturating_add(1);
+                    self.signals.record_idle_step();
+                    self.inject_l2();
+                    if let Some(ending) = self.react(journal)? {
+                        return Ok(ending);
+                    }
+                    continue;
+                }
+                Step::Backend(detail) => return Ok(Ending::Backend { detail }),
             };
             self.steps = self.steps.saturating_add(1);
             self.tokens = self
@@ -487,8 +596,12 @@ impl<'a> StepLoop<'a> {
             if calls.is_empty() {
                 // Prose with no calls: the model may be thinking aloud, and the next step may
                 // carry the call, so this counts against the stall budget rather than ending.
-                self.last_text = reply.content;
+                self.last_text.clone_from(&reply.content);
                 self.stalled = self.stalled.saturating_add(1);
+                self.signals.record_idle_step();
+                if let Some(ending) = self.react(journal)? {
+                    return Ok(ending);
+                }
                 if self.stalled >= self.runner.limits.stall_steps {
                     return Ok(Ending::Stalled);
                 }
@@ -516,10 +629,78 @@ impl<'a> StepLoop<'a> {
             if claimed {
                 return Ok(Ending::Claimed);
             }
+            if let Some(ending) = self.react(journal)? {
+                return Ok(ending);
+            }
             if self.stalled >= self.runner.limits.stall_steps {
                 return Ok(Ending::Stalled);
             }
         }
+    }
+
+    /// Ask the model one step, watching the stream for D4.
+    ///
+    /// D4 aborts the stream and applies L2: the attempt continues, but the next step is a forced
+    /// strategy rather than another tool call. `Looping` is reported separately from a backend
+    /// error because the two leave the attempt in different states.
+    fn step(&self, journal: &mut Journal) -> immortality_core::Result<Step> {
+        let request = self.request();
+        let mut stream = Stream::new(&self.runner.detectors);
+        let mut seen = String::new();
+        let mut looping = None;
+        let outcome = self.runner.model.complete_watched(&request, &mut |delta| {
+            seen.push_str(delta);
+            let verdict = stream.push(delta);
+            if let StreamVerdict::Looping { occurrences } = verdict {
+                looping = Some(occurrences);
+            }
+            !verdict.must_abort()
+        });
+        if let Some(occurrences) = looping {
+            let reaction = Reaction {
+                detector: Detector::ReasoningLoop,
+                level: Level::ForceStrategy,
+                metric: occurrences,
+            };
+            journal.append_scoped(
+                immortality_core::time::now(),
+                Kind::ModelStreamAborted,
+                serde_json::json!({
+                    "step": self.steps,
+                    "detector": reaction.detector.as_str(),
+                    "level": reaction.level.as_str(),
+                    "chars_seen": seen.chars().count(),
+                }),
+                &self.scope,
+            )?;
+            self.record_reaction(journal, reaction, Some(&seen))?;
+            return Ok(Step::Looping);
+        }
+        match outcome {
+            Ok(Streamed::Complete(reply)) => Ok(Step::Reply(reply)),
+            // A real client reports an abort only through `looping` above, because its watcher
+            // returns `false` exactly when D4 fires. An abort without a verdict means the watcher
+            // stopped for a reason the loop does not know, and inventing a reply from the text
+            // seen so far would put a half-written sentence in the history as if the model had
+            // finished it.
+            Ok(Streamed::Aborted { .. }) => Ok(Step::Backend(
+                "the response stream was aborted without a detector firing".to_string(),
+            )),
+            Err(detail) => Ok(Step::Backend(detail)),
+        }
+    }
+
+    /// Apply L2: tell the model to stop calling tools and state a strategy.
+    /// Apply L2: tell the model to stop calling tools and state a strategy.
+    ///
+    /// The journal record is written by `record_reaction` before this is called; writing another
+    /// here would count one firing twice, and the metric exists precisely to be trusted.
+    fn inject_l2(&mut self) {
+        self.signals.strategy_delivered();
+        let text = Level::ForceStrategy
+            .instruction(Detector::ReasoningLoop)
+            .unwrap_or_default();
+        self.context.push_entry(Entry::note(text));
     }
 
     /// The request as the context now stands.
@@ -539,6 +720,72 @@ impl<'a> StepLoop<'a> {
         tools.push(finish_def());
         request.tools = Some(tools);
         request
+    }
+
+    /// Journal a detector's reaction and, for L1, put the instruction in the context.
+    ///
+    /// L1 speaks and continues; L2 for a *non*-D4 detector is recorded but not injected, because
+    /// the forced strategy step belongs to the next model call and `react` returns `None` at L2
+    /// only when the caller is already driving one. `react` handles that ordering; this function
+    /// records what was decided.
+    fn record_reaction(
+        &self,
+        journal: &mut Journal,
+        reaction: Reaction,
+        seen: Option<&str>,
+    ) -> immortality_core::Result<()> {
+        let mut fields = serde_json::json!({
+            "detector": reaction.detector.as_str(),
+            "level": reaction.level.as_str(),
+            "metric": reaction.metric,
+            "step": self.steps,
+        });
+        if let Some(text) = seen {
+            fields["chars_seen"] = serde_json::json!(text.chars().count());
+        }
+        journal.append_scoped(
+            immortality_core::time::now(),
+            Kind::DetectorFired,
+            fields,
+            &self.scope,
+        )?;
+        Ok(())
+    }
+
+    /// Consult the ladder and act on what it says.
+    ///
+    /// Returns an `Ending` when the attempt is over. L1 appends the nudge to the history — the
+    /// prefix stays untouched, so the cache survives — and L2 returns an ending only for a
+    /// detector whose escalation is "stop this attempt"; the runner injects L2 itself at the top
+    /// of the next step.
+    fn react(&mut self, journal: &mut Journal) -> immortality_core::Result<Option<Ending>> {
+        let Some(reaction) = self.signals.react(&self.thresholds) else {
+            return Ok(None);
+        };
+        self.record_reaction(journal, reaction, None)?;
+        match reaction.level {
+            Level::Nudge => {
+                if let Some(text) = reaction.level.instruction(reaction.detector) {
+                    self.context.push_entry(Entry::note(text));
+                }
+                Ok(None)
+            }
+            Level::ForceStrategy => {
+                // L2 is a forced *step*, not the end of the attempt: the model is told to stop
+                // calling tools and state a strategy, and gets the chance to comply. Only L3
+                // gives up on the attempt. A model that ignores this too will reach L3 by the
+                // same detector's stop threshold, which is where the restart lives.
+                if let Some(text) = reaction.level.instruction(reaction.detector) {
+                    self.signals.strategy_delivered();
+                    self.context.push_entry(Entry::note(text));
+                }
+                Ok(None)
+            }
+            Level::Restart => {
+                self.stopped_by = Some(reaction);
+                Ok(Some(Ending::Looped(reaction)))
+            }
+        }
     }
 
     /// The budget that has been exhausted, if any.
@@ -700,6 +947,12 @@ impl<'a> StepLoop<'a> {
                 )
                 .map_err(|error| backend(&error))?;
                 drop(log);
+                self.signals.record_call(
+                    &call.name,
+                    &call.arguments,
+                    Some(&observation),
+                    Some(self.runner.gate.worktree()),
+                );
                 self.last_text.clone_from(&observation);
                 self.context
                     .push_entry(Entry::tool(call.call_id.clone(), call.name.clone(), observation));
@@ -713,6 +966,15 @@ impl<'a> StepLoop<'a> {
                 log.failed(&intent.call, serde_json::json!({ "error": observation }))
                     .map_err(|error| backend(&error))?;
                 drop(log);
+                // A refusal is a step that produced no evidence about the task, so it feeds the
+                // D1 run but not D2: the model is being told what was wrong, and that is neither
+                // progress nor a repeated experiment.
+                self.signals.record_call(
+                    &call.name,
+                    &call.arguments,
+                    None,
+                    Some(self.runner.gate.worktree()),
+                );
                 self.last_text.clone_from(&observation);
                 self.context
                     .push_entry(Entry::tool(call.call_id.clone(), call.name.clone(), observation));
@@ -788,6 +1050,17 @@ enum ToolStep {
     Ran,
     /// Nothing ran: refused by the policy gate, or the arguments were refused.
     NotRun,
+}
+
+/// What one model step produced.
+#[derive(Debug, Clone)]
+enum Step {
+    /// A finished turn.
+    Reply(Reply),
+    /// D4 aborted the stream and L2 was applied; the attempt continues.
+    Looping,
+    /// The request failed in a way the loop cannot act on.
+    Backend(String),
 }
 
 /// The brief: what a fresh context is told about the subtask.
@@ -899,6 +1172,25 @@ fn backend(error: &immortality_core::Error) -> Ending {
     }
 }
 
+/// D5's reaction for a budget ending.
+///
+/// A budget running out is always L3: the attempt cannot be talked down, because the steps or the
+/// tokens it would take to do so are what ran out.
+const fn ending_reaction(ending: &Ending) -> Reaction {
+    Reaction {
+        detector: Detector::Budget,
+        level: Level::Restart,
+        metric: match ending {
+            // The metric is the budget that ran out, not its value: the value is in the attempt's
+            // counters, and repeating it here would be a second number to keep in sync.
+            Ending::Steps => 1,
+            Ending::Tokens => 2,
+            Ending::Time => 3,
+            _ => 0,
+        },
+    }
+}
+
 fn dedup(paths: &[PathBuf]) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
     for path in paths {
@@ -948,6 +1240,33 @@ mod tests {
                 .ok()
                 .and_then(|mut queue| queue.pop_front())
                 .unwrap_or_else(|| Err("the script has no reply for this step".to_string()))
+        }
+
+        /// Feeds the scripted text through the watcher one word at a time.
+        ///
+        /// The default implementation hands the watcher the finished message in one call, which
+        /// cannot abort mid-message and therefore cannot exercise D4 the way a real stream does.
+        /// Word-by-word is the smallest fidelity that still crosses delta boundaries, which is
+        /// where a repetition detector can go wrong.
+        fn complete_watched(
+            &self,
+            request: &ChatRequest,
+            watch: &mut dyn FnMut(&str) -> bool,
+        ) -> Result<Streamed, String> {
+            let reply = self.complete(request)?;
+            let mut seen = String::new();
+            for piece in reply.content.split_inclusive(' ') {
+                seen.push_str(piece);
+                if !watch(piece) {
+                    return Ok(Streamed::Aborted { seen });
+                }
+            }
+            // A content-free reply (pure tool calls) still has to reach the watcher once, so a
+            // watcher that counts calls sees the turn it actually got.
+            if reply.content.is_empty() && !watch("") {
+                return Ok(Streamed::Aborted { seen });
+            }
+            Ok(Streamed::Complete(reply))
         }
     }
 
@@ -1050,6 +1369,7 @@ mod tests {
             },
             counter: Arc::new(immortality_core::context::CharsCounter::default()),
             task: TaskId::from_suffix("01ARZ3NDEKTSV4RRFFQ69G5FAA"),
+            detectors: Detectors::default(),
         };
         (dir, runner)
     }
@@ -1503,5 +1823,402 @@ mod tests {
         }
         let error: RegistryError = Registry::new(vec![Arc::new(Broken)]).expect_err("broken schema");
         assert_eq!(error.tool, "broken");
+    }
+
+    // ── the detectors ──────────────────────────────────────────────────────────
+
+    /// A tool that answers with whatever `path` names, so a test can script output hashes.
+    #[derive(Debug)]
+    struct Echo;
+
+    impl immortality_tools::Tool for Echo {
+        fn name(&self) -> &'static str {
+            "echo"
+        }
+
+        fn schema(&self) -> &'static serde_json::Value {
+            static SCHEMA: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
+            SCHEMA.get_or_init(|| {
+                serde_json::json!({
+                    "type": "object",
+                    "properties": { "path": { "type": "string" } },
+                    "required": ["path"],
+                    "additionalProperties": false
+                })
+            })
+        }
+
+        fn description(&self) -> &'static str {
+            "Echo the path back."
+        }
+
+        fn effect(&self, _args: &Args) -> immortality_tools::Effect {
+            immortality_tools::Effect::Read
+        }
+
+        fn idempotency(&self, _args: &Args) -> Idempotency {
+            Idempotency::Idempotent
+        }
+
+        fn paths(&self, _args: &Args) -> Vec<immortality_tools::PathUse> {
+            Vec::new()
+        }
+
+        fn execute(&self, _ctx: &ToolCtx, args: Args) -> Result<immortality_tools::ToolResult, ToolError> {
+            Ok(immortality_tools::ToolResult::text(args.str("path")?))
+        }
+    }
+
+    fn echo_reply(id: &str, path: &str) -> Reply {
+        Reply::call(id, "echo", format!(r#"{{"path":"{path}"}}"#))
+    }
+
+    /// A tool that always prints the same thing, so two different calls can share an output.
+    #[derive(Debug)]
+    struct Constant;
+
+    impl immortality_tools::Tool for Constant {
+        fn name(&self) -> &'static str {
+            "constant"
+        }
+
+        fn schema(&self) -> &'static serde_json::Value {
+            static SCHEMA: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
+            SCHEMA.get_or_init(|| {
+                serde_json::json!({
+                    "type": "object",
+                    "properties": { "path": { "type": "string" } },
+                    "required": ["path"],
+                    "additionalProperties": false
+                })
+            })
+        }
+
+        fn description(&self) -> &'static str {
+            "Print the same text every time, whatever it is asked for."
+        }
+
+        fn effect(&self, _args: &Args) -> immortality_tools::Effect {
+            immortality_tools::Effect::Read
+        }
+
+        fn idempotency(&self, _args: &Args) -> Idempotency {
+            Idempotency::Idempotent
+        }
+
+        fn paths(&self, _args: &Args) -> Vec<immortality_tools::PathUse> {
+            Vec::new()
+        }
+
+        fn execute(&self, _ctx: &ToolCtx, _args: Args) -> Result<immortality_tools::ToolResult, ToolError> {
+            Ok(immortality_tools::ToolResult::text("the same text"))
+        }
+    }
+
+    /// Detector records in the journal, as `(detector, level)` pairs.
+    fn reactions(dir: &tempfile::TempDir) -> Vec<(String, String)> {
+        let reader = immortality_core::journal::JournalReader::open(
+            dir.path().join("journal"),
+            &TaskId::from_suffix("01ARZ3NDEKTSV4RRFFQ69G5FAJ"),
+        )
+        .expect("reader");
+        reader
+            .read()
+            .expect("records")
+            .records
+            .into_iter()
+            .filter(|record| record.fields.kind == Kind::DetectorFired)
+            .filter_map(|record| {
+                Some((
+                    record.event.payload.get("detector")?.as_str()?.to_string(),
+                    record.event.payload.get("level")?.as_str()?.to_string(),
+                ))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_exact_repeat_is_nudged_then_forced_then_ends_the_attempt() {
+        // The design's ladder: 3 → L1, 5 → L2, 8 → L3. Each rung is a record and the last one
+        // ends the attempt, so a model stuck on one call does not spend the whole step budget.
+        let replies = (0..20)
+            .map(|index| Ok(echo_reply(&format!("call_{index}"), "same")))
+            .collect();
+        let (dir, runner) = runner(Scripted::new(replies), registry(vec![Arc::new(Echo)]));
+        let mut journal = journal(&dir);
+        let outcome = runner.run(&subtask(), 1, "", &mut journal).expect("run");
+
+        assert!(
+            matches!(outcome.ending, Ending::Looped(_)),
+            "{:?}",
+            outcome.ending
+        );
+        assert_eq!(outcome.attempt.failure, Some(FailureReason::Looped));
+        let fired = reactions(&dir);
+        assert!(fired.contains(&("d1".to_string(), "l1".to_string())), "{fired:?}");
+        assert!(fired.contains(&("d1".to_string(), "l2".to_string())), "{fired:?}");
+        // Eight identical calls: L1 at the third, L2 at the fifth, L3 at the eighth. The attempt
+        // ends there instead of running to the step budget.
+        assert_eq!(outcome.steps, 8, "{:?}", outcome.ending);
+    }
+
+    #[test]
+    fn one_reasoning_loop_is_recorded_once() {
+        // The live run found this: `step` recorded D4 and `inject_l2` recorded it again, so one
+        // firing looked like two. The metric exists to be trusted, and a doubled count would make
+        // D4 look twice as common as it is.
+        let repeated = "the parser is fine ".repeat(60);
+        let model = Scripted::new(vec![Ok(Reply::text(repeated)), Ok(finish())]);
+        let (dir, mut runner) = runner(model, registry(vec![Arc::new(Echo)]));
+        runner.detectors.reasoning_repeat_ngram = 4;
+        runner.detectors.reasoning_repeat_count = 3;
+        let mut journal = journal(&dir);
+        runner.run(&subtask(), 1, "", &mut journal).expect("run");
+
+        let fired = reactions(&dir)
+            .into_iter()
+            .filter(|(detector, _)| detector == "d4")
+            .count();
+        assert_eq!(fired, 1, "{:?}", reactions(&dir));
+    }
+
+    #[test]
+    fn a_normal_run_does_not_fire_a_detector() {
+        // The failure that matters more than a missed loop: a detector that fires on ordinary
+        // work teaches everyone to ignore the metric.
+        let model = Scripted::new(vec![
+            Ok(echo_reply("call_1", "a")),
+            Ok(echo_reply("call_2", "b")),
+            Ok(echo_reply("call_3", "c")),
+            Ok(finish()),
+        ]);
+        let (dir, runner) = runner(model, registry(vec![Arc::new(Echo)]));
+        let mut journal = journal(&dir);
+        let outcome = runner.run(&subtask(), 1, "", &mut journal).expect("run");
+
+        assert!(outcome.claimed_done(), "{:?}", outcome.ending);
+        assert_eq!(reactions(&dir), Vec::<(String, String)>::new());
+    }
+
+    #[test]
+    fn two_different_calls_with_identical_output_are_a_semantic_repeat() {
+        // `Echo` prints its argument, so two different arguments print different things. The
+        // detector's signal is the opposite: the model changes the call and the answer is the
+        // same, which is what a `cat a` / `cat ./a` pair looks like.
+        let model = Scripted::new(vec![
+            Ok(Reply::call("call_1", "constant", r#"{"path":"a"}"#)),
+            Ok(Reply::call("call_2", "constant", r#"{"path":"b"}"#)),
+            Ok(finish()),
+        ]);
+        let (dir, runner) = runner(model, registry(vec![Arc::new(Constant)]));
+        let mut journal = journal(&dir);
+        runner.run(&subtask(), 1, "", &mut journal).expect("run");
+
+        let fired = reactions(&dir);
+        assert!(fired.contains(&("d2".to_string(), "l1".to_string())), "{fired:?}");
+    }
+
+    #[test]
+    fn a_nudge_reaches_the_model_and_the_prefix_does_not_move() {
+        // L1 is only useful if the model actually reads it, and it must not cost a cold prefill
+        // by being put in the stable prefix.
+        let model = Scripted::new(vec![
+            Ok(echo_reply("call_1", "same")),
+            Ok(echo_reply("call_2", "same")),
+            Ok(echo_reply("call_3", "same")),
+            Ok(finish()),
+        ]);
+        let (dir, runner) = runner(model.clone(), registry(vec![Arc::new(Echo)]));
+        let mut journal = journal(&dir);
+        runner.run(&subtask(), 1, "", &mut journal).expect("run");
+
+        let requests = model.requests();
+        let prefixes: Vec<&str> = requests
+            .iter()
+            .map(|request| request.messages[0].content.as_deref().unwrap_or(""))
+            .collect();
+        // The whole point of appending: every step's prefix is the same bytes.
+        assert!(
+            prefixes.windows(2).all(|pair| pair.first() == pair.last()),
+            "{prefixes:?}"
+        );
+        let nudged = requests.iter().any(|request| {
+            request.messages.iter().any(|message| {
+                message.role == "user"
+                    && message
+                        .content
+                        .as_deref()
+                        .is_some_and(|text| text.contains("repeating"))
+            })
+        });
+        assert!(nudged, "the model was never told it was repeating");
+    }
+
+    #[test]
+    fn a_stalled_model_is_forced_to_state_a_strategy_and_then_restarted() {
+        // D3: 15 unproductive steps → L2, 25 → L3. The thresholds are lowered here so the test
+        // does not have to script twenty-five turns to prove a ladder that core already asserts
+        // in detail.
+        let replies = (0..40)
+            .map(|index| Ok(Reply::text(format!("thinking {index}"))))
+            .collect();
+        let (dir, mut runner) = runner(Scripted::new(replies), registry(vec![Arc::new(Echo)]));
+        runner.detectors.progress_stall_warn = 4;
+        runner.detectors.progress_stall_stop = 5;
+        runner.limits.stall_steps = 100;
+        let mut journal = journal(&dir);
+        let outcome = runner.run(&subtask(), 1, "", &mut journal).expect("run");
+
+        assert!(
+            matches!(outcome.ending, Ending::Looped(_)),
+            "{:?}",
+            outcome.ending
+        );
+        let fired = reactions(&dir);
+        assert!(fired.contains(&("d3".to_string(), "l2".to_string())), "{fired:?}");
+        assert_eq!(outcome.steps, 5, "{:?}", outcome.ending);
+    }
+
+    #[test]
+    fn a_reasoning_loop_is_cut_mid_stream_and_the_attempt_continues() {
+        // D4 fires inside one message: the stream is aborted before the model finishes, and the
+        // attempt goes on with a forced strategy rather than ending. Without the abort this test
+        // would need a message long enough to reach the step budget, which is the cost D4 exists
+        // to avoid.
+        let repeated = "the parser is fine ".repeat(60);
+        let model = Scripted::new(vec![
+            Ok(Reply::text(repeated)),
+            Ok(echo_reply("call_1", "a")),
+            Ok(finish()),
+        ]);
+        let (dir, mut runner) = runner(model, registry(vec![Arc::new(Echo)]));
+        runner.detectors.reasoning_repeat_ngram = 4;
+        runner.detectors.reasoning_repeat_count = 3;
+        let mut journal = journal(&dir);
+        let outcome = runner.run(&subtask(), 1, "", &mut journal).expect("run");
+
+        assert!(outcome.claimed_done(), "{:?}", outcome.ending);
+        let fired = reactions(&dir);
+        assert!(fired.contains(&("d4".to_string(), "l2".to_string())), "{fired:?}");
+        let aborted = {
+            let reader = immortality_core::journal::JournalReader::open(
+                dir.path().join("journal"),
+                &TaskId::from_suffix("01ARZ3NDEKTSV4RRFFQ69G5FAJ"),
+            )
+            .expect("reader");
+            reader
+                .read()
+                .expect("records")
+                .records
+                .into_iter()
+                .filter(|record| record.fields.kind == Kind::ModelStreamAborted)
+                .count()
+        };
+        assert_eq!(aborted, 1);
+    }
+
+    #[test]
+    fn the_reasoning_loop_is_cut_before_the_message_finishes() {
+        // Aborting is the point. A detector that waits for the whole message and then reports a
+        // loop saves nothing — the cost D4 exists to avoid has already been paid. The journal's
+        // `chars_seen` is the observable proof: it must be a fraction of the scripted 1 200
+        // characters, not all of them.
+        let repeated = "the parser is fine ".repeat(60);
+        assert!(repeated.chars().count() > 1_000);
+        let model = Scripted::new(vec![Ok(Reply::text(repeated))]);
+        let (dir, mut runner) = runner(model, registry(vec![Arc::new(Echo)]));
+        runner.detectors.reasoning_repeat_ngram = 4;
+        runner.detectors.reasoning_repeat_count = 3;
+        runner.limits.max_steps = 1;
+        let mut journal = journal(&dir);
+        runner.run(&subtask(), 1, "", &mut journal).expect("run");
+
+        let reader = immortality_core::journal::JournalReader::open(
+            dir.path().join("journal"),
+            &TaskId::from_suffix("01ARZ3NDEKTSV4RRFFQ69G5FAJ"),
+        )
+        .expect("reader");
+        let seen: Vec<u64> = reader
+            .read()
+            .expect("records")
+            .records
+            .into_iter()
+            .filter(|record| record.fields.kind == Kind::ModelStreamAborted)
+            .filter_map(|record| record.event.payload.get("chars_seen")?.as_u64())
+            .collect();
+        assert_eq!(seen.len(), 1, "one abort");
+        assert!(
+            seen[0] < 300,
+            "the stream was not cut early: {} characters arrived",
+            seen[0]
+        );
+    }
+
+    #[test]
+    fn a_reasoning_loop_that_repeats_forever_still_ends_at_the_step_budget() {
+        // D4 alone does not stop a model that loops in every message; it counts as an idle step,
+        // so D3 and the step budget still get their turn.
+        let repeated = "the parser is fine ".repeat(60);
+        let replies = (0..40).map(|_| Ok(Reply::text(repeated.clone()))).collect();
+        let (dir, mut runner) = runner(Scripted::new(replies), registry(vec![Arc::new(Echo)]));
+        runner.detectors.reasoning_repeat_ngram = 4;
+        runner.detectors.reasoning_repeat_count = 3;
+        runner.limits.max_steps = 6;
+        let mut journal = journal(&dir);
+        let outcome = runner.run(&subtask(), 1, "", &mut journal).expect("run");
+
+        assert!(matches!(outcome.ending, Ending::Steps), "{:?}", outcome.ending);
+        assert_eq!(outcome.steps, 6);
+    }
+
+    #[test]
+    fn a_step_budget_ending_is_recorded_as_d5() {
+        // The metric query "how often did the budget stop a run" has to be answerable from the
+        // journal, not from the attempt counters alone.
+        let replies = (0..20)
+            .map(|index| Ok(echo_reply(&format!("call_{index}"), &format!("p{index}"))))
+            .collect();
+        let (dir, mut runner) = runner(Scripted::new(replies), registry(vec![Arc::new(Echo)]));
+        runner.limits.max_steps = 2;
+        let mut journal = journal(&dir);
+        let outcome = runner.run(&subtask(), 1, "", &mut journal).expect("run");
+
+        assert_eq!(outcome.ending, Ending::Steps);
+        assert!(
+            reactions(&dir).contains(&("d5".to_string(), "l3".to_string())),
+            "{:?}",
+            reactions(&dir)
+        );
+    }
+
+    #[test]
+    fn every_detector_record_carries_the_attempt_scope() {
+        // Same invariant as every other record: a `detector_fired` without a scope belongs to no
+        // attempt, and the metric would be attributed to the task rather than to the run.
+        let replies = (0..20)
+            .map(|index| Ok(echo_reply(&format!("call_{index}"), "same")))
+            .collect();
+        let (dir, runner) = runner(Scripted::new(replies), registry(vec![Arc::new(Echo)]));
+        let subtask = subtask();
+        let mut journal = journal(&dir);
+        runner.run(&subtask, 3, "again", &mut journal).expect("run");
+
+        let reader = immortality_core::journal::JournalReader::open(
+            dir.path().join("journal"),
+            &TaskId::from_suffix("01ARZ3NDEKTSV4RRFFQ69G5FAJ"),
+        )
+        .expect("reader");
+        let fired: Vec<_> = reader
+            .read()
+            .expect("records")
+            .records
+            .into_iter()
+            .filter(|record| record.fields.kind == Kind::DetectorFired)
+            .collect();
+        assert_ne!(fired.len(), 0);
+        for record in &fired {
+            assert_eq!(record.fields.subtask.as_ref(), Some(&subtask.id));
+            assert_eq!(record.fields.attempt, Some(3));
+        }
     }
 }

@@ -91,7 +91,7 @@ logs/2026-10.log.gz      # архивы по месяцам
 | `tool_call_unknown` | процесс умер, эффект неизвестен |
 | `effect_verified` / `effect_absent` | результат probe после сбоя |
 | `checkpoint_created` | git-чекпоинт и его SHA |
-| `detector_fired` | тип детектора, уровень, метрика |
+| `detector_fired` | `d1`…`d5`, уровень `l1`…`l3`, счётчик-метрика; одна запись на шаг (D-077) |
 | `compaction` | компактация контекста |
 | `gate_result` | сборка/тесты/линт/reviewer |
 | `escalation_opened`, `escalation_resolved` | очередь эскалаций (D-067) |

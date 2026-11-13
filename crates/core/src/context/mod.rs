@@ -177,6 +177,16 @@ pub enum Entry {
         name: String,
         output: String,
     },
+    /// A message the system puts in front of the model, not the model's own words.
+    ///
+    /// Used by the detector ladder: when D1 or D3 fires, the model is told what it is repeating.
+    /// It cannot go into the stable prefix — that would invalidate the cache on every nudge — so
+    /// it goes at the end of the history, where an append costs nothing and the model still reads
+    /// it before the next step.
+    Note {
+        /// The instruction, already phrased for the model.
+        text: String,
+    },
 }
 
 impl Entry {
@@ -190,6 +200,12 @@ impl Entry {
         }
     }
 
+    /// A system instruction appended to the history.
+    #[must_use]
+    pub fn note(text: impl Into<String>) -> Self {
+        Self::Note { text: text.into() }
+    }
+
     /// Text of this entry as the model sees it, for counting.
     ///
     /// Tool results are counted with their text only: the call id and the name are a few dozen
@@ -199,7 +215,7 @@ impl Entry {
     #[must_use]
     pub fn text(&self) -> &str {
         match self {
-            Self::Assistant { text, .. } => text,
+            Self::Assistant { text, .. } | Self::Note { text } => text,
             Self::Tool { output, .. } => output,
         }
     }
@@ -555,6 +571,20 @@ mod tests {
         context.clear_history();
         assert_eq!(context.system(), prefix);
         assert_eq!(context.steps(), 0);
+    }
+
+    #[test]
+    fn a_note_counts_toward_the_budget_and_is_counted_as_its_text() {
+        // The nudge spends context like anything else; a counter that skipped notes would
+        // under-report exactly when the ladder is adding text.
+        let mut context = Context::new(&StableLayers {
+            system: "S".to_string(),
+            ..StableLayers::default()
+        });
+        let counter = CharsCounter::new(4.0);
+        let before = context.estimate(&counter);
+        context.push_entry(Entry::note("y".repeat(400)));
+        assert_eq!(context.estimate(&counter) - before, 100);
     }
 
     #[test]

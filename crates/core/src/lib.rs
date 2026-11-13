@@ -23,6 +23,7 @@ pub mod checkpoint;
 pub mod config;
 pub mod context;
 pub mod delegation;
+pub mod detect;
 pub mod domain;
 pub mod error;
 pub mod escalation;

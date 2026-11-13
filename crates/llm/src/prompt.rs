@@ -73,6 +73,13 @@ pub fn messages(context: &Context) -> Vec<Message> {
                     output.clone(),
                 ));
             }
+            // A nudge from the detector ladder is the system talking, and the wire protocol has
+            // no third role. `user` is the honest choice: the model is being asked a question
+            // ("what will you do differently?"), not handed a tool result it could mistake for
+            // output it asked for. A `system` message in the middle of a conversation is
+            // accepted by some servers and silently ignored by others, which would make the
+            // ladder a no-op on exactly the backend this project targets.
+            Entry::Note { text } => messages.push(Message::user(text.clone())),
         }
     }
     messages
@@ -198,6 +205,33 @@ mod tests {
         let messages = messages(&context);
         assert_eq!(messages[2].role, "assistant");
         assert_eq!(messages[2].tool_calls, None);
+    }
+
+    #[test]
+    fn a_note_becomes_a_user_message_after_the_history_it_comments_on() {
+        // The ladder's nudge cannot go into the prefix — that would invalidate the cache — so it
+        // is appended, and it must arrive after the calls it is about.
+        let mut context = context();
+        context.push_assistant("looking", vec![]);
+        context.push_entry(Entry::note("you are repeating yourself"));
+        let messages = messages(&context);
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0].role, "system");
+        assert_eq!(messages[1].role, "user");
+        assert_eq!(messages[2].role, "assistant");
+        assert_eq!(messages[3].role, "user");
+        assert_eq!(messages[3].content.as_deref(), Some("you are repeating yourself"));
+    }
+
+    #[test]
+    fn a_note_does_not_move_the_prefix() {
+        // The point of appending it: the cache keys on the prefix, and a nudge that changed the
+        // prefix would cost a cold prefill exactly when a run is already going badly.
+        let mut context = context();
+        let prefix = serde_json::to_string(&messages(&context)[0]).expect("serialise");
+        context.push_entry(Entry::note("you are repeating yourself"));
+        let later = serde_json::to_string(&messages(&context)[0]).expect("serialise");
+        assert_eq!(later, prefix);
     }
 
     #[test]
