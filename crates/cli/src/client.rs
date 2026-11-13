@@ -103,10 +103,23 @@ impl Client {
         }
         let token = read_token(token_path)?;
         let mut client = Self::open(socket, token).await?;
-        // `hello` is the handshake *and* the token check: a wrong token is refused here, before
-        // any command runs, rather than after it looked like it was going to work.
-        let response = client.request("hello", json!({})).await?;
+        // `hello` is the handshake, the token check *and* the version negotiation: a wrong token
+        // or a different protocol is refused here, before any command runs, rather than after it
+        // looked like it was going to work. The version is sent, not merely compared afterwards:
+        // the daemon is the side that can say which of the two problems this is.
+        let response = client
+            .request("hello", json!({ "version": rpc::VERSION }))
+            .await?;
         if let Some(error) = response.error {
+            // The distinction matters to a human: a version complaint means both sides are whole
+            // and disagreeing, so restoring the token would change nothing.
+            if error.code == rpc::ErrorCode::VersionMismatch {
+                bail!(
+                    "{}\n\
+                     Restart the daemon with this binary; nothing was changed.",
+                    error.message
+                );
+            }
             bail!(
                 "the daemon refused this client: {}\n\
                  The token in {} does not match the running daemon. Restart the daemon, or\n\
@@ -121,6 +134,9 @@ impl Client {
             .and_then(|result| result.get("version"))
             .and_then(Value::as_u64)
             .unwrap_or(0);
+        // A daemon too old to negotiate answered without a version or with an older one. Kept as
+        // a second check rather than replaced by the request field: an older daemon silently
+        // ignores `params`, and silence is not agreement.
         if version != u64::from(rpc::VERSION) {
             bail!(
                 "the daemon speaks protocol {version} and this client speaks {}.\n\
@@ -294,7 +310,9 @@ impl Client {
                 socket.display()
             )
         })?;
-        let response = client.request("hello", json!({})).await?;
+        let response = client
+            .request("hello", json!({ "version": rpc::VERSION }))
+            .await?;
         if let Some(error) = response.error {
             bail!("the daemon refused the reconnect: {}", error.message);
         }

@@ -258,14 +258,12 @@ async fn connection(stream: UnixStream, state: &ServerState, events: &Events) ->
         }
 
         if request.method == "hello" {
-            authorised = true;
-            let response = Response::ok(
-                request.id,
-                json!({
-                    "version": rpc::VERSION,
-                    "protocol": "immortality",
-                }),
-            );
+            let response = hello(request.id, &request.params);
+            // Only a successful handshake authorises the rest of the connection. A version
+            // refusal leaves it unauthorised: the two builds have just agreed they disagree, and
+            // marking the client authorised would let the next request be interpreted by exactly
+            // the daemon it was told not to talk to.
+            authorised = response.error.is_none();
             write_line(&mut write, &response).await?;
             continue;
         }
@@ -437,6 +435,44 @@ fn encode_error(error: &serde_json::Error) -> std::io::Error {
 /// Every handler at this milestone answers from local files, so this is synchronous. M4's
 /// scheduler handlers will need a runtime, and this becomes `async` again then; declaring it
 /// `async` now would only imply a suspension point that does not exist.
+/// `hello`: prove the token was accepted, and negotiate the protocol version.
+///
+/// Version negotiation lives here rather than in the client because a client comparing versions
+/// *after* a successful handshake has already been handed code that assumed the answer. The
+/// daemon can tell the difference between "your token is wrong" and "your build is different",
+/// and a client that only checked on its own could not.
+///
+/// A mismatched version is a refusal, not a disconnect: the human running an old terminal against
+/// a new daemon needs the message, and a client that omitted `version` is still answerable.
+fn hello(id: u64, params: &Value) -> Response {
+    // A malformed `params` is treated as "no version claimed": the token was already proven, and
+    // an unparseable extra field is not a reason to refuse a client that speaks this build.
+    let theirs = serde_json::from_value::<rpc::HelloParams>(params.clone())
+        .ok()
+        .and_then(|claimed| claimed.version);
+    if let Some(theirs) = theirs
+        && theirs != rpc::VERSION
+    {
+        return Response::failed(
+            id,
+            RpcError::new(
+                ErrorCode::VersionMismatch,
+                format!(
+                    "this daemon speaks protocol {} and this client speaks {theirs}",
+                    rpc::VERSION
+                ),
+            ),
+        );
+    }
+    Response::ok(
+        id,
+        json!({
+            "version": rpc::VERSION,
+            "protocol": "immortality",
+        }),
+    )
+}
+
 fn dispatch(request: &Request, state: &ServerState) -> Result<Value, RpcError> {
     match request.method.as_str() {
         "status" => status(state, &request.params),

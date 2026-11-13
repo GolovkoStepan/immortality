@@ -316,6 +316,65 @@ async fn the_token_alone_is_not_enough_hello_must_come_first() {
 }
 
 #[tokio::test]
+async fn hello_refuses_a_client_that_speaks_another_protocol() {
+    // The negotiation the roadmap asks for: a newer client must be told its *build* is the
+    // problem, not be fed answers meant for a different schema. The daemon is the side that can
+    // tell that apart from a bad token, which is why the version is sent with `hello`.
+    let fixture = Fixture::new();
+    let _server = fixture.serve();
+
+    let mut client = Client::connect(&fixture.socket, &fixture.token).await;
+    let response = client
+        .request("hello", json!({ "version": rpc::VERSION + 1 }))
+        .await;
+    let error = response.error.expect("a foreign protocol must be refused");
+    assert_eq!(error.code, ErrorCode::VersionMismatch);
+    assert!(error.message.contains(&rpc::VERSION.to_string()), "{error:?}");
+
+    // The refusal does not authorise the connection: the next request is still refused, and a
+    // daemon has not silently started serving a build it just said it cannot talk to.
+    let status = client.request("status", json!({})).await;
+    assert_eq!(
+        status.error.expect("still unauthenticated").code,
+        ErrorCode::Unauthorized
+    );
+}
+
+#[tokio::test]
+async fn hello_without_a_version_is_accepted() {
+    // A human debugging with `printf` must still be able to hand-shake: the field is optional,
+    // and its absence means "I am not claiming a version" rather than "I claim zero".
+    let fixture = Fixture::new();
+    let _server = fixture.serve();
+
+    let mut client = Client::connect(&fixture.socket, &fixture.token).await;
+    let response = client.request("hello", json!({})).await;
+    assert!(response.error.is_none(), "{response:?}");
+    assert_eq!(response.result.unwrap()["version"], rpc::VERSION);
+}
+
+#[tokio::test]
+async fn a_version_mismatch_is_not_reported_as_a_bad_token() {
+    // The human-facing consequence of doing the negotiation on the daemon: a stale token and a
+    // stale binary produce different messages, because the fix is different.
+    let fixture = Fixture::new();
+    let _server = fixture.serve();
+
+    let mut stale = Client::connect(&fixture.socket, "wrong-token").await;
+    let token_error = stale.request("hello", json!({ "version": rpc::VERSION })).await;
+    assert_eq!(token_error.error.expect("refused").code, ErrorCode::Unauthorized);
+
+    let mut wrong_version = Client::connect(&fixture.socket, &fixture.token).await;
+    let version_error = wrong_version
+        .request("hello", json!({ "version": rpc::VERSION + 7 }))
+        .await;
+    assert_eq!(
+        version_error.error.expect("refused").code,
+        ErrorCode::VersionMismatch
+    );
+}
+
+#[tokio::test]
 async fn hello_reports_the_protocol_version() {
     let fixture = Fixture::new();
     let _server = fixture.serve();

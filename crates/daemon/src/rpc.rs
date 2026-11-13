@@ -173,6 +173,23 @@ impl ErrorCode {
     }
 }
 
+/// The `hello` request's parameters.
+///
+/// `version` is the client's own protocol version. It is a field rather than a second method
+/// because the whole point of `hello` is to be answerable *before* either side knows whether the
+/// other can understand anything: a separate `version` method would itself be subject to the
+/// version it is meant to establish.
+///
+/// Omitted means "do not check" — a hand-written `printf` during debugging must still get an
+/// answer, and refusing that would make the one tool a human reaches for useless in exactly the
+/// situation it is for.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HelloParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<u32>,
+}
+
 /// The methods this build answers. Closed, for the same reason as [`ErrorCode`].
 ///
 /// `gc` is deliberately absent: it needs the live set from the scheduler and the storage

@@ -487,6 +487,16 @@ fn serve_brings_up_a_daemon_that_the_other_commands_can_reach() {
         assert_eq!(mode & 0o777, 0o600, "token mode {mode:o}");
     }
 
+    // An existing token is never rewritten: a restart must not lock out a terminal attached to
+    // the previous daemon, and a token that changes silently is one a human cannot trust.
+    let minted = token;
+    daemon.cli().arg("status").assert().success();
+    assert_eq!(
+        std::fs::read_to_string(daemon.token_path()).expect("reread"),
+        minted,
+        "a second start replaced the token"
+    );
+
     // `status` reaches it and sees the journal.
     daemon
         .cli()
