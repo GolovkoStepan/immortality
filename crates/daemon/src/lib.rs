@@ -11,6 +11,7 @@
 
 pub mod doctor;
 pub mod rpc;
+pub mod runner;
 pub mod server;
 
 /// Version of the daemon<->client protocol.

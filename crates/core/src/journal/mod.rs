@@ -40,7 +40,7 @@
 mod record;
 mod writer;
 
-pub use record::{JournalEvent, JournalRecord, Kind, RecordFields, SCHEMA_VERSION};
+pub use record::{JournalEvent, JournalRecord, Kind, RecordFields, SCHEMA_VERSION, Scope};
 pub use writer::{Journal, JournalReader, ReadOutcome, ReadProblem, SEGMENT_LIMIT_BYTES, hash_line};
 
 /// A 32-byte SHA-256 digest, written as `sha256:<64 hex>` wherever it appears in a file.

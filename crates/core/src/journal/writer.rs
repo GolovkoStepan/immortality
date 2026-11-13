@@ -30,7 +30,7 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest as _, Sha256};
 
 use super::Digest;
-use super::record::{JournalEvent, JournalRecord, RecordFields};
+use super::record::{JournalEvent, JournalRecord, RecordFields, Scope};
 use crate::domain::{TaskId, Timestamp};
 use crate::journal::Kind;
 
@@ -170,6 +170,30 @@ impl Journal {
         self.append(fields, JournalEvent::with_payload(payload))
     }
 
+    /// Append an event attributed to a subtask and an attempt.
+    ///
+    /// The scope is not decoration: recovery groups attempts by `(subtask, attempt)` to decide
+    /// which ones a crash left `Running`, so a record written without it is invisible to the one
+    /// pass that is supposed to close an interrupted attempt. `append_event` stays for records
+    /// that genuinely belong to the task rather than to a pass at it.
+    pub fn append_scoped(
+        &mut self,
+        at: Timestamp,
+        kind: Kind,
+        payload: serde_json::Value,
+        scope: &Scope,
+    ) -> crate::Result<JournalRecord> {
+        let fields = RecordFields {
+            seq: self.next_seq,
+            at,
+            task: self.task.clone(),
+            subtask: scope.subtask.clone(),
+            attempt: scope.attempt,
+            kind,
+        };
+        self.append(fields, JournalEvent::with_payload(payload))
+    }
+
     /// Append a fully built event with a given kind.
     ///
     /// Unlike [`Self::append_event`], this accepts a [`JournalEvent`] so that an artifact
@@ -182,6 +206,25 @@ impl Journal {
         event: JournalEvent,
     ) -> crate::Result<JournalRecord> {
         let fields = RecordFields::new(self.next_seq, at, self.task.clone(), kind);
+        self.append(fields, event)
+    }
+
+    /// [`Self::append_full`] with the subtask and attempt the event belongs to.
+    pub fn append_full_scoped(
+        &mut self,
+        at: Timestamp,
+        kind: Kind,
+        event: JournalEvent,
+        scope: &Scope,
+    ) -> crate::Result<JournalRecord> {
+        let fields = RecordFields {
+            seq: self.next_seq,
+            at,
+            task: self.task.clone(),
+            subtask: scope.subtask.clone(),
+            attempt: scope.attempt,
+            kind,
+        };
         self.append(fields, event)
     }
 
@@ -748,6 +791,56 @@ mod tests {
         let outcome = reader.read().unwrap();
         assert_eq!(outcome.records.len(), 3);
         assert_eq!(outcome.problems, Vec::new());
+    }
+
+    #[test]
+    fn a_scoped_record_carries_the_subtask_and_attempt() {
+        // Recovery keys attempts by `(subtask, attempt)`. A record written without the scope is
+        // invisible to the pass that closes interrupted attempts, so the scope is asserted on
+        // both the in-memory record and the bytes on disk.
+        let dir = tempfile::tempdir().unwrap();
+        let task = TaskId::from_suffix("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let subtask = crate::domain::SubtaskId::from_suffix("01ARZ3NDEKTSV4RRFFQ69G5FAA");
+        {
+            let mut writer = Journal::open(dir.path(), task.clone()).unwrap();
+            let record = writer
+                .append_scoped(
+                    at(),
+                    Kind::AttemptStarted,
+                    serde_json::json!({ "number": 2 }),
+                    &crate::journal::Scope::attempt(subtask.clone(), 2),
+                )
+                .unwrap();
+            assert_eq!(record.fields.subtask.as_ref(), Some(&subtask));
+            assert_eq!(record.fields.attempt, Some(2));
+            writer.close().unwrap();
+        }
+
+        let text = std::fs::read_to_string(dir.path().join("JOURNAL.jsonl")).unwrap();
+        let line: serde_json::Value = serde_json::from_str(text.trim_end()).unwrap();
+        assert_eq!(line["subtask"], subtask.as_str());
+        assert_eq!(line["attempt"], 2);
+
+        let reader = JournalReader::open(dir.path(), &task).unwrap();
+        let records = reader.read().unwrap().records;
+        assert_eq!(records[0].fields.subtask.as_ref(), Some(&subtask));
+        assert_eq!(records[0].fields.attempt, Some(2));
+    }
+
+    #[test]
+    fn an_unscoped_record_omits_the_scope_fields_entirely() {
+        // `skip_serializing_if` is load-bearing: a record about the task must not claim an
+        // attempt number it does not have, because `null` and "absent" read differently to
+        // every consumer that looks the field up by name.
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = journal(dir.path());
+        writer
+            .append_event(at(), Kind::DaemonStarted, serde_json::json!({}))
+            .unwrap();
+        let text = std::fs::read_to_string(dir.path().join("JOURNAL.jsonl")).unwrap();
+        let line: serde_json::Value = serde_json::from_str(text.trim_end()).unwrap();
+        assert!(line.get("subtask").is_none(), "{line}");
+        assert!(line.get("attempt").is_none(), "{line}");
     }
 
     #[test]

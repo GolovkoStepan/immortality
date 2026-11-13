@@ -24,13 +24,28 @@ use immortality_core::context::{Context, Entry, ToolCall};
 use crate::turn;
 use crate::wire::Message;
 
+/// The one user turn every attempt starts with.
+///
+/// The stable prefix — layers 1–4, brief included — goes into the system message, so the model
+/// already knows what to do; what it lacks is a *turn to answer*. Chat templates require at
+/// least one user message, and strata rejects the request outright with `No user query found in
+/// messages`, which turns every step into a `Backend` ending before any work happens.
+///
+/// A constant rather than the brief, deliberately: it sits inside the cacheable prefix, so the
+/// bytes must not change between steps. Moving the brief here would work too and would be the
+/// more conventional layout, but it would split the prefix across two messages for no gain —
+/// the model reads both, and the cache keys on the whole prefix either way.
+const BEGIN: &str = "Begin. Work step by step, using the tools you have been given.";
+
 /// Build the message list for one step.
 ///
-/// One system message carrying the stable prefix, then the history in order.
+/// One system message carrying the stable prefix, one constant user turn, then the history in
+/// order.
 #[must_use]
 pub fn messages(context: &Context) -> Vec<Message> {
-    let mut messages = Vec::with_capacity(1 + context.steps());
+    let mut messages = Vec::with_capacity(2 + context.steps());
     messages.push(Message::system(context.system()));
+    messages.push(Message::user(BEGIN));
     for entry in context.history() {
         match entry {
             Entry::Assistant { text, calls } => {
@@ -98,10 +113,37 @@ mod tests {
     fn the_system_message_is_the_whole_prefix() {
         let context = context();
         let messages = messages(&context);
-        assert_eq!(messages.len(), 1);
+        assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].role, "system");
         assert_eq!(messages[0].content.as_deref(), Some(context.system()));
         assert_eq!(stable_prefix_len(&messages), context.system().len());
+    }
+
+    #[test]
+    fn every_request_carries_a_user_turn_because_the_backend_requires_one() {
+        // Measured on the live backend: a request whose messages are all `system` is rejected
+        // with `No user query found in messages`, before the model sees anything. A fake model
+        // never says so, so the run would fail on its first real step.
+        let context = context();
+        let messages = messages(&context);
+        let users: Vec<&Message> = messages.iter().filter(|m| m.role == "user").collect();
+        assert_eq!(users.len(), 1, "{messages:?}");
+        assert_ne!(users[0].content.as_deref().unwrap_or(""), "");
+    }
+
+    #[test]
+    fn the_user_turn_is_stable_across_steps() {
+        // It sits inside the prefix the cache keys on, so it must not vary: a user turn that
+        // quoted the last observation would look helpful and cost a 400× prefill every step.
+        let mut context = context();
+        let first = {
+            let messages = messages(&context);
+            serde_json::to_string(&messages[1]).expect("serialise")
+        };
+        context.push_assistant("thinking", vec![]);
+        context.push_entry(Entry::tool("call", "read_file", "fn main() {}"));
+        let later = serde_json::to_string(&messages(&context)[1]).expect("serialise");
+        assert_eq!(later, first);
     }
 
     #[test]
@@ -132,8 +174,8 @@ mod tests {
         context.push_entry(Entry::tool("call_1", "read_file", "[package]"));
 
         let messages = messages(&context);
-        assert_eq!(messages.len(), 3);
-        let assistant = &messages[1];
+        assert_eq!(messages.len(), 4);
+        let assistant = &messages[2];
         assert_eq!(assistant.role, "assistant");
         assert_eq!(assistant.content.as_deref(), Some("checking the config"));
         let calls = assistant.tool_calls.as_ref().expect("calls");
@@ -142,7 +184,7 @@ mod tests {
         assert_eq!(calls[0].function.name, "read_file");
         assert_eq!(calls[0].function.arguments, r#"{"path":"Cargo.toml"}"#);
 
-        let tool = &messages[2];
+        let tool = &messages[3];
         assert_eq!(tool.role, "tool");
         assert_eq!(tool.tool_call_id.as_deref(), Some("call_1"));
         assert_eq!(tool.name.as_deref(), Some("read_file"));
@@ -154,8 +196,8 @@ mod tests {
         let mut context = context();
         context.push_assistant("done", vec![]);
         let messages = messages(&context);
-        assert_eq!(messages[1].role, "assistant");
-        assert_eq!(messages[1].tool_calls, None);
+        assert_eq!(messages[2].role, "assistant");
+        assert_eq!(messages[2].tool_calls, None);
     }
 
     #[test]
@@ -164,6 +206,6 @@ mod tests {
         context.push_assistant("a", vec![]);
         context.push_entry(Entry::tool("c1", "grep", "hit"));
         context.push_assistant("b", vec![]);
-        assert_eq!(messages(&context).len(), 1 + context.steps());
+        assert_eq!(messages(&context).len(), 2 + context.steps());
     }
 }

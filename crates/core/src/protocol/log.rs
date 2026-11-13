@@ -24,13 +24,19 @@
 use std::collections::BTreeMap;
 
 use crate::Result;
-use crate::journal::{Journal, JournalEvent, Kind};
+use crate::journal::{Journal, JournalEvent, Kind, Scope};
 use crate::protocol::{CallId, Idempotency, Intent, OpenCall, Probe};
 
 /// A journal-backed log of tool calls for one attempt.
 #[derive(Debug)]
 pub struct ToolCallLog<'journal> {
     journal: &'journal mut Journal,
+    /// The subtask and attempt every record belongs to.
+    ///
+    /// Carried by the log rather than passed to each method: recovery keys attempts by
+    /// `(subtask, attempt)`, and a call record that omits it is a record about no attempt —
+    /// which is exactly the association an operator reading `immortality log` is looking for.
+    scope: Scope,
     /// Calls whose `intent` has been written but which are not finished.
     ///
     /// Kept in memory for ordering checks within one process run. It is not the source of
@@ -40,11 +46,28 @@ pub struct ToolCallLog<'journal> {
 }
 
 impl<'journal> ToolCallLog<'journal> {
-    /// Start logging into `journal`.
+    /// Start logging into `journal`, for a call that belongs to no particular attempt.
+    ///
+    /// Used by recovery, which closes calls from a journal it cannot attribute: the records it
+    /// writes are about the task, not about a pass at it.
     #[must_use]
     pub const fn new(journal: &'journal mut Journal) -> Self {
         Self {
             journal,
+            scope: Scope::task(),
+            open: BTreeMap::new(),
+        }
+    }
+
+    /// Start logging into `journal` for one attempt.
+    ///
+    /// The runner uses this one: a tool call always belongs to the attempt that made it, and
+    /// the scope is what lets recovery and `log` put the call back where it belongs.
+    #[must_use]
+    pub const fn scoped(journal: &'journal mut Journal, scope: Scope) -> Self {
+        Self {
+            journal,
+            scope,
             open: BTreeMap::new(),
         }
     }
@@ -57,10 +80,11 @@ impl<'journal> ToolCallLog<'journal> {
                 intent.call
             )));
         }
-        let record = self.journal.append_event(
+        let record = self.journal.append_scoped(
             crate::time::now(),
             Kind::ToolCallIntent,
             with_call(&intent.call, payload),
+            &self.scope,
         )?;
         debug_assert_eq!(record.fields.kind, Kind::ToolCallIntent);
         self.open.insert(intent.call.clone(), intent.clone());
@@ -74,8 +98,12 @@ impl<'journal> ToolCallLog<'journal> {
     /// available for a `start_process` probe after a crash.
     pub fn started(&mut self, call: &CallId, handle: serde_json::Value) -> Result<()> {
         self.require_open(call)?;
-        self.journal
-            .append_event(crate::time::now(), Kind::ToolCallStarted, with_call(call, handle))?;
+        self.journal.append_scoped(
+            crate::time::now(),
+            Kind::ToolCallStarted,
+            with_call(call, handle),
+            &self.scope,
+        )?;
         Ok(())
     }
 
@@ -101,7 +129,7 @@ impl<'journal> ToolCallLog<'journal> {
             None => JournalEvent::with_payload(observation),
         };
         self.journal
-            .append_full(crate::time::now(), Kind::ToolCallCompleted, event)
+            .append_full_scoped(crate::time::now(), Kind::ToolCallCompleted, event, &self.scope)
             .map(|_| ())
     }
 
@@ -109,8 +137,12 @@ impl<'journal> ToolCallLog<'journal> {
     pub fn failed(&mut self, call: &CallId, error: serde_json::Value) -> Result<()> {
         self.require_open(call)?;
         self.open.remove(call);
-        self.journal
-            .append_event(crate::time::now(), Kind::ToolCallFailed, with_call(call, error))?;
+        self.journal.append_scoped(
+            crate::time::now(),
+            Kind::ToolCallFailed,
+            with_call(call, error),
+            &self.scope,
+        )?;
         Ok(())
     }
 
@@ -121,8 +153,12 @@ impl<'journal> ToolCallLog<'journal> {
     pub fn unknown(&mut self, call: &CallId, reason: serde_json::Value) -> Result<()> {
         self.require_open(call)?;
         self.open.remove(call);
-        self.journal
-            .append_event(crate::time::now(), Kind::ToolCallUnknown, with_call(call, reason))?;
+        self.journal.append_scoped(
+            crate::time::now(),
+            Kind::ToolCallUnknown,
+            with_call(call, reason),
+            &self.scope,
+        )?;
         Ok(())
     }
 
@@ -139,7 +175,7 @@ impl<'journal> ToolCallLog<'journal> {
             }
         };
         self.journal
-            .append_event(crate::time::now(), kind, with_call(call, detail))?;
+            .append_scoped(crate::time::now(), kind, with_call(call, detail), &self.scope)?;
         Ok(())
     }
 

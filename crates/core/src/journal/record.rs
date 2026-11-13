@@ -247,6 +247,51 @@ impl RecordFields {
     }
 }
 
+/// Which subtask and attempt a record belongs to.
+///
+/// A separate type because the pair travels together: recovery keys attempts by
+/// `(subtask, attempt)`, and passing the two fields separately is how one of them gets left
+/// `None` and the record becomes invisible to the pass that closes interrupted attempts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Scope {
+    /// The subtask the record is about.
+    pub subtask: Option<SubtaskId>,
+    /// The 1-based attempt number, not the attempt's id: that is what the journal stores.
+    pub attempt: Option<u32>,
+}
+
+impl Scope {
+    /// A record about one attempt.
+    #[must_use]
+    pub const fn attempt(subtask: SubtaskId, attempt: u32) -> Self {
+        Self {
+            subtask: Some(subtask),
+            attempt: Some(attempt),
+        }
+    }
+
+    /// A record about a subtask but not about one of its attempts.
+    #[must_use]
+    pub const fn subtask(subtask: SubtaskId) -> Self {
+        Self {
+            subtask: Some(subtask),
+            attempt: None,
+        }
+    }
+
+    /// A record about the task as a whole.
+    ///
+    /// Recovery closes calls it cannot attribute to a pass, and a record that invented an
+    /// attempt number would make `attempts.json` claim a pass that never ran.
+    #[must_use]
+    pub const fn task() -> Self {
+        Self {
+            subtask: None,
+            attempt: None,
+        }
+    }
+}
+
 /// A single event, ready to be written.
 ///
 /// The payload is a [`serde_json::Value`] rather than a typed per-kind enum. `kind` already
