@@ -263,6 +263,20 @@ pub struct PolicyGate {
     allow_write: PatternSet,
     deny_write: PatternSet,
     deny_read: PatternSet,
+    /// The project's own `.agent/`, when the caller knows it.
+    ///
+    /// The plan, the acceptance criteria and the task tree have exactly one home: `<repo>/.agent/`.
+    /// The worktree is a *sibling* directory (`<parent>/<name>-agent/<task>`) and holds a checked-out
+    /// copy of `.agent/` from whenever the branch was cut. That copy is stale by construction —
+    /// measured on the `word-count` fixture: the project said every subtask was `done` while the
+    /// worktree still said all of them were `pending`. `read_state` and `update_state` therefore
+    /// address this directory, and the gate has to know where it is to allow a path it does not
+    /// otherwise reach.
+    ///
+    /// `None` means "no project root known", which is the honest answer for a gate built by a test
+    /// or a caller that only has a worktree. State tools then fall back to the worktree copy, which
+    /// is the pre-fix behaviour rather than a new failure mode.
+    project_agent_dir: Option<PathBuf>,
     policy: Policy,
 }
 
@@ -294,8 +308,26 @@ impl PolicyGate {
             // Read from the policy rather than a parameter: unlike the write lists, this one has a
             // single source and no caller that needs to override it.
             deny_read: PatternSet::parse(&policy.deny_read_globs)?,
+            project_agent_dir: None,
             policy,
         })
+    }
+
+    /// The same gate, told where the project's `.agent/` is.
+    ///
+    /// Set once, by the daemon, from the registered project path. It is not a constructor
+    /// parameter because almost every caller has no project root — every tool test builds a gate
+    /// from a bare worktree — and a required argument would make those tests invent one.
+    #[must_use]
+    pub fn with_project_agent_dir(mut self, agent_dir: impl Into<PathBuf>) -> Self {
+        self.project_agent_dir = Some(normalise(&absolute(&expand_tilde(&agent_dir.into()))));
+        self
+    }
+
+    /// The project's `.agent/`, when the caller supplied one.
+    #[must_use]
+    pub fn project_agent_dir(&self) -> Option<&Path> {
+        self.project_agent_dir.as_deref()
     }
 
     /// A gate with the design's defaults, for tests and for a first run.
@@ -505,29 +537,104 @@ impl PolicyGate {
                 );
             };
 
-            if let Some(why) = self.is_denied_write(&relative) {
-                let mut denial = Denial::new(
-                    format!("the path is protected by the deny list ({why})"),
-                    &used.path,
-                );
-                denial = denial
-                    .with("choose another file")
-                    .with("if this is genuinely required, it is a human decision, not a tool call");
-                if Self::needs_escalation_for_write(&relative) {
-                    denial = denial.asking(format!("write:{relative}"));
-                }
-                return Verdict::Denied(denial);
-            }
-
-            if !self.allow_write.matches(&relative) {
-                return Verdict::Denied(
-                    Denial::new("the path is not covered by the write allow list", &used.path)
-                        .with(format!("write inside `{}` only", self.worktree.display()))
-                        .with("the allow list is read from the global config, not the project"),
-                );
+            if let Some(verdict) = self.check_one_write(&relative, used) {
+                return verdict;
             }
         }
         Verdict::Allowed
+    }
+
+    /// Check a write to one of the five state documents in the *project's* `.agent/`.
+    ///
+    /// Deliberately not part of [`Self::check_writes`]. That function is the gate for every tool,
+    /// and teaching it that a path outside the worktree may be written would let `write_file`
+    /// rewrite the plan directly — a capability `update_state` exists to make impossible in the
+    /// first place. Only the state tools ask this question, and only with a name from the closed
+    /// list, so the set of writable paths outside the worktree is five files and nothing else.
+    #[must_use]
+    pub fn check_state_write(&self, name: &str) -> Verdict {
+        if !crate::state::StateFile::is_state_file(name) {
+            return Verdict::Denied(
+                Denial::new("the file is not one of the five state documents", name)
+                    .with("use `update_state`, whose `file` argument is an enum, not a path"),
+            );
+        }
+        let used = PathUse::write(self.state_path(name).display().to_string());
+        // The deny list is evaluated against `.agent/<name>`, the same string it would see for a
+        // copy inside the worktree, so an operator's pattern keeps its meaning.
+        let relative = format!(".agent/{name}");
+        self.check_one_write(&relative, &used).unwrap_or(Verdict::Allowed)
+    }
+
+    /// Check a read of one of the five state documents in the project's `.agent/`.
+    ///
+    /// Reads inside `workspace_root` are already allowed, so this is not a permission — it is the
+    /// same five-name list as the write side, so that a model naming `JOURNAL.jsonl` gets the
+    /// argument error `update_state` would give rather than a journal read dressed as state.
+    #[must_use]
+    pub fn check_state_read(&self, name: &str) -> Verdict {
+        if !crate::state::StateFile::is_state_file(name) {
+            return Verdict::Denied(
+                Denial::new("the file is not one of the five state documents", name)
+                    .with("use `read_state`, whose `file` argument is an enum, not a path"),
+            );
+        }
+        let resolved = self.state_path(name);
+        if let Some(why) = self.is_denied_read(&resolved) {
+            return Verdict::Denied(
+                Denial::new(format!("the path is on the read deny list ({why})"), name)
+                    .with("the file is excluded by the operator, not by the worktree"),
+            );
+        }
+        Verdict::Allowed
+    }
+
+    /// The absolute path of a state document, in the project's `.agent/` when it is known.
+    ///
+    /// The fallback is the worktree's copy, which is what every test and every gate built from a
+    /// bare worktree gets. It is stale by construction during a real run — the worktree branch was
+    /// cut before the plan was edited — which is exactly why the daemon always supplies the project
+    /// root through [`Self::with_project_agent_dir`].
+    #[must_use]
+    pub fn state_path(&self, name: &str) -> PathBuf {
+        self.project_agent_dir.as_ref().map_or_else(
+            || self.worktree.join(crate::state::AGENT_DIR).join(name),
+            |dir| dir.join(name),
+        )
+    }
+
+    /// The directory holding the state documents, for a caller that needs the whole set.
+    #[must_use]
+    pub fn state_dir(&self) -> PathBuf {
+        self.project_agent_dir
+            .clone()
+            .unwrap_or_else(|| self.worktree.join(crate::state::AGENT_DIR))
+    }
+
+    /// Judge one write against the deny list and the allow list.
+    fn check_one_write(&self, relative: &str, used: &PathUse) -> Option<Verdict> {
+        if let Some(why) = self.is_denied_write(relative) {
+            let mut denial = Denial::new(
+                format!("the path is protected by the deny list ({why})"),
+                &used.path,
+            );
+            denial = denial
+                .with("choose another file")
+                .with("if this is genuinely required, it is a human decision, not a tool call");
+            if Self::needs_escalation_for_write(relative) {
+                denial = denial.asking(format!("write:{relative}"));
+            }
+            return Some(Verdict::Denied(denial));
+        }
+
+        if !self.allow_write.matches(relative) {
+            return Some(Verdict::Denied(
+                Denial::new("the path is not covered by the write allow list", &used.path)
+                    .with(format!("write inside `{}` only", self.worktree.display()))
+                    .with("the allow list is read from the global config, not the project"),
+            ));
+        }
+        None
     }
 
     /// Neither `.git` nor the project config can be granted by a config flag.
@@ -982,6 +1089,42 @@ mod tests {
     #[test]
     fn a_redirect_inside_the_worktree_is_a_mutation_but_allowed() {
         assert_eq!(gate().check_command("echo hi > notes.txt"), Verdict::Allowed);
+    }
+
+    #[test]
+    fn a_redirect_to_dev_null_is_not_a_write_outside_the_worktree() {
+        // The bug the first live run hit hardest: `/dev/null` was read as a write outside the
+        // worktree, so `bundle exec rspec 2>/dev/null` — and every other ordinary way to silence
+        // stderr — was denied. Two subtasks were blocked on DoD gates whose command never ran:
+        // the gate reported "(no exit code)", which reads as a failing check rather than as a
+        // policy refusal, so the model kept rewriting code that was already correct.
+        for command in [
+            "cargo test 2>/dev/null",
+            "cargo test > /dev/null 2>&1",
+            "grep -qE 'x' README.md > /dev/null",
+        ] {
+            assert_eq!(gate().check_command(command), Verdict::Allowed, "{command}");
+        }
+        // An unknown program is still external: the sink excuses a path, never a program. The
+        // distinction matters because the live command was `bundle exec rspec`, and calling that
+        // `Allowed` would be a different — and much larger — change than the one being made.
+        let verdict = gate().check_command("bundle exec rspec 2>/dev/null");
+        let Verdict::Escalated(escalation) = verdict else {
+            panic!("an unknown program must still be escalated, got {verdict:?}");
+        };
+        assert!(
+            escalation.reason.contains("`bundle` is not a known command"),
+            "{escalation:?}"
+        );
+    }
+
+    #[test]
+    fn a_sink_redirect_does_not_excuse_a_real_write_on_the_same_line() {
+        // Not a whitelist for the line: the sink is skipped and every other path is still judged.
+        // A rule that returned `Allowed` as soon as it saw `/dev/null` would be the hole this
+        // whole module exists to close.
+        let verdict = gate().check_command("echo x > /dev/null; echo pwned > /etc/passwd");
+        assert!(verdict.is_denied(), "{verdict:?}");
     }
 
     #[test]

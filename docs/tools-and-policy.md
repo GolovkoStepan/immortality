@@ -62,7 +62,7 @@ src/parser.rs»), инструменты с эффектом в аргумент
 | `read_file` | `path`, `offset`, `limit` | Нумерация строк; отказ на бинарных файлах с подсказкой |
 | `glob` | `pattern`, `path` | Сортировка по mtime, лимит результатов |
 | `grep` | `pattern`, `glob`, `path`, `-A/-B`, `limit` | Регексы; поиск идёт только по текстовым файлам |
-| `read_state` | `file`, `offset`, `limit` | Пять документов `PLAN.md` / `ACCEPTANCE.md` / `TASKS.json` / `DECISIONS.md` / `NOTES.md` (D-065) |
+| `read_state` | `file`, `offset`, `limit` | Пять документов `PLAN.md` / `ACCEPTANCE.md` / `TASKS.json` / `DECISIONS.md` / `NOTES.md` из **проектного** `.agent/` (D-065, D-103) |
 | `grep_journal` | `query`, `since_seq`, `kind`, `limit` | Поиск по журналу; `next_seq` — курсор для следующей страницы (D-066) |
 | `git` с `subcommand` = `status`/`diff`/`log`/`show`/`rev_parse` | `args` — массив argv | Только чтение |
 
@@ -73,7 +73,7 @@ src/parser.rs»), инструменты с эффектом в аргумент
 | `write_file` | `path`, `content` | ByContent |
 | `edit_file` | `path`, `old`, `new`, `replace_all` | ByContent |
 | `git` с `subcommand` = `add`/`commit`/`branch`/`worktree`/`stash` | `args`, `message`, `path`, `reason` | commit → Unknown (probe по `Immortality-Call` trailer) |
-| `update_state` | `file`, `content`, `replace` | ByContent; отказ создать отсутствующий файл и урезать вдвое без `replace` (D-065) |
+| `update_state` | `file`, `content`, `replace` | ByContent; `NOTES.md`/`DECISIONS.md` создаются, план-документы — нет; урезать вдвое без `replace` нельзя (D-065, D-103) |
 | `shell` (mutating) | `command`, `timeout_secs`, `cwd` | Unknown |
 | `start_process` | `command`, `cwd`, `env`, `name` | Unknown (probe по маркеру в командной строке, D-061) |
 | `kill_process` | `handle` | Idempotent |

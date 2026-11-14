@@ -105,7 +105,7 @@ logs/2026-10.log.gz      # архивы по месяцам
 | `tool_call_unknown` | процесс умер, эффект неизвестен |
 | `effect_verified` / `effect_absent` | результат probe после сбоя |
 | `checkpoint_created` | git-чекпоинт, его SHA и `role` (`base` / `discarded` / `rollback`); `rollback` без последующего `attempt_restarted` — незавершённый откат (D-080) |
-| `detector_fired` | `d1`…`d5`, уровень `l1`…`l3`, счётчик-метрика; одна запись на шаг (D-077) |
+| `detector_fired` | `d1`…`d6`, уровень `l1`…`l3`, счётчик-метрика; одна запись на шаг (D-077) |
 | `compaction` | компактация контекста |
 | `gate_result` | один гейт: тег `gate` — `sanity` (находки), `check` (id, команда, код, длительность, required), `review` (одобрено, проблемы) или `verdict` (прошло, причина, почему). Вердикт всегда последний; `gate: verdict` + `passed: true` закрывает попытку и в recovery (D-079) |
 | `escalation_opened`, `escalation_resolved` | очередь эскалаций (D-067) |
@@ -215,6 +215,13 @@ recovery планирует `RollbackToCheckpoint` на названный SHA, 
 быть невидимым.
 
 ## 5. Где лежит журнал
+
+Журнал, план и рабочая память — в `.agent/` **проекта**, а не в worktree. Работа с состоянием
+идёт через `PolicyGate::with_project_agent_dir`: `read_state`, `update_state` и `grep_journal`
+адресуют проектный каталог, потому что worktree-копия `.agent/` — снимок с момента создания
+ветки и устарела по построению. Измерено на фикстуре `word-count`: проектный `TASKS.json`
+говорил `done`/`blocked`, worktree-копия — `pending` обо всех подзадачах (D-103).
+
 
 Журнал — в `.agent/` **проекта**, а worktree задачи — отдельный каталог
 (`<parent>/<name>-agent/<task>`). Разделение обязательно, а не косметика: откат L3 делает

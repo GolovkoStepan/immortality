@@ -53,6 +53,13 @@ pub struct ToolsetDeps {
     pub budget: OutputBudget,
     /// The task's machine-local state directory, `<root>/state/<project>/<task>`.
     pub task_dir: PathBuf,
+    /// The project's own checkout, which is where `.agent/` lives.
+    ///
+    /// Not the worktree: the worktree is a sibling directory whose `.agent/` is a checkout from
+    /// whenever the branch was cut, and therefore stale by construction. The plan the scheduler
+    /// executes, the journal recovery reads and the notes the agent writes are all in *this*
+    /// repository's `.agent/`.
+    pub repository: PathBuf,
     /// The directory *holding* per-task state directories, `<root>/state/<project>`.
     ///
     /// Not the machine state root, and not the task directory: [`DirectoryQueue`] and
@@ -82,14 +89,22 @@ impl ToolsetDeps {
         state_root: impl Into<PathBuf>,
         task_dir: impl Into<PathBuf>,
         worktree: impl Into<PathBuf>,
+        repository: impl Into<PathBuf>,
         task: TaskId,
     ) -> immortality_core::Result<Self> {
         let state_root = state_root.into();
         let task_dir = task_dir.into();
         let worktree = worktree.into();
-        let gate = PolicyGate::with_defaults(&worktree, config.policy.clone()).map_err(|error| {
-            immortality_core::Error::Protocol(format!("the policy gate is misconfigured: {error}"))
-        })?;
+        let repository = repository.into();
+        // The gate is told where `.agent/` is, because the state tools write there and the gate is
+        // the only thing that hands out paths. Without this the tools fall back to the worktree's
+        // stale copy — the split-brain the `word-count` fixture still shows: project `done`,
+        // worktree `pending`.
+        let gate = PolicyGate::with_defaults(&worktree, config.policy.clone())
+            .map_err(|error| {
+                immortality_core::Error::Protocol(format!("the policy gate is misconfigured: {error}"))
+            })?
+            .with_project_agent_dir(repository.join(immortality_core::paths::AGENT_DIR));
         let artifacts = ArtifactStore::open(state_root.join("artifacts"))?;
         // The queue and the delegation store both append the task id themselves. Falling back to
         // the task directory would put a second `<task>` segment under it, which is a directory
@@ -101,6 +116,7 @@ impl ToolsetDeps {
             task_dir,
             task,
             worktree,
+            repository,
             gate: Arc::new(gate),
             artifacts,
             budget: OutputBudget {
@@ -199,7 +215,7 @@ mod tests {
         // The daemon's layout: `<state>/state/<project>/<task>`.
         let task_dir = dir.join("state").join("project").join(task.as_str());
         std::fs::create_dir_all(&task_dir).expect("task dir");
-        ToolsetDeps::for_task(&Config::default(), dir, task_dir, worktree, task).expect("deps")
+        ToolsetDeps::for_task(&Config::default(), dir, task_dir, worktree, dir, task).expect("deps")
     }
 
     #[test]

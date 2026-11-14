@@ -246,6 +246,7 @@ impl Fixture {
             self.dir.path(),
             &self.task_dir,
             &self.worktree,
+            self.dir.path(),
             self.task.clone(),
         )
         .expect("toolset deps");
@@ -988,6 +989,7 @@ fn every_writing_tool_that_cannot_be_replayed_is_not_safe_to_retry() {
         fixture.dir.path(),
         &fixture.task_dir,
         &fixture.worktree,
+        fixture.dir.path(),
         fixture.task.clone(),
     )
     .expect("toolset deps");

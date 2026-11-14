@@ -982,6 +982,7 @@ fn recover(fixture: &Fixture, task: &str) -> startup::Recovered {
         &fixture.state_root,
         &task_dir,
         &worktree,
+        &fixture.repo,
         task.clone(),
     )
     .expect("toolset deps");
