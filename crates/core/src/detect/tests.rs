@@ -249,6 +249,72 @@ fn progress_resets_the_unproductive_stretch() {
 }
 
 #[test]
+fn an_alternation_of_two_known_outputs_is_a_stall_not_a_fresh_step() {
+    // The measured failure from the second `black_jack` run: `verify_shuffle_spec` spent 62 steps
+    // alternating two commands — `srand(1234); … shuffle!` printing `[41, 28, …]` and an override
+    // of `shuffle!` printing `[1, 2, …]` — 28 and 25 times respectively, in a clean A-B-A-B.
+    // Both outputs were known from the first two steps, so nothing after them was progress.
+    //
+    // Every earlier detector was blind by construction: D1 and D2 only count a run of *adjacent*
+    // identical calls or outputs, and this sequence has neither. Measured over both live runs, the
+    // longest such stretch was 49 in that attempt and 0–6 everywhere else, so a D3 that asks this
+    // question separates the two without a new threshold.
+    let mut signals = Signals::default();
+    let thresholds = thresholds();
+    record(
+        &mut signals,
+        "shell",
+        r#"{"command":"a"}"#,
+        "[41, 28, 40, 45, 7, 47]",
+    );
+    record(&mut signals, "shell", r#"{"command":"b"}"#, "[1, 2, 3, 4, 5, 6]");
+    assert_eq!(
+        signals.react(&thresholds),
+        None,
+        "two steps, both new — not a stall yet"
+    );
+    let mut fired = Vec::new();
+    for step in 0..30 {
+        // Strict A-B-A-B: each step differs from the one before it.
+        let (command, output) = if step % 2 == 0 {
+            (r#"{"command":"a"}"#, "[41, 28, 40, 45, 7, 47]")
+        } else {
+            (r#"{"command":"b"}"#, "[1, 2, 3, 4, 5, 6]")
+        };
+        record(&mut signals, "shell", command, output);
+        if let Some(reaction) = signals.react(&thresholds) {
+            fired.push(reaction);
+        }
+    }
+    assert_eq!(
+        fired.iter().map(|one| one.level).collect::<Vec<_>>(),
+        vec![Level::ForceStrategy, Level::Restart],
+        "the alternation must reach L2 at 15 and L3 at 25: {fired:?}"
+    );
+    assert_eq!(fired.first().map(|one| one.detector), Some(Detector::NoProgress));
+    assert_eq!(fired.first().map(|one| one.metric), Some(15));
+}
+
+#[test]
+fn a_known_output_after_real_work_still_stops_being_progress() {
+    // The other side of the same rule: re-reading a file the attempt already read teaches nothing,
+    // even when the step before it was new. D2 stays silent — these are not adjacent — and this is
+    // the signal that catches a model walking a list it has already walked.
+    let mut signals = Signals::default();
+    record(&mut signals, "read_file", r#"{"path":"a"}"#, "contents of a");
+    assert_eq!(signals.unproductive(), 0);
+    record(&mut signals, "read_file", r#"{"path":"b"}"#, "contents of b");
+    assert_eq!(signals.unproductive(), 0);
+    record(&mut signals, "read_file", r#"{"path":"a"}"#, "contents of a");
+    assert_eq!(
+        signals.unproductive(),
+        1,
+        "the third step produced nothing this attempt had not seen"
+    );
+    assert_eq!(signals.semantic_run(), 1, "D2 needs adjacency and must not fire");
+}
+
+#[test]
 fn a_fresh_output_counts_as_progress() {
     let mut signals = Signals::default();
     for _ in 0..14 {
@@ -413,6 +479,11 @@ fn writing_a_different_file_restarts_the_churn_run() {
 fn the_measured_failure_fires_d6_and_not_d1() {
     // The interleaving from the journal: write the probe, run it, write it again. The run is not
     // reset by the check — that is the whole point, because the check is what makes it a loop.
+    //
+    // D3 fires later, and correctly so: once the write and the check are both known, every step
+    // after them is a repeat. D6 is the one that has to speak *first*, because it names the thing
+    // the model can act on ("you are rewriting the same file"), and D1 must stay silent: every
+    // body was a different guess.
     let mut signals = Signals::default();
     let thresholds = thresholds();
     let mut fired = Vec::new();
@@ -435,10 +506,11 @@ fn the_measured_failure_fires_d6_and_not_d1() {
         }
     }
     assert_eq!(
-        fired,
-        vec![Detector::FileChurn],
-        "D1 must stay silent: every body was a different guess"
+        fired.first(),
+        Some(&Detector::FileChurn),
+        "D6 must be the first to speak: {fired:?}"
     );
+    assert!(!fired.contains(&Detector::ExactRepeat), "{fired:?}");
 }
 
 #[test]

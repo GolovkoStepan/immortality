@@ -48,7 +48,7 @@ pub enum Detector {
     ExactRepeat,
     /// D2: different calls whose results are indistinguishable.
     SemanticRepeat,
-    /// D3: steps passed without the tree, the gates or the facts changing.
+    /// D3: steps produced no observation this attempt had not already seen.
     NoProgress,
     /// D4: the model is repeating a phrase inside one message.
     ReasoningLoop,
@@ -265,7 +265,15 @@ pub struct Signals {
     last_output: Option<String>,
     /// Consecutive semantic repeats of the same digest.
     semantic_run: u32,
-    /// Steps since the last observable progress.
+    /// Every output digest this attempt has produced, so a repeat is recognisable even when the
+    /// steps are not adjacent.
+    ///
+    /// D2 needs adjacency and D3 must not: the measured A-B-A-B loop alternated two commands whose
+    /// two outputs were both known, so every digest differed from its predecessor and a window of
+    /// one saw nothing. The memory is the whole attempt and therefore bounded by its step budget,
+    /// and each entry is a 32-byte digest, not the output itself.
+    seen_outputs: std::collections::BTreeSet<String>,
+    /// Consecutive steps that produced no observation this attempt had not already seen.
     unproductive: u32,
     /// The harshest unproductive-stretch level already announced.
     progress_announced: Option<Level>,
@@ -290,6 +298,12 @@ impl Signals {
     /// says nothing about D2: the same command twice is expected to print the same thing, and
     /// counting that as a semantical repeat as well would report one stuck step as two problems.
     /// D2 counts what happens when the model *changes* the call and gets the same answer back.
+    ///
+    /// D3 is not D2 and does not care about adjacency: its question is whether this step told the
+    /// attempt anything it did not already know. An output digest the attempt has seen before is
+    /// therefore a step without progress *wherever* it appeared earlier, which is what makes an
+    /// A-B-A-B alternation visible. D2's run stays adjacent on purpose — two identical results
+    /// with real work in between are not a loop.
     pub fn record_call(
         &mut self,
         tool: &str,
@@ -312,6 +326,14 @@ impl Signals {
             return;
         };
         let digest = crate::journal::digest_text(&crate::artifacts::digest_of(text.as_bytes()));
+        // D3: a digest this attempt has not produced before is a new fact, and any position is
+        // enough. This is fed for identical calls too — a repeat of `ls` answers with output the
+        // model already has, and a step that learns nothing is exactly what D3 counts.
+        if self.seen_outputs.insert(digest.clone()) {
+            self.unproductive = 0;
+        } else {
+            self.unproductive = self.unproductive.saturating_add(1);
+        }
         if same_call {
             // The identical call is D1's; do not also feed D2.
             return;
@@ -320,8 +342,6 @@ impl Signals {
             self.semantic_run = self.semantic_run.saturating_add(1);
         } else {
             self.semantic_run = 1;
-            // An output this attempt has not seen is progress.
-            self.unproductive = 0;
         }
         self.last_output = Some(digest);
     }
@@ -338,8 +358,9 @@ impl Signals {
 
     /// Record a step that changed the working tree or the recorded facts.
     ///
-    /// The hash itself is not stored: the loop only needs to know *that* it changed, and the
-    /// caller has already paid for the hash.
+    /// D3's own counter is reset by a *new observation* as well, so this is for progress a digest
+    /// cannot see: a write that changed the tree while printing the same acknowledgement, or a
+    /// gate that went green.
     pub fn record_progress(&mut self) {
         self.unproductive = 0;
         // Progress ends a churn cycle: rewriting a file after something *worked* is the next
@@ -388,7 +409,7 @@ impl Signals {
         self.semantic_run
     }
 
-    /// How many steps have passed without progress.
+    /// How many steps have passed without an observation this attempt had not already seen.
     #[must_use]
     pub const fn unproductive(&self) -> u32 {
         self.unproductive
