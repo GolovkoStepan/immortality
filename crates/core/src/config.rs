@@ -177,6 +177,13 @@ pub struct Detectors {
     pub reasoning_repeat_ngram: u32,
     /// D4: how many times that n-gram must repeat before the stream is aborted.
     pub reasoning_repeat_count: u32,
+    /// D6, L1: writes to one file in a row. Measured: the live run rewrote `spec/probe_spec.rb`
+    /// nineteen times while a healthy one rewrites its main file at most three.
+    pub file_churn_warn: u32,
+    /// D6, L2.
+    pub file_churn_strategy: u32,
+    /// D6, L3. The measured failure reached L3 territory, so the ladder has a stop.
+    pub file_churn_stop: u32,
 }
 
 /// Logging.
@@ -288,6 +295,13 @@ impl Default for Detectors {
             progress_stall_stop: 25,
             reasoning_repeat_ngram: 40,
             reasoning_repeat_count: 3,
+            // Calibrated on two measured runs: a healthy one rewrites its main file at most
+            // three times (the `word-count` dogfood run), and the failure rewrote one file
+            // nineteen times. Six leaves a factor of two above the healthy ceiling and a factor
+            // of three below the failure, so neither side of the calibration is a near miss.
+            file_churn_warn: 6,
+            file_churn_strategy: 10,
+            file_churn_stop: 16,
         }
     }
 }
@@ -402,6 +416,9 @@ pub struct RawDetectors {
     pub progress_stall_stop: Option<u32>,
     pub reasoning_repeat_ngram: Option<u32>,
     pub reasoning_repeat_count: Option<u32>,
+    pub file_churn_warn: Option<u32>,
+    pub file_churn_strategy: Option<u32>,
+    pub file_churn_stop: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -647,6 +664,9 @@ fn apply_non_policy(config: &mut Config, raw: RawConfig) {
         target.reasoning_repeat_count = raw
             .reasoning_repeat_count
             .unwrap_or(target.reasoning_repeat_count);
+        target.file_churn_warn = raw.file_churn_warn.unwrap_or(target.file_churn_warn);
+        target.file_churn_strategy = raw.file_churn_strategy.unwrap_or(target.file_churn_strategy);
+        target.file_churn_stop = raw.file_churn_stop.unwrap_or(target.file_churn_stop);
     }
     if let Some(raw) = raw.logging {
         let target = &mut config.logging;
@@ -809,6 +829,18 @@ fn validate_detectors(detectors: &Detectors) -> Result<()> {
             detectors.progress_stall_warn,
             "detectors.progress_stall_stop",
             detectors.progress_stall_stop,
+        ),
+        (
+            "detectors.file_churn_warn",
+            detectors.file_churn_warn,
+            "detectors.file_churn_strategy",
+            detectors.file_churn_strategy,
+        ),
+        (
+            "detectors.file_churn_strategy",
+            detectors.file_churn_strategy,
+            "detectors.file_churn_stop",
+            detectors.file_churn_stop,
         ),
     ];
     for (warn_name, warn, stop_name, stop) in ladder {

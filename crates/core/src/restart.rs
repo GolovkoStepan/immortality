@@ -148,6 +148,10 @@ impl Cause {
                          stream was cut"
                     ),
                     Detector::Budget => "a budget ran out".to_string(),
+                    Detector::FileChurn => format!(
+                        "it rewrote one file {metric} time(s) in a row, each time guessing at the \
+                         fix"
+                    ),
                 };
                 format!("{what}; the ladder stopped it (detector {})", detector.as_str())
             }
@@ -206,6 +210,15 @@ impl Cause {
                 "The budget that ran out was not a step budget, so the plan was too expensive \
                  rather than too long. Do the same work with fewer and cheaper observations, and \
                  finish the subtask as soon as its definition of done holds."
+            }
+            Self::Detector {
+                detector: Detector::FileChurn,
+                ..
+            } => {
+                "Stop editing that file. Run the check first and read the whole failure, then say \
+                 in one sentence what you believe is wrong. If you cannot, the file is not the \
+                 problem: read the code the check calls, or explain why the check's expectation is \
+                 wrong and change that instead."
             }
             Self::Limit(Limit::Steps) => {
                 "The last plan did not fit in one pass. Work in smaller pieces: one file, one \

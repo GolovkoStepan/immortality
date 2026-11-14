@@ -83,6 +83,7 @@ fn every_cause_has_a_distinct_wire_name() {
         detector(Detector::NoProgress, 25),
         detector(Detector::ReasoningLoop, 3),
         detector(Detector::Budget, 1),
+        detector(Detector::FileChurn, 16),
         Cause::Limit(Limit::Steps),
         Cause::Limit(Limit::Tokens),
         Cause::Limit(Limit::Time),

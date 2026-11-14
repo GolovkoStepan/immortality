@@ -1,4 +1,4 @@
-//! Tests for D1–D3 and the ladder.
+//! Tests for D1–D3, D6 and the ladder.
 
 use super::*;
 use std::path::PathBuf;
@@ -18,6 +18,7 @@ fn detector_names_are_stable_because_they_are_a_metric_key() {
     assert_eq!(Detector::NoProgress.as_str(), "d3");
     assert_eq!(Detector::ReasoningLoop.as_str(), "d4");
     assert_eq!(Detector::Budget.as_str(), "d5");
+    assert_eq!(Detector::FileChurn.as_str(), "d6");
 }
 
 #[test]
@@ -33,6 +34,7 @@ fn no_two_detectors_share_a_name() {
         Detector::NoProgress,
         Detector::ReasoningLoop,
         Detector::Budget,
+        Detector::FileChurn,
     ]
     .into_iter()
     .map(Detector::as_str)
@@ -346,4 +348,129 @@ fn a_count_that_leaps_several_rungs_reports_the_harshest() {
         stop: 8,
     };
     assert_eq!(ladder.level(9), Some(Level::Restart));
+}
+
+// ── D6: the same file rewritten over and over ────────────────────────────────────
+
+#[test]
+fn rewriting_one_file_six_times_is_a_nudge() {
+    // The measured failure, reduced to its signal: nineteen successive writes to
+    // `spec/probe_spec.rb`, each with a different body, each followed by the same failing check.
+    // D1 cannot see it (the bodies differ), D2 and D3 reset on each new output (the check prints
+    // random permutations). What stays constant is the destination.
+    let mut signals = Signals::default();
+    let thresholds = thresholds();
+    for _ in 0..5 {
+        signals.record_write("write_file", "spec/probe_spec.rb");
+        assert_eq!(
+            signals.react(&thresholds),
+            None,
+            "five is below the nudge threshold"
+        );
+    }
+    signals.record_write("write_file", "spec/probe_spec.rb");
+    let reaction = signals.react(&thresholds).expect("the sixth write is L1");
+    assert_eq!(reaction.detector, Detector::FileChurn);
+    assert_eq!(reaction.level, Level::Nudge);
+    assert_eq!(reaction.metric, 6);
+}
+
+#[test]
+fn the_churn_ladder_reaches_force_strategy_and_restart() {
+    // The measured run reached nineteen, so the ladder has to have a rung past the nudge —
+    // otherwise a model that ignores it spends the whole step budget, which is what happened.
+    let mut signals = Signals::default();
+    let thresholds = thresholds();
+    let mut seen = Vec::new();
+    for _ in 0..16 {
+        signals.record_write("write_file", "spec/probe_spec.rb");
+        if let Some(reaction) = signals.react(&thresholds) {
+            seen.push(reaction.level);
+        }
+    }
+    assert_eq!(
+        seen,
+        vec![Level::Nudge, Level::ForceStrategy, Level::Restart],
+        "the ladder must climb, and announce each rung once"
+    );
+}
+
+#[test]
+fn writing_a_different_file_restarts_the_churn_run() {
+    // D6 counts one file, not "editing". A model that touches three files in rotation is doing
+    // work; a model that rewrites one and then another has moved on.
+    let mut signals = Signals::default();
+    for _ in 0..5 {
+        signals.record_write("write_file", "src/a.rs");
+    }
+    assert_eq!(signals.churn_run(), 5, "{}", signals.churn_run());
+    signals.record_write("write_file", "src/b.rs");
+    assert_eq!(signals.churn_run(), 1);
+    assert_eq!(signals.churn_path(), Some("src/b.rs"));
+}
+
+#[test]
+fn the_measured_failure_fires_d6_and_not_d1() {
+    // The interleaving from the journal: write the probe, run it, write it again. The run is not
+    // reset by the check — that is the whole point, because the check is what makes it a loop.
+    let mut signals = Signals::default();
+    let thresholds = thresholds();
+    let mut fired = Vec::new();
+    for _ in 0..7 {
+        record(
+            &mut signals,
+            "write_file",
+            r#"{"path":"spec/probe_spec.rb"}"#,
+            "Created",
+        );
+        signals.record_write("write_file", "spec/probe_spec.rb");
+        record(
+            &mut signals,
+            "shell",
+            r#"{"command":"bundle exec rspec"}"#,
+            "1 example, 1 failure",
+        );
+        if let Some(reaction) = signals.react(&thresholds) {
+            fired.push(reaction.detector);
+        }
+    }
+    assert_eq!(
+        fired,
+        vec![Detector::FileChurn],
+        "D1 must stay silent: every body was a different guess"
+    );
+}
+
+#[test]
+fn progress_ends_a_churn_cycle() {
+    // A rewrite after a check that *passed* is the next piece of work, not the same guess again.
+    let mut signals = Signals::default();
+    for _ in 0..3 {
+        signals.record_write("write_file", "src/a.rs");
+    }
+    signals.record_progress();
+    assert_eq!(signals.churn_run(), 0);
+    signals.record_write("write_file", "src/a.rs");
+    assert_eq!(signals.churn_run(), 1);
+}
+
+#[test]
+fn a_shell_write_is_not_file_churn() {
+    // `Signals::record_write` ignores anything but the two editing tools, so a run of
+    // `cargo test > /tmp/out` cannot nudge a model that is working.
+    let mut signals = Signals::default();
+    for _ in 0..20 {
+        signals.record_write("shell", "/tmp/out");
+    }
+    assert_eq!(signals.churn_run(), 0);
+}
+
+#[test]
+fn an_absolute_path_and_its_relative_form_are_the_same_file() {
+    // Otherwise a model that switches between `spec/a.rb` and `/work/tree/spec/a.rb` would reset
+    // its own churn run and evade the detector.
+    let root = PathBuf::from("/work/tree");
+    let relative = normalize_path("spec/a.rb", &root);
+    let absolute = normalize_path("/work/tree/spec/a.rb", &root);
+    assert_eq!(relative, absolute, "{relative} vs {absolute}");
 }
