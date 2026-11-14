@@ -130,6 +130,7 @@ allow_write_globs = [".agent/**", "**"]          # внутри worktree
 deny_write_globs = ["**/.git/config", "**/.env*"]
 deny_read_globs = []                             # пусто: root и так узкий
 deny_programs = []                               # "sudo", "ssh", "curl" — на выбор человека
+yolo = false                                     # снимает эскалации, не запреты (D-101)
 trusted_hosts = ["llm-server", "127.0.0.1", "localhost"]
 allow_commit = true
 allow_push = false

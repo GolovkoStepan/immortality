@@ -104,6 +104,14 @@ pub struct Policy {
     /// Matched against the basename of every program the classifier recognises in the line, so
     /// `PATH=/x:$PATH; /usr/bin/sudo ls` is caught by the same rule as `sudo ls`.
     pub deny_programs: Vec<String>,
+    /// Run external actions without asking.
+    ///
+    /// The name every agent tool uses for it. It is *not* an off switch for the policy: the three
+    /// deny lists still apply, because those are the operator's statement about what must never
+    /// happen, and a convenience flag is not a reason to break one. What it waives is the
+    /// escalation — the "may a human say yes to this" question. Path containment inside the task
+    /// worktree survives too, for the same reason.
+    pub yolo: bool,
     pub allow_commit: bool,
     pub allow_push: bool,
     pub allow_network: bool,
@@ -224,6 +232,7 @@ impl Default for Policy {
             deny_write_globs: vec!["**/.git/config".to_string(), "**/.env*".to_string()],
             deny_read_globs: Vec::new(),
             deny_programs: Vec::new(),
+            yolo: false,
             allow_commit: true,
             allow_push: false,
             allow_network: false,
@@ -345,6 +354,7 @@ pub struct RawPolicy {
     pub deny_write_globs: Option<Vec<String>>,
     pub deny_read_globs: Option<Vec<String>>,
     pub deny_programs: Option<Vec<String>>,
+    pub yolo: Option<bool>,
     pub allow_commit: Option<bool>,
     pub allow_push: Option<bool>,
     pub allow_network: Option<bool>,
@@ -558,6 +568,7 @@ fn apply_policy(target: &mut Policy, raw: RawPolicy) {
     if let Some(value) = raw.deny_programs {
         target.deny_programs = value;
     }
+    target.yolo = raw.yolo.unwrap_or(target.yolo);
     target.allow_commit = raw.allow_commit.unwrap_or(target.allow_commit);
     target.allow_push = raw.allow_push.unwrap_or(target.allow_push);
     target.allow_network = raw.allow_network.unwrap_or(target.allow_network);
@@ -667,6 +678,13 @@ fn apply_env(config: &mut Config) {
     }
     if let Ok(value) = std::env::var("IMMORTALITY_LOG_LEVEL") {
         config.logging.level = value;
+    }
+    // `IMMORTALITY_YOLO=1` is the escape hatch for a project whose build commands the classifier
+    // does not recognise and whose operator does not want to wait for a human on each one. It is
+    // an environment variable rather than a config key because it is meant to be momentary: a
+    // setting written into a file outlives the reason it was turned on.
+    if std::env::var("IMMORTALITY_YOLO").is_ok_and(|value| value == "1" || value == "true") {
+        config.policy.yolo = true;
     }
     apply_env_u32(
         "IMMORTALITY_SOFT_BUDGET_TOKENS",
@@ -1058,6 +1076,27 @@ mod tests {
         let config = Config::default();
         assert_eq!(config.policy.deny_read_globs, Vec::<String>::new());
         assert_eq!(config.policy.deny_programs, Vec::<String>::new());
+    }
+
+    #[test]
+    fn the_global_file_can_turn_on_yolo() {
+        let fx = fixture();
+        std::fs::write(&fx.global, "[policy]\nyolo = true\n").unwrap();
+
+        let loaded = load(&overrides_for(&fx)).unwrap();
+        assert!(loaded.config.policy.yolo);
+    }
+
+    #[test]
+    fn project_file_cannot_turn_on_yolo() {
+        // `yolo` is a permission, so D-009 applies: the file inside the repository the agent edits
+        // cannot grant it.
+        let fx = fixture();
+        std::fs::write(&fx.global, "").unwrap();
+        std::fs::write(&fx.project, "[policy]\nyolo = true\n").unwrap();
+
+        let loaded = load(&overrides_for(&fx)).unwrap();
+        assert!(!loaded.config.policy.yolo);
     }
 
     #[test]

