@@ -425,8 +425,15 @@ fn execute(run: Run) -> Result<TaskState, String> {
     let worktree = WorktreeManager::new(&project.path)
         .ensure(task.as_str(), &branch, None)
         .map_err(|error| format!("cannot create the worktree: {error}"))?;
-    let deps = ToolsetDeps::for_task(&config, state_root, task_dir, worktree.path.clone(), task.clone())
-        .map_err(|error| format!("cannot build the tool layer: {error}"))?;
+    let deps = ToolsetDeps::for_task(
+        &config,
+        state_root,
+        task_dir,
+        worktree.path.clone(),
+        project.path.clone(),
+        task.clone(),
+    )
+    .map_err(|error| format!("cannot build the tool layer: {error}"))?;
     let registry = toolset::build(&deps).map_err(|error| format!("cannot build the tools: {error}"))?;
 
     let model: Arc<dyn Model> = match model {

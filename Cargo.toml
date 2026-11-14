@@ -10,7 +10,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.0.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.99"
 license = "MIT OR Apache-2.0"
@@ -21,11 +21,11 @@ authors = ["immortality contributors"]
 # Internal path dependencies carry the workspace version explicitly. Without it cargo-deny
 # sees a `*` requirement and reports a wildcard dependency, which would be denied in CI for
 # no reason; the version is irrelevant at runtime because none of these are published.
-immortality-core = { path = "crates/core", version = "0.0.0" }
-immortality-llm = { path = "crates/llm", version = "0.0.0" }
-immortality-tools = { path = "crates/tools", version = "0.0.0" }
-immortality-daemon = { path = "crates/daemon", version = "0.0.0" }
-immortality-testkit = { path = "crates/testkit", version = "0.0.0" }
+immortality-core = { path = "crates/core", version = "0.1.1" }
+immortality-llm = { path = "crates/llm", version = "0.1.1" }
+immortality-tools = { path = "crates/tools", version = "0.1.1" }
+immortality-daemon = { path = "crates/daemon", version = "0.1.1" }
+immortality-testkit = { path = "crates/testkit", version = "0.1.1" }
 
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }

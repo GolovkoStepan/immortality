@@ -151,6 +151,25 @@ impl Verb {
         })
     }
 
+    /// The word the model sends as `subcommand`.
+    ///
+    /// Kept next to [`Self::parse`] so the two cannot disagree: a name that parses but does not
+    /// print is a refusal message that names the wrong word.
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Status => "status",
+            Self::Diff => "diff",
+            Self::Log => "log",
+            Self::Show => "show",
+            Self::Add => "add",
+            Self::Commit => "commit",
+            Self::Branch => "branch",
+            Self::Worktree => "worktree",
+            Self::Stash => "stash",
+            Self::RevParse => "rev_parse",
+        }
+    }
+
     /// What this verb can change, for the policy gate.
     const fn effect(self) -> Effect {
         match self {
@@ -247,6 +266,7 @@ impl Tool for Git {
     fn execute(&self, ctx: &ToolCtx, args: Args) -> Result<ToolResult, ToolError> {
         let verb = Verb::parse(args.str("subcommand")?)?;
         let extra = read_args(&args)?;
+        reject_repeated_verb(verb, &extra)?;
 
         // The gate sees the effect of the verb, not the verb's arguments: `git branch -D x` and
         // `git branch` are both `Branch`, and one of them deletes refs. Both are `Mutate`, which
@@ -285,6 +305,36 @@ impl Tool for Git {
             Verb::RevParse => rev_parse(&repo, &extra),
         }
     }
+}
+
+/// Refuse `args` that repeat the verb the caller already named.
+///
+/// The model has two fields that look like the same thing, and the live run showed it uses both
+/// ways: `{"subcommand": "log", "args": ["log", "--oneline", "-5"]}` produced
+/// `git log --no-color --format=… log --oneline -5`, which git rejects as an ambiguous argument.
+/// The refusal names the fix, because the model that made the mistake is the one that has to
+/// unmake it, and a git error about `log` being "not a revision" does not say what to change.
+///
+/// Only the first element is checked. A later one can legitimately be the verb's own word — a
+/// path called `log`, a revision named `show` — and a rule that scanned the whole array would
+/// turn a working call into a refusal.
+///
+/// # Errors
+/// The first argument is the same word as `subcommand`.
+fn reject_repeated_verb(verb: Verb, extra: &[String]) -> Result<(), ToolError> {
+    let Some(first) = extra.first() else {
+        return Ok(());
+    };
+    if first != verb.name() {
+        return Ok(());
+    }
+    Err(ToolError::Arguments(format!(
+        "`args` starts with `{first}`, which is already the `subcommand`. The verb is not part of \
+         `args`: send `{{\"subcommand\": \"{first}\", \"args\": {}}}` instead of \
+         `{{\"subcommand\": \"{first}\", \"args\": [\"{first}\", …]}}`.",
+        json!(extra.get(1..).unwrap_or_default()),
+        first = first
+    )))
 }
 
 /// The model's `args` array, as borrowed strings.
@@ -825,6 +875,43 @@ mod tests {
         let lines: Vec<&str> = result.observation.lines().collect();
         assert!(lines[0].contains("feat: second"), "{lines:?}");
         assert!(result.observation.contains("chore: initial"), "{lines:?}");
+    }
+
+    #[test]
+    fn args_that_repeat_the_verb_are_refused_with_the_fix() {
+        // The live run's actual mistake: `{"subcommand": "log", "args": ["log", "--oneline", "-5"]}`
+        // became `git log --no-color --format=… log --oneline -5`, and git answered "ambiguous
+        // argument 'log': unknown revision or path". That message does not say what to change, so
+        // the model spent further steps on it. The refusal has to name the shape it wants.
+        let fixture = Fixture::new();
+        let error = call(
+            &fixture.own_path(),
+            json!({"subcommand": "log", "args": ["log", "--oneline", "-5"]}),
+        )
+        .expect_err("a repeated verb must be refused, not passed to git");
+        let ToolError::Arguments(detail) = &error else {
+            panic!("a usage mistake is an argument error, got {error:?}");
+        };
+        assert!(detail.contains("already the `subcommand`"), "{detail}");
+        // The fix is in the message: the same flags without the verb.
+        assert!(detail.contains("--oneline"), "{detail}");
+    }
+
+    #[test]
+    fn the_verb_is_accepted_as_a_later_argument() {
+        // Only the first element is the verb's slot. `git show <rev>` with a file named `show` is
+        // a legitimate call, and a rule that scanned the whole array would refuse it.
+        let fixture = Fixture::new();
+        let result = call(
+            &fixture.own_path(),
+            json!({"subcommand": "log", "args": ["--oneline", "-n", "1"]}),
+        )
+        .unwrap();
+        assert!(
+            result.observation.contains("chore: initial"),
+            "{}",
+            result.observation
+        );
     }
 
     #[test]

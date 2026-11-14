@@ -308,7 +308,7 @@ fn recover_one(
     task_dir: &Path,
 ) -> Result<Option<startup::Recovered>> {
     let worktree = WorktreeManager::new(&project.path).path_for(task.as_str());
-    let deps = ToolsetDeps::for_task(config, root, task_dir, &worktree, task.clone())
+    let deps = ToolsetDeps::for_task(config, root, task_dir, &worktree, &project.path, task.clone())
         .map_err(|error| anyhow::anyhow!("{error}"))?;
     let registry = toolset::build(&deps).map_err(|error| anyhow::anyhow!("{error}"))?;
     let request = RecoveryRequest {

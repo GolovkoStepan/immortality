@@ -184,6 +184,7 @@ impl Fixture {
             &self.state_root,
             self.task_dir(),
             &self.worktree,
+            &self.project,
             self.task.clone(),
         )
         .expect("toolset deps");

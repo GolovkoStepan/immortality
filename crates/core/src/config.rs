@@ -87,6 +87,31 @@ pub struct Policy {
     /// Denies win over allows, always. A list that could be overridden by adding a broader allow
     /// pattern would be a suggestion rather than a rule.
     pub deny_write_globs: Vec<String>,
+    /// Paths no read may touch, checked after containment but before the read is allowed.
+    ///
+    /// Reads used to be unconditional inside `workspace_root`, which made `~/.ssh/id_rsa` as
+    /// reachable as `src/main.rs` once the root contained the home directory. This list is the
+    /// operator's answer to that: a deny glob names a file the agent may not read even though it
+    /// is in bounds. Empty by default because the default root is narrow.
+    pub deny_read_globs: Vec<String>,
+    /// Programs no command line may run, whatever else says otherwise.
+    ///
+    /// A *deny* list, not an allow list, and the asymmetry is the point: the set of programs a
+    /// human never wants an agent to run is small and stable (`sudo`, `ssh`, `curl`), while the set
+    /// of programs a build might legitimately need is unbounded and grows with every toolchain.
+    /// Enumerating the second is a treadmill; enumerating the first is a policy.
+    ///
+    /// Matched against the basename of every program the classifier recognises in the line, so
+    /// `PATH=/x:$PATH; /usr/bin/sudo ls` is caught by the same rule as `sudo ls`.
+    pub deny_programs: Vec<String>,
+    /// Run external actions without asking.
+    ///
+    /// The name every agent tool uses for it. It is *not* an off switch for the policy: the three
+    /// deny lists still apply, because those are the operator's statement about what must never
+    /// happen, and a convenience flag is not a reason to break one. What it waives is the
+    /// escalation — the "may a human say yes to this" question. Path containment inside the task
+    /// worktree survives too, for the same reason.
+    pub yolo: bool,
     pub allow_commit: bool,
     pub allow_push: bool,
     pub allow_network: bool,
@@ -152,6 +177,13 @@ pub struct Detectors {
     pub reasoning_repeat_ngram: u32,
     /// D4: how many times that n-gram must repeat before the stream is aborted.
     pub reasoning_repeat_count: u32,
+    /// D6, L1: writes to one file in a row. Measured: the live run rewrote `spec/probe_spec.rb`
+    /// nineteen times while a healthy one rewrites its main file at most three.
+    pub file_churn_warn: u32,
+    /// D6, L2.
+    pub file_churn_strategy: u32,
+    /// D6, L3. The measured failure reached L3 territory, so the ladder has a stop.
+    pub file_churn_stop: u32,
 }
 
 /// Logging.
@@ -205,6 +237,9 @@ impl Default for Policy {
             ]),
             allow_write_globs: vec!["**".to_string()],
             deny_write_globs: vec!["**/.git/config".to_string(), "**/.env*".to_string()],
+            deny_read_globs: Vec::new(),
+            deny_programs: Vec::new(),
+            yolo: false,
             allow_commit: true,
             allow_push: false,
             allow_network: false,
@@ -260,6 +295,13 @@ impl Default for Detectors {
             progress_stall_stop: 25,
             reasoning_repeat_ngram: 40,
             reasoning_repeat_count: 3,
+            // Calibrated on two measured runs: a healthy one rewrites its main file at most
+            // three times (the `word-count` dogfood run), and the failure rewrote one file
+            // nineteen times. Six leaves a factor of two above the healthy ceiling and a factor
+            // of three below the failure, so neither side of the calibration is a near miss.
+            file_churn_warn: 6,
+            file_churn_strategy: 10,
+            file_churn_stop: 16,
         }
     }
 }
@@ -324,6 +366,9 @@ pub struct RawPolicy {
     pub trusted_hosts: Option<Vec<String>>,
     pub allow_write_globs: Option<Vec<String>>,
     pub deny_write_globs: Option<Vec<String>>,
+    pub deny_read_globs: Option<Vec<String>>,
+    pub deny_programs: Option<Vec<String>>,
+    pub yolo: Option<bool>,
     pub allow_commit: Option<bool>,
     pub allow_push: Option<bool>,
     pub allow_network: Option<bool>,
@@ -371,6 +416,9 @@ pub struct RawDetectors {
     pub progress_stall_stop: Option<u32>,
     pub reasoning_repeat_ngram: Option<u32>,
     pub reasoning_repeat_count: Option<u32>,
+    pub file_churn_warn: Option<u32>,
+    pub file_churn_strategy: Option<u32>,
+    pub file_churn_stop: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -531,6 +579,13 @@ fn apply_policy(target: &mut Policy, raw: RawPolicy) {
     if let Some(value) = raw.deny_write_globs {
         target.deny_write_globs = value;
     }
+    if let Some(value) = raw.deny_read_globs {
+        target.deny_read_globs = value;
+    }
+    if let Some(value) = raw.deny_programs {
+        target.deny_programs = value;
+    }
+    target.yolo = raw.yolo.unwrap_or(target.yolo);
     target.allow_commit = raw.allow_commit.unwrap_or(target.allow_commit);
     target.allow_push = raw.allow_push.unwrap_or(target.allow_push);
     target.allow_network = raw.allow_network.unwrap_or(target.allow_network);
@@ -609,6 +664,9 @@ fn apply_non_policy(config: &mut Config, raw: RawConfig) {
         target.reasoning_repeat_count = raw
             .reasoning_repeat_count
             .unwrap_or(target.reasoning_repeat_count);
+        target.file_churn_warn = raw.file_churn_warn.unwrap_or(target.file_churn_warn);
+        target.file_churn_strategy = raw.file_churn_strategy.unwrap_or(target.file_churn_strategy);
+        target.file_churn_stop = raw.file_churn_stop.unwrap_or(target.file_churn_stop);
     }
     if let Some(raw) = raw.logging {
         let target = &mut config.logging;
@@ -640,6 +698,13 @@ fn apply_env(config: &mut Config) {
     }
     if let Ok(value) = std::env::var("IMMORTALITY_LOG_LEVEL") {
         config.logging.level = value;
+    }
+    // `IMMORTALITY_YOLO=1` is the escape hatch for a project whose build commands the classifier
+    // does not recognise and whose operator does not want to wait for a human on each one. It is
+    // an environment variable rather than a config key because it is meant to be momentary: a
+    // setting written into a file outlives the reason it was turned on.
+    if std::env::var("IMMORTALITY_YOLO").is_ok_and(|value| value == "1" || value == "true") {
+        config.policy.yolo = true;
     }
     apply_env_u32(
         "IMMORTALITY_SOFT_BUDGET_TOKENS",
@@ -764,6 +829,18 @@ fn validate_detectors(detectors: &Detectors) -> Result<()> {
             detectors.progress_stall_warn,
             "detectors.progress_stall_stop",
             detectors.progress_stall_stop,
+        ),
+        (
+            "detectors.file_churn_warn",
+            detectors.file_churn_warn,
+            "detectors.file_churn_strategy",
+            detectors.file_churn_strategy,
+        ),
+        (
+            "detectors.file_churn_strategy",
+            detectors.file_churn_strategy,
+            "detectors.file_churn_stop",
+            detectors.file_churn_stop,
         ),
     ];
     for (warn_name, warn, stop_name, stop) in ladder {
@@ -968,6 +1045,90 @@ mod tests {
         assert!(!loaded.config.policy.allow_network);
         assert!(!loaded.config.policy.allow_sudo);
         assert!(!loaded.config.policy.trusted_hosts.contains("evil.example"));
+    }
+
+    #[test]
+    fn the_global_file_sets_the_deny_lists() {
+        let fx = fixture();
+        std::fs::write(
+            &fx.global,
+            "[policy]\ndeny_read_globs = [\"**/.ssh/**\"]\ndeny_programs = [\"sudo\", \"ssh\"]\n",
+        )
+        .unwrap();
+
+        let loaded = load(&overrides_for(&fx)).unwrap();
+        assert_eq!(
+            loaded.config.policy.deny_read_globs,
+            vec!["**/.ssh/**".to_string()]
+        );
+        assert_eq!(
+            loaded.config.policy.deny_programs,
+            vec!["sudo".to_string(), "ssh".to_string()]
+        );
+    }
+
+    #[test]
+    fn project_file_cannot_empty_the_read_deny_list() {
+        // Same reason as the write list: a project file that could empty a deny list is a project
+        // file that can grant itself the right to read whatever the operator excluded.
+        let fx = fixture();
+        std::fs::write(&fx.global, "[policy]\ndeny_read_globs = [\"**/.ssh/**\"]\n").unwrap();
+        std::fs::write(
+            &fx.project,
+            "[policy]\ndeny_read_globs = []\ndeny_programs = []\n",
+        )
+        .unwrap();
+
+        let loaded = load(&overrides_for(&fx)).unwrap();
+        assert_eq!(
+            loaded.config.policy.deny_read_globs,
+            vec!["**/.ssh/**".to_string()],
+            "the project file must not be able to empty the read deny list"
+        );
+    }
+
+    #[test]
+    fn project_file_cannot_unban_a_program() {
+        let fx = fixture();
+        std::fs::write(&fx.global, "[policy]\ndeny_programs = [\"sudo\"]\n").unwrap();
+        std::fs::write(&fx.project, "[policy]\ndeny_programs = []\n").unwrap();
+
+        let loaded = load(&overrides_for(&fx)).unwrap();
+        assert_eq!(
+            loaded.config.policy.deny_programs,
+            vec!["sudo".to_string()],
+            "the project file must not be able to unban a program"
+        );
+    }
+
+    #[test]
+    fn the_deny_lists_default_to_empty() {
+        // The empty default is what keeps an existing project's behaviour unchanged: a deny rule
+        // nobody wrote must not suddenly deny a read.
+        let config = Config::default();
+        assert_eq!(config.policy.deny_read_globs, Vec::<String>::new());
+        assert_eq!(config.policy.deny_programs, Vec::<String>::new());
+    }
+
+    #[test]
+    fn the_global_file_can_turn_on_yolo() {
+        let fx = fixture();
+        std::fs::write(&fx.global, "[policy]\nyolo = true\n").unwrap();
+
+        let loaded = load(&overrides_for(&fx)).unwrap();
+        assert!(loaded.config.policy.yolo);
+    }
+
+    #[test]
+    fn project_file_cannot_turn_on_yolo() {
+        // `yolo` is a permission, so D-009 applies: the file inside the repository the agent edits
+        // cannot grant it.
+        let fx = fixture();
+        std::fs::write(&fx.global, "").unwrap();
+        std::fs::write(&fx.project, "[policy]\nyolo = true\n").unwrap();
+
+        let loaded = load(&overrides_for(&fx)).unwrap();
+        assert!(!loaded.config.policy.yolo);
     }
 
     #[test]

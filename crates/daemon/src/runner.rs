@@ -212,7 +212,7 @@ pub enum Streamed {
 ///
 /// The daemon runs on a tokio runtime and the loop is synchronous: making it `async` would push
 /// `async` into every detector and every test for no benefit, because steps are strictly
-/// sequential and the global semaphore admits one inference at a time anyway.
+/// sequential: each request starts after the previous one's result is in the journal.
 pub struct LlmModel {
     backend: Backend,
     runtime: tokio::runtime::Runtime,
@@ -1188,7 +1188,7 @@ struct StepLoop<'a> {
     /// Preferred over `last_text` for the report because it is a deliberate summary rather than
     /// whatever happened to be observed last — the next attempt inherits it.
     claim_summary: Option<String>,
-    /// What D1–D3 have seen so far, and what they have already announced.
+    /// What D1–D3 and D6 have seen so far, and what they have already announced.
     signals: Signals,
     /// The thresholds, read from config once.
     thresholds: Thresholds,
@@ -1673,6 +1673,18 @@ impl<'a> StepLoop<'a> {
         let declared = tool.paths(&args);
         match tool.execute(&ctx, args) {
             Ok(result) => {
+                // D6: the *destination*, from what the tool declared it would write. Not the
+                // content and not the arguments: the measured failure rewrote one file nineteen
+                // times with nineteen different bodies, so anything content-derived is blind to
+                // it. `Signals::record_write` ignores tools that are not file editors, which is
+                // why this can pass every write path without counting shell redirects.
+                for path in &declared {
+                    if path.write {
+                        let normalised =
+                            immortality_core::detect::normalize_path(&path.path, self.runner.gate.worktree());
+                        self.signals.record_write(&call.name, &normalised);
+                    }
+                }
                 for path in &declared {
                     if path.write {
                         self.touched.push(PathBuf::from(&path.path));
@@ -3563,6 +3575,62 @@ mod tests {
         }
     }
 
+    /// A tool named `write_file` that declares a write and does nothing else.
+    ///
+    /// D6 keys on the tool's name and its declared write path, so a test of it needs the real
+    /// name — `touch` would be ignored by design, and a fake registered under a different name
+    /// would prove only that the test's own convention works.
+    #[derive(Debug)]
+    struct Churn;
+
+    impl immortality_tools::Tool for Churn {
+        fn name(&self) -> &'static str {
+            "write_file"
+        }
+
+        fn schema(&self) -> &'static serde_json::Value {
+            static SCHEMA: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
+            SCHEMA.get_or_init(|| {
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" },
+                        "content": { "type": "string" }
+                    },
+                    "required": ["path", "content"],
+                    "additionalProperties": false
+                })
+            })
+        }
+
+        fn description(&self) -> &'static str {
+            "Write a file."
+        }
+
+        fn effect(&self, _args: &Args) -> immortality_tools::Effect {
+            immortality_tools::Effect::Mutate
+        }
+
+        fn idempotency(&self, _args: &Args) -> Idempotency {
+            Idempotency::ByContent
+        }
+
+        fn paths(&self, args: &Args) -> Vec<immortality_tools::PathUse> {
+            args.opt_str("path")
+                .ok()
+                .flatten()
+                .map(|path| vec![immortality_tools::PathUse::write(path)])
+                .unwrap_or_default()
+        }
+
+        fn execute(&self, _ctx: &ToolCtx, args: Args) -> Result<immortality_tools::ToolResult, ToolError> {
+            // The observation differs per call so that D2 cannot be what fires; only the
+            // destination is constant.
+            let content = args.str("content")?;
+            Ok(immortality_tools::ToolResult::text(format!("wrote {content}")))
+        }
+    }
+
     /// Detector records in the journal, as `(detector, level)` pairs.
     ///
     /// Panics rather than skipping a record whose detector or level is missing. That is the
@@ -3570,7 +3638,7 @@ mod tests {
     /// with its type **and** level", and the obvious `filter_map` — which this used to be — makes
     /// a record without a level simply disappear. Every test written on top of it would still
     /// pass, and the journal would be quietly missing the half that says what was done about the
-    /// loop. A strict helper turns the omission into a failure in the five tests that read it.
+    /// loop. A strict helper turns the omission into a failure in the tests that read it.
     fn reactions(dir: &tempfile::TempDir) -> Vec<(String, String)> {
         let reader = immortality_core::journal::JournalReader::open(
             dir.path().join("journal"),
@@ -3881,17 +3949,43 @@ mod tests {
         pairs
     }
 
+    /// The D6 scenario: one file rewritten with a different body every step.
+    ///
+    /// The body differs on purpose — D1 is blind to a changing body by design, and that is exactly
+    /// the shape the live run had: nineteen rewrites of `spec/probe_spec.rb`, nineteen different
+    /// guesses, no detector firing until the step budget ended the attempt.
+    fn churn_scenario() -> Vec<(String, String)> {
+        let replies = (0..20)
+            .map(|index| {
+                Ok(Reply::call(
+                    format!("call_{index}"),
+                    "write_file",
+                    format!(r#"{{"path":"spec/probe_spec.rb","content":"try {index}"}}"#),
+                ))
+            })
+            .collect();
+        fired_by(
+            Scripted::new(replies),
+            registry(vec![Arc::new(Churn)]),
+            |runner| {
+                runner.detectors.file_churn_warn = 3;
+                runner.detectors.file_churn_strategy = 4;
+                runner.detectors.file_churn_stop = 5;
+            },
+        )
+    }
+
     #[test]
     fn every_detector_reaches_the_journal_with_a_level() {
         // The v0.1 criterion is "every detector firing is journaled with its type **and** level".
         // Each detector has a test of its own above, and that is what let this gap survive: every
-        // test asserted about the detector it was written for, and nothing asserted that the five
-        // together were all there. A detector that stopped being reachable — a threshold raised
+        // test asserted about the detector it was written for, and nothing asserted that all of
+        // them together were there. A detector that stopped being reachable — a threshold raised
         // past the budget, a rung removed, a reaction replaced by a log line that only an operator
-        // reads — would leave all five tests green and the metric short of a row.
+        // reads — would leave every per-detector test green and the metric short of a row.
         //
         // So the set is checked as a set. Every scenario is the smallest one that reaches its
-        // detector, and the assertion is that all five names appear with a level the ladder
+        // detector, and the assertion is that all six names appear with a level the ladder
         // actually has.
         let repeated = "the parser is fine ".repeat(60);
         let scenarios = [
@@ -3962,6 +4056,7 @@ mod tests {
                     |runner| runner.limits.max_steps = 2,
                 ),
             ),
+            ("d6", churn_scenario()),
         ];
 
         let mut journaled: Vec<String> = Vec::new();
@@ -3979,7 +4074,7 @@ mod tests {
                 journaled.push(level);
             }
         }
-        // All three rungs are reached by the five scenarios, so "with a level" is not satisfied by
+        // All three rungs are reached by the six scenarios, so "with a level" is not satisfied by
         // a field that is always the same value.
         for rung in ["l1", "l2", "l3"] {
             assert!(

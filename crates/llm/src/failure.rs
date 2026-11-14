@@ -227,7 +227,7 @@ pub fn classify_turn(turn: &AssistantTurn) -> Option<Failure> {
 /// Doubling from one second with a 60-second cap: 1, 2, 4, 8, 16, 32, 60, 60…
 ///
 /// No jitter, deliberately. Jitter exists to spread a thundering herd of independent clients;
-/// this daemon is the only client, and the semaphore limits it to one request at a time. In
+/// this daemon is the only client and it issues one request at a time. In
 /// exchange, the schedule is reproducible, so a test can assert it and an operator reading a log
 /// can tell whether a backend was down for two minutes or twenty.
 #[must_use]

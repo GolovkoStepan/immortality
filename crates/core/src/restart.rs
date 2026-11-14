@@ -37,7 +37,7 @@
 use std::collections::BTreeSet;
 
 use crate::detect::Detector;
-use crate::domain::{FailureReason, SubtaskId};
+use crate::domain::{FailureReason, SubtaskId, TaskId};
 use crate::journal::{JournalRecord, Kind};
 
 /// The most failed approaches a brief repeats.
@@ -140,14 +140,18 @@ impl Cause {
                         format!("different calls kept returning the same result ({metric} time(s))")
                     }
                     Detector::NoProgress => format!(
-                        "nothing changed for {metric} steps: the tree, the gates and the facts \
-                         were identical"
+                        "nothing changed for {metric} steps: every observation had already been \
+                         seen in this attempt"
                     ),
                     Detector::ReasoningLoop => format!(
                         "the message began repeating itself ({metric} occurrence(s)) and the \
                          stream was cut"
                     ),
                     Detector::Budget => "a budget ran out".to_string(),
+                    Detector::FileChurn => format!(
+                        "it rewrote one file {metric} time(s) in a row, each time guessing at the \
+                         fix"
+                    ),
                 };
                 format!("{what}; the ladder stopped it (detector {})", detector.as_str())
             }
@@ -206,6 +210,15 @@ impl Cause {
                 "The budget that ran out was not a step budget, so the plan was too expensive \
                  rather than too long. Do the same work with fewer and cheaper observations, and \
                  finish the subtask as soon as its definition of done holds."
+            }
+            Self::Detector {
+                detector: Detector::FileChurn,
+                ..
+            } => {
+                "Stop editing that file. Run the check first and read the whole failure, then say \
+                 in one sentence what you believe is wrong. If you cannot, the file is not the \
+                 problem: read the code the check calls, or explain why the check's expectation is \
+                 wrong and change that instead."
             }
             Self::Limit(Limit::Steps) => {
                 "The last plan did not fit in one pass. Work in smaller pieces: one file, one \
@@ -307,13 +320,21 @@ impl Spent {
     ///
     /// `next` is driven by the highest number the journal has *seen*, not by the budget: a
     /// subtask that abandoned three attempts still gets number 4, and its key never collides.
+    ///
+    /// The task is part of the key, not a convenience. `.agent/JOURNAL.jsonl` is shared by every
+    /// task of a repository, and a plan reuses subtask ids across runs (the second run of
+    /// `black_jack` had the same six ids as the first). Filtering by subtask alone therefore
+    /// charged the second task's *first* attempt with the first task's attempts: measured in the
+    /// journal, `tsk_01M7D7GK…` started at attempt 2 or 4 on every subtask and reached "attempt 4"
+    /// under a `max_attempts_per_subtask` of 3, which also made two runs of the same plan
+    /// incomparable.
     #[must_use]
-    pub fn read(records: &[JournalRecord], subtask: &SubtaskId) -> Self {
+    pub fn read(records: &[JournalRecord], task: &TaskId, subtask: &SubtaskId) -> Self {
         let mut charged: BTreeSet<u32> = BTreeSet::new();
         let mut restarted: BTreeSet<u32> = BTreeSet::new();
         let mut seen: BTreeSet<u32> = BTreeSet::new();
         for record in records {
-            if record.fields.subtask.as_ref() != Some(subtask) {
+            if &record.fields.task != task || record.fields.subtask.as_ref() != Some(subtask) {
                 continue;
             }
             let Some(number) = record.fields.attempt else {

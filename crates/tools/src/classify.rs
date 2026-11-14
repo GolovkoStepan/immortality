@@ -472,6 +472,20 @@ fn classify_simple(simple: &Simple) -> Classification {
         .collect();
 
     for (target, _) in &simple.redirections {
+        // A sink is a place output goes that is not a file on disk. It is not a path the policy
+        // can judge, and reporting it as one is not a harmless over-approximation: `/dev/null`
+        // is outside the worktree by construction, so every `cmd 2>/dev/null` — the ordinary
+        // way to silence a warning — was denied as an escape attempt. Measured: five separate
+        // steps of the first live run were refused for this alone, and two subtasks were
+        // blocked on gates that never ran because their command was denied before execution.
+        if is_sink(target) {
+            // The effect is still a mutation. `cargo test 2>/dev/null` writes `target/`, and a
+            // mutation that names no path is allowed inside the worktree while an unknown
+            // program stays external either way — the sink changes the path list, not the risk.
+            result.effect = result.effect.max(Effect::Mutate);
+            result.reason = "redirects output into a sink".to_string();
+            continue;
+        }
         result.paths.push(PathUse {
             path: target.clone(),
             write: true,
@@ -569,7 +583,9 @@ fn classify_program(program: &str, args: &[&str]) -> Classification {
 
     if let Some((_, writes)) = PATH_PROGRAMS.iter().find(|(name, _)| *name == program) {
         let value_options = options_taking_values(program);
+        let pattern_is_first_operand = takes_a_pattern_operand(program, args);
         let mut skip_next = false;
+        let mut operand = 0usize;
         for arg in args {
             if skip_next {
                 skip_next = false;
@@ -581,6 +597,14 @@ fn classify_program(program: &str, args: &[&str]) -> Classification {
                 }
                 continue;
             }
+            operand += 1;
+            // `grep PATTERN FILE...` — the first operand is what to look for, and reading it as a
+            // path is how a pattern like `~> *3\.4` became a denial: `~` is refused as a path
+            // because a tool argument may not expand it, so the DoD check `grep -qE '~> *3\.4'
+            // README.md` never ran and the gate reported "(no exit code)" with no reason at all.
+            if pattern_is_first_operand && operand == 1 {
+                continue;
+            }
             result.paths.push(PathUse {
                 path: (*arg).to_string(),
                 write: *writes,
@@ -589,6 +613,31 @@ fn classify_program(program: &str, args: &[&str]) -> Classification {
     }
 
     result
+}
+
+/// Whether the program's first non-flag operand is a pattern rather than a file.
+///
+/// `grep PATTERN FILE` puts a non-path first operand in front of the files, and reading it as a
+/// path is not harmless. `grep -qE '~> *3\.4' README.md` is the exact definition-of-done check the
+/// first live run used, and `~` is refused outright because a tool argument may not expand it: the
+/// check was denied before it ran and the gate recorded "(no exit code)", which reads as a failing
+/// test rather than as a policy refusal. The agent then spent two more attempts rewriting a README
+/// that was already correct.
+///
+/// `-e` and `-f` supply the pattern themselves, so with either present the first operand is a file
+/// again and must stay checked.
+fn takes_a_pattern_operand(program: &str, args: &[&str]) -> bool {
+    if !matches!(program, "grep" | "egrep" | "fgrep" | "rg") {
+        return false;
+    }
+    // Both the separated form (`-e pattern`) and the joined one (`-epattern`) count: either way
+    // the pattern came from the flag, not from a bare operand.
+    let supplied = args.iter().any(|arg| {
+        (*arg == "-e" || *arg == "-f")
+            || (arg.starts_with("-e") && arg.len() > 2)
+            || (arg.starts_with("-f") && arg.len() > 2)
+    });
+    !supplied
 }
 
 /// Options whose following word is a value rather than a path, per program.
@@ -837,6 +886,22 @@ fn basename(word: &str) -> String {
     word.rsplit('/').next().unwrap_or(word).to_string()
 }
 
+/// Whether a redirection target names a sink rather than a file.
+///
+/// Only the device files POSIX guarantees on every system, and only by exact name. A prefix rule
+/// would let `> /dev/null.txt` skip the path check, and a broader `/dev/*` rule would excuse
+/// writes to block devices — the one class of target where a wrong "harmless" answer is worst.
+///
+/// `/dev/stdout` and `/dev/stderr` are here because they are the same thing as `>&1` and `>&2`
+/// said with a path, and a model writes them interchangeably. Closing the descriptor
+/// (`>&-`) needs no entry: the lexer already refuses to read it as a target.
+fn is_sink(target: &str) -> bool {
+    matches!(
+        target,
+        "/dev/null" | "/dev/stdout" | "/dev/stderr" | "/dev/zero" | "/dev/full"
+    )
+}
+
 fn is_assignment(word: &str) -> bool {
     match word.split_once('=') {
         Some((name, _)) => {
@@ -1051,6 +1116,52 @@ mod tests {
     }
 
     #[test]
+    fn a_redirect_to_a_device_sink_is_not_a_path() {
+        // The refusal this test exists for: `cmd 2>/dev/null` used to arrive at the gate as a
+        // write to `/dev/null`, which is outside the worktree, so the ordinary way to silence a
+        // warning was denied as an escape attempt. Measured on the first live run: five steps
+        // refused for this alone, and two subtasks blocked on gates whose command was denied
+        // before it ran, reporting "no exit code" rather than a failing check.
+        assert!(
+            paths("cargo test 2>/dev/null").is_empty(),
+            "{:?}",
+            paths("cargo test 2>/dev/null")
+        );
+        // The effect is still a mutation: `cargo test` writes `target/`, and dropping to `Read`
+        // would let the same command skip the worktree check it needs.
+        assert_eq!(effect("cargo test 2>/dev/null"), Effect::Mutate);
+        for command in [
+            "rspec 2>/dev/null",
+            "rspec > /dev/null",
+            "rspec 2> /dev/stderr",
+            "rspec 1>/dev/stdout",
+            "rspec > /dev/zero",
+        ] {
+            assert!(paths(command).is_empty(), "{command}: {:?}", paths(command));
+        }
+    }
+
+    #[test]
+    fn a_sink_lookalike_is_still_a_path() {
+        // The rule is an exact-name match, not a prefix: `/dev/null.txt` is an ordinary file and
+        // `/dev/sda` is a block device. A broader match would excuse exactly the writes that
+        // matter most.
+        for command in [
+            "rspec > /dev/null.txt",
+            "rspec > /dev/sda",
+            "rspec > /dev/null/../passwd",
+            "rspec > mydev/null",
+        ] {
+            assert_eq!(
+                paths(command).len(),
+                1,
+                "{command} must still name a path: {:?}",
+                paths(command)
+            );
+        }
+    }
+
+    #[test]
     fn an_input_redirect_is_not_a_write() {
         assert_eq!(effect("wc -l < notes.txt"), Effect::Read);
     }
@@ -1191,6 +1302,33 @@ mod tests {
         let extracted = paths("grep -A 3 TODO src/main.rs");
         assert!(!extracted.iter().any(|(path, _)| path == "3"), "{extracted:?}");
         assert!(extracted.iter().any(|(path, _)| path == "src/main.rs"));
+    }
+
+    #[test]
+    fn grep_pattern_is_not_a_path() {
+        // The check the first live run never got to run. `~` is refused as a path by design — a
+        // tool argument may not expand it — so reading the pattern as one denied
+        // `grep -qE '~> *3\.4' README.md` before it executed and the gate recorded "(no exit
+        // code)". Only the file operand is a path.
+        let classified = classify("grep -qE '~> *3\\.4' README.md");
+        assert_eq!(classified.effect, Effect::Read);
+        assert_eq!(classified.paths, vec![PathUse::read("README.md")]);
+
+        // A pattern that happens to be a real path-looking word is still a pattern, and the file
+        // after it is still checked: dropping both would let `grep secret.txt config/.env` read
+        // the file it names.
+        let extracted = paths("grep pattern config/.env");
+        assert_eq!(extracted, vec![("config/.env".to_string(), false)]);
+
+        // `-e` supplies the pattern, so the first operand is a file again.
+        assert_eq!(
+            paths("grep -e pattern README.md"),
+            vec![("README.md".to_string(), false)]
+        );
+        assert_eq!(
+            paths("grep -epattern README.md"),
+            vec![("README.md".to_string(), false)]
+        );
     }
 
     #[test]

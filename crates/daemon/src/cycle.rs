@@ -393,7 +393,7 @@ impl Pass<'_> {
         // a live `kill -9` proved the consequence — two `attempt_started` records under the same
         // `(subtask, 1)` key, and a resumed run with the whole budget back. `Spent` is what makes
         // the module doc's promise ("a resumed subtask continues counting attempts") true.
-        let spent = Spent::read(self.history, &running.id);
+        let spent = Spent::read(self.history, self.journal.task(), &running.id);
         let mut session = self
             .runner
             .session(&running, spent.next)

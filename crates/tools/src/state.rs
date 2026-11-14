@@ -51,7 +51,7 @@ use crate::tool::{Tool, ToolCtx, ToolError, ToolResult};
 use crate::write::write_atomically;
 
 /// The in-repository state directory.
-const AGENT_DIR: &str = ".agent";
+pub const AGENT_DIR: &str = ".agent";
 
 /// One of the five files the agent may read and edit.
 ///
@@ -97,6 +97,27 @@ impl StateFile {
     #[must_use]
     pub fn relative_path(self) -> String {
         format!("{AGENT_DIR}/{}", self.as_str())
+    }
+
+    /// Whether this document is working memory the agent creates for itself.
+    ///
+    /// `NOTES.md` and `DECISIONS.md` have no producer besides the agent: the planner writes the
+    /// plan, `init` writes the config. The other three are executed by the scheduler, so their
+    /// absence means a wrong directory rather than a document waiting to be written.
+    #[must_use]
+    pub const fn is_working_memory(self) -> bool {
+        matches!(self, Self::Decisions | Self::Notes)
+    }
+
+    /// Whether `name` is exactly one of the five documents.
+    ///
+    /// The bare name only: `.agent/NOTES.md` is [`Self::parse`]'s job, and a caller that has a
+    /// string from outside the model — a config, a journal record — has no business supplying the
+    /// prefix. `is_state_file("")`, `is_state_file("JOURNAL.jsonl")` and
+    /// `is_state_file("sub/NOTES.md")` are all false, which is what keeps the set closed.
+    #[must_use]
+    pub fn is_state_file(name: &str) -> bool {
+        Self::ALL.iter().any(|file| file.as_str() == name)
     }
 
     /// Parse the model's `file` argument.
@@ -281,7 +302,17 @@ impl Tool for ReadState {
             .clamp(1, MAX_STATE_LINES);
 
         let relative = file.relative_path();
-        let path = ctx.read_path(&relative)?;
+        // The five documents live in the *project's* `.agent/`, not the worktree's stale copy.
+        // The gate is asked by name, because a name from a closed list is the whole reason this
+        // tool takes an enum rather than a path.
+        match ctx.gate().check_state_read(file.as_str()) {
+            crate::Verdict::Allowed => {}
+            crate::Verdict::Denied(denial) => return Err(ToolError::Refused(denial.observation())),
+            crate::Verdict::Escalated(escalation) => {
+                return Err(ToolError::Refused(escalation.observation()));
+            }
+        }
+        let path = ctx.gate().state_path(file.as_str());
         let bytes = match std::fs::read(&path) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -352,7 +383,7 @@ impl Tool for UpdateState {
     }
 
     fn description(&self) -> &'static str {
-        "Replace a state document wholesale. Refuses a missing file, and refuses to shrink one below half without `replace: true`."
+        "Replace a state document wholesale. Refuses a missing plan document, and refuses to shrink one below half without `replace: true`."
     }
 
     fn effect(&self, _args: &Args) -> Effect {
@@ -387,20 +418,39 @@ impl Tool for UpdateState {
         }
 
         let relative = file.relative_path();
-        let path = ctx.write_path(&relative)?;
-        let previous = std::fs::read(&path).map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                // Creating state files is `immortality init`'s job. A missing one means a wrong
-                // worktree far more often than a new document, and a created-but-empty
-                // `NOTES.md` in a pull request is a confusing thing to review.
-                ToolError::Refused(format!(
-                    "{relative} does not exist. State files are created by `immortality init`; \
-                     this worktree may be missing them."
-                ))
-            } else {
-                ToolError::io(&path, &error)
+        // The five documents live in the *project's* `.agent/`, not the worktree's stale copy.
+        match ctx.gate().check_state_write(file.as_str()) {
+            crate::Verdict::Allowed => {}
+            crate::Verdict::Denied(denial) => return Err(ToolError::Refused(denial.observation())),
+            crate::Verdict::Escalated(escalation) => {
+                return Err(ToolError::Refused(escalation.observation()));
             }
-        })?;
+        }
+        let path = ctx.gate().state_path(file.as_str());
+        let previous = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && file.is_working_memory() => {
+                // The two working-memory documents are the ones nobody else writes: the planner
+                // produces the plan, `init` produces the config, and no component produces notes or
+                // decisions. Refusing to create them meant the model could only ever *think* about
+                // writing what it learned — measured on the live run, where `update_state` on
+                // `NOTES.md` was refused with "State files are created by `immortality init`",
+                // which was untrue: `init` writes `config.toml` and nothing else. The model then
+                // wrote `NOTES.md` in the repository root to keep the facts somewhere, and that
+                // file went into its commit.
+                Vec::new()
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // The plan documents are different: `PLAN.md`, `ACCEPTANCE.md` and `TASKS.json` are
+                // what the scheduler executes. A missing one means a wrong directory, not a new
+                // document, and creating it would give the run an empty plan to execute.
+                return Err(ToolError::Refused(format!(
+                    "{relative} does not exist. The plan documents come from `immortality plan`; \
+                     a missing one means this is not the task's state directory."
+                )));
+            }
+            Err(error) => return Err(ToolError::io(&path, &error)),
+        };
 
         let unchanged = previous == content.as_bytes();
         if unchanged {
@@ -512,10 +562,13 @@ impl Tool for GrepJournal {
             .unwrap_or(DEFAULT_JOURNAL_MATCHES)
             .clamp(1, MAX_JOURNAL_MATCHES);
 
-        let dir = ctx.read_path(AGENT_DIR)?;
+        // The journal lives in the project's `.agent/` too, which is the whole reason it survives a
+        // rollback: `reset --hard` runs in the worktree, and a journal inside it would be deleted
+        // by the recovery step that reads it (D-083).
+        let dir = ctx.gate().state_dir();
         if !dir.is_dir() {
             return Ok(ToolResult::new(
-                format!("There is no `{AGENT_DIR}/` directory in this worktree, so no journal."),
+                format!("There is no `{AGENT_DIR}/` directory for this project, so no journal."),
                 json!({"exists": false, "matches": []}),
             ));
         }
@@ -747,6 +800,68 @@ mod tests {
         UpdateState.execute(&fixture.ctx(), Args::new(args))
     }
 
+    /// A fixture with a project checkout *and* a worktree, which is the daemon's real layout.
+    ///
+    /// The two `.agent/` directories deliberately disagree: the project's says a subtask is done,
+    /// the worktree's still says it is pending. That is not a contrived state — it is what the
+    /// `word-count` dogfood fixture was found in, because the worktree branch was cut before the
+    /// plan was finished. A tool that reads the worktree copy reports a plan that has already
+    /// moved on, which is the split-brain this fixture exists to make impossible.
+    struct SplitFixture {
+        dir: tempfile::TempDir,
+        project: PathBuf,
+        worktree: PathBuf,
+    }
+
+    impl SplitFixture {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let project = dir.path().join("project");
+            let worktree = dir.path().join("project-agent").join("tsk_01");
+            for root in [&project, &worktree] {
+                std::fs::create_dir_all(root.join(AGENT_DIR)).unwrap();
+            }
+            for file in StateFile::ALL {
+                std::fs::write(
+                    state_path(&project, *file),
+                    format!("# {} (project, current)\n", file.as_str()),
+                )
+                .unwrap();
+                std::fs::write(
+                    state_path(&worktree, *file),
+                    format!("# {} (worktree, stale)\n", file.as_str()),
+                )
+                .unwrap();
+            }
+            Self {
+                dir,
+                project,
+                worktree,
+            }
+        }
+
+        fn ctx(&self) -> ToolCtx {
+            let gate = PolicyGate::with_defaults(
+                &self.worktree,
+                immortality_core::config::Policy {
+                    workspace_root: self.dir.path().to_path_buf(),
+                    ..immortality_core::config::Policy::default()
+                },
+            )
+            .unwrap()
+            .with_project_agent_dir(self.project.join(AGENT_DIR));
+            ToolCtx::new(Arc::new(gate), crate::OutputBudget::default())
+        }
+
+        fn project_body(&self, file: StateFile) -> String {
+            std::fs::read_to_string(state_path(&self.project, file)).unwrap()
+        }
+
+        fn worktree_body(&self, file: StateFile) -> String {
+            std::fs::read_to_string(state_path(&self.worktree, file)).unwrap()
+        }
+    }
+
     // ── read_state ────────────────────────────────────────────────────────────────────────
 
     #[test]
@@ -843,9 +958,10 @@ mod tests {
     }
 
     #[test]
-    fn update_state_refuses_to_create_a_missing_file() {
-        // Creating state files is `immortality init`'s job. A missing one means a wrong worktree
-        // far more often than it means a new document.
+    fn update_state_refuses_to_create_a_missing_plan_document() {
+        // `PLAN.md` is what the scheduler executes, so its absence means a wrong directory rather
+        // than a document waiting to be written. Creating an empty one would give the run an empty
+        // plan.
         let fixture = Fixture::new();
         std::fs::remove_file(state_path(fixture.dir.path(), StateFile::Plan)).unwrap();
         let error = update(&fixture, json!({"file": "PLAN.md", "content": "x\n"})).unwrap_err();
@@ -854,6 +970,60 @@ mod tests {
             "the refusal must name the cause: {error}"
         );
         assert!(!state_path(fixture.dir.path(), StateFile::Plan).exists());
+    }
+
+    #[test]
+    fn update_state_creates_missing_working_memory() {
+        // `NOTES.md` and `DECISIONS.md` have no producer besides the agent: the planner writes the
+        // plan, `init` writes the config, and nothing writes notes. Refusing to create them meant
+        // the agent could not record what it learned at all — measured on the live run, where the
+        // refusal told the model to run `immortality init`, which does not create them, and the
+        // model responded by writing `NOTES.md` in the repository root instead.
+        let fixture = Fixture::new();
+        for file in [StateFile::Notes, StateFile::Decisions] {
+            let path = state_path(fixture.dir.path(), file);
+            std::fs::remove_file(&path).unwrap();
+            update(&fixture, json!({"file": file.as_str(), "content": "# learned\n"})).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                "# learned\n",
+                "{} must be creatable",
+                file.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn state_tools_use_the_project_agent_dir_not_the_worktree_copy() {
+        // The split-brain, as a test. A worktree's `.agent/` is a checkout from when the branch was
+        // cut, so it is stale by construction; the plan the scheduler executes lives in the
+        // project. Reading the worktree copy would hand the model a plan that has already moved on,
+        // and writing to it would report success while changing nothing anyone reads.
+        let split = SplitFixture::new();
+
+        let result = ReadState
+            .execute(&split.ctx(), Args::new(json!({"file": "TASKS.json"})))
+            .unwrap();
+        assert!(
+            result.observation.contains("project, current"),
+            "the project's copy must win: {}",
+            result.observation
+        );
+
+        // `replace` because the fixture's notes are longer than the replacement: the halving
+        // guard is a separate rule and firing it here would test that rule, not the destination.
+        UpdateState
+            .execute(
+                &split.ctx(),
+                Args::new(json!({"file": "NOTES.md", "content": "# new facts\n", "replace": true})),
+            )
+            .unwrap();
+        assert_eq!(split.project_body(StateFile::Notes), "# new facts\n");
+        assert!(
+            split.worktree_body(StateFile::Notes).contains("stale"),
+            "the worktree copy must be left alone: {}",
+            split.worktree_body(StateFile::Notes)
+        );
     }
 
     #[test]

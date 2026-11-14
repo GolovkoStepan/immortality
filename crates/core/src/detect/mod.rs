@@ -1,4 +1,4 @@
-//! Five detectors and the reaction ladder, as pure logic.
+//! Six detectors and the reaction ladder, as pure logic.
 //!
 //! # Why this is not inside the runner
 //!
@@ -16,7 +16,8 @@
 //!
 //! # Why D4 is separate from D1–D3
 //!
-//! D1–D3 look at *finished* steps: a call was made, an output came back, the tree changed.
+//! D1–D3 and D6 look at *finished* steps: a call was made, an output came back, the tree
+//! changed.
 //! D4 looks at a *stream in progress* and has to abort it before the model writes five thousand
 //! tokens of the same paragraph. It is therefore a stateful scanner fed one delta at a time, not
 //! a function over history, and it lives in [`Stream`].
@@ -29,6 +30,17 @@ mod stream;
 pub use normalize::normalize;
 pub use stream::{Stream, StreamVerdict};
 
+/// One path, in the form the repeat detectors compare.
+///
+/// The same rewriting [`normalize`] applies inside a JSON argument object: an absolute path under
+/// the worktree becomes relative, so `./src/a.rs`, `src/a.rs` and `/work/tree/src/a.rs` are one
+/// file. Exposed separately because D6 sees the path outside the argument JSON and must not
+/// re-derive the rule — two implementations of "the same file" would disagree eventually.
+#[must_use]
+pub fn normalize_path(path: &str, worktree: &std::path::Path) -> String {
+    normalize::strip_root(path, &worktree.to_string_lossy())
+}
+
 /// Which detector spoke.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Detector {
@@ -36,18 +48,20 @@ pub enum Detector {
     ExactRepeat,
     /// D2: different calls whose results are indistinguishable.
     SemanticRepeat,
-    /// D3: steps passed without the tree, the gates or the facts changing.
+    /// D3: steps produced no observation this attempt had not already seen.
     NoProgress,
     /// D4: the model is repeating a phrase inside one message.
     ReasoningLoop,
     /// D5: a budget is spent.
     Budget,
+    /// D6: the same file is being rewritten over and over.
+    FileChurn,
 }
 
 impl Detector {
     /// The wire name, for a `detector_fired` record.
     ///
-    /// `d1`…`d5` rather than the prose name: the documentation, the config keys and the journal
+    /// `d1`…`d6` rather than the prose name: the documentation, the config keys and the journal
     /// all refer to the detectors by number, and a metric query that has to translate
     /// `exact_repeat` back to `d1` is a query someone will get wrong.
     #[must_use]
@@ -58,6 +72,7 @@ impl Detector {
             Self::NoProgress => "d3",
             Self::ReasoningLoop => "d4",
             Self::Budget => "d5",
+            Self::FileChurn => "d6",
         }
     }
 }
@@ -104,6 +119,11 @@ impl Level {
             (Self::Nudge, Detector::SemanticRepeat) => Some(
                 "Your last calls produced the same result. Running another variant of the same \
                  command will not tell you anything new.",
+            ),
+            (Self::Nudge, Detector::FileChurn) => Some(
+                "You have rewritten the same file several times without the check changing its \
+                 verdict. Another rewrite is a guess, not a fix: state what the check actually \
+                 complains about, or whether the check itself is the thing that is wrong.",
             ),
             (Self::ForceStrategy, _) => Some(
                 "Stop calling tools for one step. Write down three genuinely different hypotheses \
@@ -161,6 +181,7 @@ pub struct Thresholds {
     exact: Ladder,
     semantic: Ladder,
     progress: Ladder,
+    churn: Ladder,
 }
 
 impl Thresholds {
@@ -183,6 +204,11 @@ impl Thresholds {
                 strategy: detectors.progress_stall_warn,
                 stop: detectors.progress_stall_stop,
             },
+            churn: Ladder {
+                warn: detectors.file_churn_warn,
+                strategy: detectors.file_churn_strategy,
+                stop: detectors.file_churn_stop,
+            },
         }
     }
 
@@ -203,7 +229,20 @@ impl Thresholds {
     pub const fn progress(&self, steps: u32) -> Option<Level> {
         self.progress.level(steps)
     }
+
+    /// The level a run of rewrites to one file reaches.
+    #[must_use]
+    pub const fn churn(&self, writes: u32) -> Option<Level> {
+        self.churn.level(writes)
+    }
 }
+
+/// The tools whose purpose is editing a file.
+///
+/// Listed here rather than inferred from the tool name: a tool called `patch` or `write_state`
+/// would otherwise be counted or missed by a guess. D6 is about a file being rewritten, so only
+/// the tools that exist to rewrite one are in the list.
+const FILE_EDITORS: &[&str] = &["write_file", "edit_file"];
 
 /// What the loop has observed so far in one attempt.
 ///
@@ -226,10 +265,24 @@ pub struct Signals {
     last_output: Option<String>,
     /// Consecutive semantic repeats of the same digest.
     semantic_run: u32,
-    /// Steps since the last observable progress.
+    /// Every output digest this attempt has produced, so a repeat is recognisable even when the
+    /// steps are not adjacent.
+    ///
+    /// D2 needs adjacency and D3 must not: the measured A-B-A-B loop alternated two commands whose
+    /// two outputs were both known, so every digest differed from its predecessor and a window of
+    /// one saw nothing. The memory is the whole attempt and therefore bounded by its step budget,
+    /// and each entry is a 32-byte digest, not the output itself.
+    seen_outputs: std::collections::BTreeSet<String>,
+    /// Consecutive steps that produced no observation this attempt had not already seen.
     unproductive: u32,
     /// The harshest unproductive-stretch level already announced.
     progress_announced: Option<Level>,
+    /// The file most recently rewritten, and how many times it has been rewritten since a write
+    /// to some other file.
+    churn_path: Option<String>,
+    churn_run: u32,
+    /// The harshest churn level already announced.
+    churn_announced: Option<Level>,
     /// Whether the model was just told to stop and think, so the forced step is not forced twice.
     strategy_forced: bool,
 }
@@ -245,6 +298,12 @@ impl Signals {
     /// says nothing about D2: the same command twice is expected to print the same thing, and
     /// counting that as a semantical repeat as well would report one stuck step as two problems.
     /// D2 counts what happens when the model *changes* the call and gets the same answer back.
+    ///
+    /// D3 is not D2 and does not care about adjacency: its question is whether this step told the
+    /// attempt anything it did not already know. An output digest the attempt has seen before is
+    /// therefore a step without progress *wherever* it appeared earlier, which is what makes an
+    /// A-B-A-B alternation visible. D2's run stays adjacent on purpose — two identical results
+    /// with real work in between are not a loop.
     pub fn record_call(
         &mut self,
         tool: &str,
@@ -267,6 +326,14 @@ impl Signals {
             return;
         };
         let digest = crate::journal::digest_text(&crate::artifacts::digest_of(text.as_bytes()));
+        // D3: a digest this attempt has not produced before is a new fact, and any position is
+        // enough. This is fed for identical calls too — a repeat of `ls` answers with output the
+        // model already has, and a step that learns nothing is exactly what D3 counts.
+        if self.seen_outputs.insert(digest.clone()) {
+            self.unproductive = 0;
+        } else {
+            self.unproductive = self.unproductive.saturating_add(1);
+        }
         if same_call {
             // The identical call is D1's; do not also feed D2.
             return;
@@ -275,8 +342,6 @@ impl Signals {
             self.semantic_run = self.semantic_run.saturating_add(1);
         } else {
             self.semantic_run = 1;
-            // An output this attempt has not seen is progress.
-            self.unproductive = 0;
         }
         self.last_output = Some(digest);
     }
@@ -293,10 +358,43 @@ impl Signals {
 
     /// Record a step that changed the working tree or the recorded facts.
     ///
-    /// The hash itself is not stored: the loop only needs to know *that* it changed, and the
-    /// caller has already paid for the hash.
-    pub const fn record_progress(&mut self) {
+    /// D3's own counter is reset by a *new observation* as well, so this is for progress a digest
+    /// cannot see: a write that changed the tree while printing the same acknowledgement, or a
+    /// gate that went green.
+    pub fn record_progress(&mut self) {
         self.unproductive = 0;
+        // Progress ends a churn cycle: rewriting a file after something *worked* is the next
+        // piece of work, not a continuation of the guess that failed.
+        self.churn_path = None;
+        self.churn_run = 0;
+    }
+
+    /// Record a write to `path` by `tool`.
+    ///
+    /// D6's signal is deliberately about the *destination*, not the content: D1 compares calls and
+    /// is blind to a model that rewrites one file nineteen times, because each body is a fresh
+    /// guess. Measured on the first live run: nineteen successive writes of `spec/probe_spec.rb`,
+    /// each with a different body and each followed by the same failing check, and no detector
+    /// fired until the step budget ended the attempt.
+    ///
+    /// Only the tools whose purpose is editing a file count ([`FILE_EDITORS`]). A shell redirect
+    /// that names a path is not one: `cargo test > /tmp/out` repeated eight times is an ordinary
+    /// run, and counting it would nudge a model that is making progress.
+    ///
+    /// Non-editing calls do not reset the run: the measured sequence interleaved the rewrite with
+    /// the check that judged it, and a counter that only looked at adjacent calls would have been
+    /// reset by every check.
+    pub fn record_write(&mut self, tool: &str, path: &str) {
+        if !FILE_EDITORS.contains(&tool) {
+            return;
+        }
+        if self.churn_path.as_deref() == Some(path) {
+            self.churn_run = self.churn_run.saturating_add(1);
+        } else {
+            self.churn_path = Some(path.to_string());
+            self.churn_run = 1;
+            self.churn_announced = None;
+        }
     }
 
     /// How many times in a row the most recent call has been repeated.
@@ -311,10 +409,22 @@ impl Signals {
         self.semantic_run
     }
 
-    /// How many steps have passed without progress.
+    /// How many steps have passed without an observation this attempt had not already seen.
     #[must_use]
     pub const fn unproductive(&self) -> u32 {
         self.unproductive
+    }
+
+    /// How many times the same file has been rewritten in a row.
+    #[must_use]
+    pub const fn churn_run(&self) -> u32 {
+        self.churn_run
+    }
+
+    /// The file the churn run is about, if any.
+    #[must_use]
+    pub fn churn_path(&self) -> Option<&str> {
+        self.churn_path.as_deref()
     }
 
     /// How many distinct call shapes were made.
@@ -346,6 +456,15 @@ impl Signals {
             thresholds.semantic(self.semantic_run),
             self.semantic_run,
             &mut self.semantic_announced,
+        );
+        if decision.is_some() {
+            return decision;
+        }
+        let decision = raise(
+            Detector::FileChurn,
+            thresholds.churn(self.churn_run),
+            self.churn_run,
+            &mut self.churn_announced,
         );
         if decision.is_some() {
             return decision;

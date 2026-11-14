@@ -59,7 +59,7 @@ fn relativize(value: Value, root: &str) -> Value {
 ///
 /// `"/work/tree/src/a.rs"` becomes `"src/a.rs"`, and the bare root becomes `"."`, so the same
 /// file named absolutely and relatively normalises to identical bytes.
-fn strip_root(text: &str, root: &str) -> String {
+pub(super) fn strip_root(text: &str, root: &str) -> String {
     let root = root.trim_end_matches('/');
     if root.is_empty() {
         return text.to_string();
