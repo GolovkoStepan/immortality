@@ -138,6 +138,8 @@ impl Fixture {
     fn open_call(&self, call: &str, tool: &str, arguments: &serde_json::Value, started: bool) {
         let mut journal = self.journal();
         let scope = Scope::attempt(SubtaskId::from_suffix(SUBTASK), 1);
+        let request = self.request();
+        let class = idempotency_for(&request.registry, tool, arguments);
         {
             // One log for both records: the ordering guard lives in its in-memory map, and a
             // second log would refuse a `started` whose `intent` it never saw.
@@ -146,7 +148,7 @@ impl Fixture {
                 immortality_core::protocol::CallId::from_model(call),
                 tool,
                 arguments,
-                idempotency_for(tool),
+                class,
                 format!("call {call}"),
             );
             log.intent(&intent, arguments).expect("intent");
@@ -202,17 +204,26 @@ impl Fixture {
     }
 }
 
-/// The idempotency class each tool declares, mirroring the tool's own `idempotency()`.
+/// The idempotency class each tool declares, taken from the tools themselves.
 ///
-/// A helper that guessed differently would exercise an arm the tool never reaches, and a test that
-/// passes through the wrong arm proves nothing about the one that ships.
-fn idempotency_for(tool: &str) -> immortality_core::protocol::Idempotency {
-    use immortality_core::protocol::Idempotency;
-    match tool {
-        "write_file" | "edit_file" | "update_state" => Idempotency::ByContent,
-        "shell" | "start_process" | "delegate" | "git" => Idempotency::Unknown,
-        _ => Idempotency::Idempotent,
-    }
+/// # Why this is not a match on the tool's name
+///
+/// It used to be one, and it had already drifted from the code: `escalate` and `kill_process`
+/// both declare `ByContent`, and the hand-written table put them in its `_ => Idempotent` arm.
+/// Every test built on that table was therefore exercising an arm the tool never reaches — the
+/// exact failure its own comment warned about, made invisible by the copy.
+///
+/// Taking the class from the registry `request()` builds is the version that cannot drift: a tool
+/// that changes its class changes what these tests exercise, in the same commit.
+fn idempotency_for(
+    registry: &immortality_tools::Registry,
+    tool: &str,
+    arguments: &serde_json::Value,
+) -> immortality_core::protocol::Idempotency {
+    let found = registry
+        .get(tool)
+        .unwrap_or_else(|| panic!("`{tool}` is not a production tool, so its class is unknown"));
+    found.idempotency(&immortality_tools::Args::new(arguments.clone()))
 }
 
 /// A gate over the fixture's worktree, for the cases that assert on policy refusals.

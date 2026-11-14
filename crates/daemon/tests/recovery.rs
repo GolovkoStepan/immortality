@@ -34,7 +34,7 @@ use immortality_core::domain::TaskId;
 use immortality_core::escalation::{Answer, EscalationStore};
 use immortality_core::ids::SubtaskId;
 use immortality_core::journal::{Journal, JournalReader, Kind, ReadOutcome, Scope};
-use immortality_core::protocol::{CallId, Intent, Probe};
+use immortality_core::protocol::{CallId, Idempotency, Intent, Probe};
 use immortality_core::recover::{self, Prober, RecoveryInput, Verdict, WorkspaceFacts};
 use immortality_core::time::{Clock as _, FixedClock};
 use immortality_daemon::recovery::{self as exec, Executed, RecoveryDeps, ToolProbe};
@@ -213,7 +213,11 @@ impl Fixture {
             CallId::from_model(call),
             tool,
             arguments,
-            idempotency_for(tool),
+            // The class comes from the tool that will execute the retry, not from a copy of its
+            // table. The copy had already drifted: `escalate` and `kill_process` declare
+            // `ByContent` and a hand-written match put them in its `Idempotent` default, so tests
+            // exercised an arm production never reaches.
+            self.class_of(tool, arguments),
             format!("call {call}"),
         );
         let scope = Scope::attempt(SubtaskId::from_suffix(SUBTASK), 1);
@@ -228,6 +232,28 @@ impl Fixture {
             }
         }
         journal.close().expect("close");
+    }
+
+    /// The idempotency class the production registry declares for `tool`.
+    ///
+    /// Taken from the tool, not from a copy of its table. The copy this replaces had already
+    /// drifted from the code — `escalate` and `kill_process` were in its `Idempotent` default arm
+    /// while both declare `ByContent` — so every test built on it exercised a path production
+    /// never takes, which is exactly what its own comment warned about.
+    fn class_of(&self, tool: &str, arguments: &serde_json::Value) -> Idempotency {
+        let deps = immortality_daemon::toolset::ToolsetDeps::for_task(
+            &immortality_core::config::Config::default(),
+            self.dir.path(),
+            &self.task_dir,
+            &self.worktree,
+            self.task.clone(),
+        )
+        .expect("toolset deps");
+        let registry = immortality_daemon::toolset::build(&deps).expect("registry");
+        let found = registry
+            .get(tool)
+            .unwrap_or_else(|| panic!("`{tool}` is not a production tool, so a test cannot name its class"));
+        found.idempotency(&immortality_tools::Args::new(arguments.clone()))
     }
 
     fn run_plan(&self) -> (ReadOutcome, recover::RecoveryReport, Executed) {
@@ -303,17 +329,6 @@ fn workspace_facts(worktree: &Path) -> WorkspaceFacts {
 const fn clean(mut facts: WorkspaceFacts) -> WorkspaceFacts {
     facts.dirty = false;
     facts
-}
-
-fn idempotency_for(tool: &str) -> immortality_core::protocol::Idempotency {
-    use immortality_core::protocol::Idempotency;
-    match tool {
-        "write_file" | "edit_file" | "update_state" => Idempotency::ByContent,
-        // Mirrors each tool's own `idempotency()`: a helper that guessed differently would
-        // exercise an arm the tool never reaches.
-        "shell" | "start_process" | "delegate" | "git" => Idempotency::Unknown,
-        _ => Idempotency::Idempotent,
-    }
 }
 
 // ── the probe ──────────────────────────────────────────────────────────────────────────────
@@ -954,4 +969,55 @@ fn the_prober_reads_through_the_same_gate_the_tool_used() {
     );
     let arguments = json!({"path": "../../../etc/passwd", "content": "x"});
     assert_eq!(probe.probe(&intent, Some(&arguments)), Probe::Unknown);
+}
+
+#[test]
+fn every_writing_tool_that_cannot_be_replayed_is_not_safe_to_retry() {
+    // The v0.1 criterion "0 double-applied non-idempotent actions" is only as good as the classes
+    // the tools declare, and the class decides what recovery does with an interrupted call: a tool
+    // that says `Idempotent` is re-run blindly, one that says `ByContent` or `Unknown` is not.
+    //
+    // This test exists because the previous version of this file asked a hand-written table
+    // instead of the tool. That table had already drifted — `escalate` and `kill_process` declare
+    // `ByContent` and the table put them in its `Idempotent` default — so the tests were asserting
+    // about an arm no tool takes. Reading the registry is what makes the claim about the code that
+    // ships.
+    let fixture = Fixture::new();
+    let deps = immortality_daemon::toolset::ToolsetDeps::for_task(
+        &immortality_core::config::Config::default(),
+        fixture.dir.path(),
+        &fixture.task_dir,
+        &fixture.worktree,
+        fixture.task.clone(),
+    )
+    .expect("toolset deps");
+    let registry = immortality_daemon::toolset::build(&deps).expect("registry");
+
+    // Every tool whose replay repeats an effect, with arguments that name the dangerous thing it
+    // does. `shell` and `start_process` are where a replay runs a second process; `git commit` is
+    // where it makes a second commit; `escalate` and `delegate` write queue records; the two state
+    // and file writers rewrite content.
+    //
+    // `kill_process` is deliberately absent: killing an already-dead process does nothing, so
+    // `Idempotent` is the honest class there and the second kill finds nothing to repeat.
+    let writing: [(&str, serde_json::Value); 7] = [
+        ("shell", json!({"command": "rm -rf build"})),
+        ("start_process", json!({"command": "sleep 60"})),
+        ("git", json!({"subcommand": "commit", "message": "x"})),
+        ("escalate", json!({"question": "may I?"})),
+        ("delegate", json!({"brief": "x", "scope": "y"})),
+        ("write_file", json!({"path": "a.txt", "content": "x"})),
+        ("update_state", json!({"file": "facts", "content": "x"})),
+    ];
+    for (name, arguments) in writing {
+        let tool = registry
+            .get(name)
+            .unwrap_or_else(|| panic!("`{name}` is missing from every_tool_set"));
+        let class = tool.idempotency(&immortality_tools::Args::new(arguments));
+        assert!(
+            !class.is_safe_to_retry(),
+            "`{name}` declares `{class:?}`, so recovery would replay it blindly; a doubled \
+             non-idempotent action is the one v0.1 criterion this test exists to keep honest"
+        );
+    }
 }

@@ -21,6 +21,43 @@ fn detector_names_are_stable_because_they_are_a_metric_key() {
 }
 
 #[test]
+fn no_two_detectors_share_a_name() {
+    // The name is the key `core::metrics` tallies by, so two detectors answering to `d1` would be
+    // one line in the report and one number for two different loops — a metric that undercounts
+    // exactly the thing it exists to count. `as_str` matches exhaustively, so a new variant cannot
+    // be added without this list failing to compile; this assertion is what stops it being added
+    // under an existing name.
+    let names: Vec<&str> = [
+        Detector::ExactRepeat,
+        Detector::SemanticRepeat,
+        Detector::NoProgress,
+        Detector::ReasoningLoop,
+        Detector::Budget,
+    ]
+    .into_iter()
+    .map(Detector::as_str)
+    .collect();
+    let mut unique = names.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(unique.len(), names.len(), "two detectors share a name: {names:?}");
+}
+
+#[test]
+fn no_two_levels_share_a_name() {
+    // Same reasoning as the detectors: `d1/l1` and `d1/l2` are different actions taken, and a
+    // shared name would merge "nudged" with "restarted the attempt".
+    let names: Vec<&str> = [Level::Nudge, Level::ForceStrategy, Level::Restart]
+        .into_iter()
+        .map(Level::as_str)
+        .collect();
+    let mut unique = names.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(unique.len(), names.len(), "two levels share a name: {names:?}");
+}
+
+#[test]
 fn level_names_are_stable() {
     assert_eq!(Level::Nudge.as_str(), "l1");
     assert_eq!(Level::ForceStrategy.as_str(), "l2");

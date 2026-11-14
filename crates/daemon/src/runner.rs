@@ -3429,6 +3429,13 @@ mod tests {
     }
 
     /// Detector records in the journal, as `(detector, level)` pairs.
+    ///
+    /// Panics rather than skipping a record whose detector or level is missing. That is the
+    /// difference between a metric and a guess: the v0.1 criterion is "every firing is journaled
+    /// with its type **and** level", and the obvious `filter_map` — which this used to be — makes
+    /// a record without a level simply disappear. Every test written on top of it would still
+    /// pass, and the journal would be quietly missing the half that says what was done about the
+    /// loop. A strict helper turns the omission into a failure in the five tests that read it.
     fn reactions(dir: &tempfile::TempDir) -> Vec<(String, String)> {
         let reader = immortality_core::journal::JournalReader::open(
             dir.path().join("journal"),
@@ -3441,11 +3448,27 @@ mod tests {
             .records
             .into_iter()
             .filter(|record| record.fields.kind == Kind::DetectorFired)
-            .filter_map(|record| {
-                Some((
-                    record.event.payload.get("detector")?.as_str()?.to_string(),
-                    record.event.payload.get("level")?.as_str()?.to_string(),
-                ))
+            .map(|record| {
+                let detector = record
+                    .event
+                    .payload
+                    .get("detector")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "a detector_fired record has no `detector`: {}",
+                            record.event.payload
+                        )
+                    });
+                let level = record
+                    .event
+                    .payload
+                    .get("level")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_else(|| {
+                        panic!("a detector_fired record has no `level`: {}", record.event.payload)
+                    });
+                (detector.to_string(), level.to_string())
             })
             .collect()
     }
@@ -3701,6 +3724,168 @@ mod tests {
             reactions(&dir).contains(&("d5".to_string(), "l3".to_string())),
             "{:?}",
             reactions(&dir)
+        );
+    }
+
+    /// The distinct `(detector, level)` pairs one scripted run journaled.
+    ///
+    /// The registry is a parameter because the scenarios need different tools: D2 is about two
+    /// distinct calls sharing one output, so it needs a tool that ignores its arguments.
+    fn fired_by(
+        model: Arc<dyn Model>,
+        tools: Registry,
+        tune: impl FnOnce(&mut Runner),
+    ) -> Vec<(String, String)> {
+        let (dir, mut runner) = runner(model, tools);
+        tune(&mut runner);
+        let mut journal = journal(&dir);
+        runner.run(&subtask(), 1, "", &mut journal).expect("run");
+        let mut pairs = reactions(&dir);
+        pairs.sort_unstable();
+        pairs.dedup();
+        pairs
+    }
+
+    #[test]
+    fn every_detector_reaches_the_journal_with_a_level() {
+        // The v0.1 criterion is "every detector firing is journaled with its type **and** level".
+        // Each detector has a test of its own above, and that is what let this gap survive: every
+        // test asserted about the detector it was written for, and nothing asserted that the five
+        // together were all there. A detector that stopped being reachable — a threshold raised
+        // past the budget, a rung removed, a reaction replaced by a log line that only an operator
+        // reads — would leave all five tests green and the metric short of a row.
+        //
+        // So the set is checked as a set. Every scenario is the smallest one that reaches its
+        // detector, and the assertion is that all five names appear with a level the ladder
+        // actually has.
+        let repeated = "the parser is fine ".repeat(60);
+        let scenarios = [
+            (
+                "d1",
+                fired_by(
+                    Scripted::new(
+                        (0..20)
+                            .map(|index| Ok(echo_reply(&format!("call_{index}"), "same")))
+                            .collect(),
+                    ),
+                    registry(vec![Arc::new(Echo)]),
+                    |_| {},
+                ),
+            ),
+            (
+                "d2",
+                fired_by(
+                    Scripted::new(vec![
+                        Ok(Reply::call("call_1", "constant", r#"{"path":"a"}"#)),
+                        Ok(Reply::call("call_2", "constant", r#"{"path":"b"}"#)),
+                        Ok(finish()),
+                    ]),
+                    registry(vec![Arc::new(Constant)]),
+                    |_| {},
+                ),
+            ),
+            (
+                "d3",
+                fired_by(
+                    Scripted::new(
+                        (0..40)
+                            .map(|index| Ok(Reply::text(format!("thinking {index}"))))
+                            .collect(),
+                    ),
+                    registry(vec![Arc::new(Echo)]),
+                    |runner| {
+                        runner.detectors.progress_stall_warn = 4;
+                        runner.detectors.progress_stall_stop = 5;
+                        runner.limits.stall_steps = 100;
+                    },
+                ),
+            ),
+            (
+                "d4",
+                fired_by(
+                    Scripted::new(vec![
+                        Ok(Reply::text(repeated)),
+                        Ok(echo_reply("call_1", "a")),
+                        Ok(finish()),
+                    ]),
+                    registry(vec![Arc::new(Echo)]),
+                    |runner| {
+                        runner.detectors.reasoning_repeat_ngram = 4;
+                        runner.detectors.reasoning_repeat_count = 3;
+                    },
+                ),
+            ),
+            (
+                "d5",
+                fired_by(
+                    Scripted::new(
+                        (0..20)
+                            .map(|index| Ok(echo_reply(&format!("call_{index}"), &format!("p{index}"))))
+                            .collect(),
+                    ),
+                    registry(vec![Arc::new(Echo)]),
+                    |runner| runner.limits.max_steps = 2,
+                ),
+            ),
+        ];
+
+        let mut journaled: Vec<String> = Vec::new();
+        for (detector, pairs) in scenarios {
+            assert!(
+                pairs.iter().any(|(found, _)| found == detector),
+                "`{detector}` never reached the journal, so the metric would report it as never \
+                 having fired: {pairs:?}"
+            );
+            for (_, level) in pairs {
+                assert!(
+                    matches!(level.as_str(), "l1" | "l2" | "l3"),
+                    "a detector record carries `{level}`, which is not a rung of the ladder"
+                );
+                journaled.push(level);
+            }
+        }
+        // All three rungs are reached by the five scenarios, so "with a level" is not satisfied by
+        // a field that is always the same value.
+        for rung in ["l1", "l2", "l3"] {
+            assert!(
+                journaled.iter().any(|level| level == rung),
+                "no scenario ever journaled `{rung}`: {journaled:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_detector_firing_reaches_the_metric_through_the_journal() {
+        // The criterion is "every firing is journaled with its type and level", and the reason it
+        // matters is `immortality metrics`: that command is how a reader of `docs/metrics-v0.1.md`
+        // gets the number. But the writer and the reader are different modules — the runner builds
+        // the payload, `core::metrics` picks keys out of it — and every test above checks only one
+        // side. Rename `detector` to `kind` in the writer, or read `name` in the reader, and both
+        // suites stay green while the report shows nothing.
+        //
+        // Worse, the reader is deliberately forgiving: a missing key becomes `unknown`. So the
+        // breakage would not be an error — it would be a plausible-looking row that says a
+        // detector fired without saying which, or no row at all. This test drives a real run, feeds
+        // the journal it wrote to the production reader, and requires the loop to be counted.
+        let replies = (0..20)
+            .map(|index| Ok(echo_reply(&format!("call_{index}"), "same")))
+            .collect();
+        let (dir, runner) = runner(Scripted::new(replies), registry(vec![Arc::new(Echo)]));
+        let mut journal = journal(&dir);
+        runner.run(&subtask(), 1, "", &mut journal).expect("run");
+
+        let metrics =
+            immortality_core::metrics::compute("01ARZ3NDEKTSV4RRFFQ69G5FAJ", &journal_records(&dir));
+        assert!(
+            metrics.detectors.get("d1/l1").is_some_and(|count| *count > 0),
+            "the run journaled D1 but the metric does not count it; it saw {:?}. A reader of \
+             `metrics-v0.1.md` would report this run as having no detector noise at all",
+            metrics.detectors
+        );
+        assert!(
+            !metrics.detectors.contains_key("unknown/unknown"),
+            "a record reached the metric without a detector or without a level: {:?}",
+            metrics.detectors
         );
     }
 
