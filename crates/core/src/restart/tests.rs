@@ -275,18 +275,39 @@ fn a_retry_also_needs_budget_on_both_counts() {
 
 // ── what the journal says a subtask already spent ────────────────────────────────────────
 
+/// The task every [`scoped`] record belongs to.
+fn our_task() -> crate::domain::TaskId {
+    crate::domain::TaskId::from_suffix("01ARZ3NDEKTSV4RRFFQ69G5FAV")
+}
+
 /// One record with an explicit scope, for the budget reader.
 fn scoped(number: u32, kind: Kind, payload: serde_json::Value) -> JournalRecord {
     JournalRecord::new(
         crate::journal::RecordFields {
             seq: 0,
             at: at(),
-            task: crate::domain::TaskId::from_suffix("01ARZ3NDEKTSV4RRFFQ69G5FAV"),
+            task: our_task(),
             subtask: Some(SubtaskId::from_suffix("01ARZ3NDEKTSV4RRFFQ69G5FAA")),
             attempt: Some(number),
             kind,
         },
         crate::journal::JournalEvent::with_payload(payload),
+        None,
+    )
+}
+
+/// The same record, but written by another task in the same shared journal.
+fn scoped_to(task: &crate::domain::TaskId, number: u32, kind: Kind) -> JournalRecord {
+    JournalRecord::new(
+        crate::journal::RecordFields {
+            seq: 0,
+            at: at(),
+            task: task.clone(),
+            subtask: Some(SubtaskId::from_suffix("01ARZ3NDEKTSV4RRFFQ69G5FAA")),
+            attempt: Some(number),
+            kind,
+        },
+        crate::journal::JournalEvent::with_payload(serde_json::json!({})),
         None,
     )
 }
@@ -302,7 +323,7 @@ fn here() -> SubtaskId {
 
 #[test]
 fn a_subtask_the_journal_never_mentioned_starts_at_one_with_the_whole_budget() {
-    assert_eq!(Spent::read(&[], &here()), Spent::EMPTY);
+    assert_eq!(Spent::read(&[], &our_task(), &here()), Spent::EMPTY);
     assert_eq!(Spent::EMPTY.next, 1);
 }
 
@@ -311,7 +332,7 @@ fn a_failed_attempt_is_charged_and_the_next_number_follows_it() {
     // The budget is about attempts, so a failed one has to be visible; and the number has to move
     // or the next attempt reuses a key the journal already holds.
     let records = vec![scoped(1, Kind::AttemptFailed, serde_json::json!({}))];
-    let spent = Spent::read(&records, &here());
+    let spent = Spent::read(&records, &our_task(), &here());
     assert_eq!(spent.attempts, 1);
     assert_eq!(spent.restarts, 0);
     assert_eq!(spent.next, 2);
@@ -329,7 +350,7 @@ fn a_ladder_restart_spends_both_budgets() {
         Kind::AttemptRestarted,
         serde_json::json!({ "cause": "stalled" }),
     )];
-    let spent = Spent::read(&records, &here());
+    let spent = Spent::read(&records, &our_task(), &here());
     assert_eq!(spent.attempts, 1);
     assert_eq!(spent.restarts, 1);
     assert_eq!(spent.left(room(3, 2)), room(2, 1));
@@ -352,7 +373,7 @@ fn an_abandoned_attempt_spends_nothing_but_still_takes_its_number() {
             serde_json::json!({ "cause": "recovery" }),
         ),
     ];
-    let spent = Spent::read(&records, &here());
+    let spent = Spent::read(&records, &our_task(), &here());
     assert_eq!(spent.attempts, 0, "an abandoned attempt is free");
     assert_eq!(spent.restarts, 0, "recovery is not an L3 restart");
     assert_eq!(spent.next, 3, "but the number still moved past both");
@@ -366,7 +387,7 @@ fn a_green_verdict_is_charged_but_a_failed_one_is_not() {
         Kind::GateResult,
         serde_json::json!({ "gate": "verdict", "passed": true }),
     )];
-    assert_eq!(Spent::read(&passed, &here()).attempts, 1);
+    assert_eq!(Spent::read(&passed, &our_task(), &here()).attempts, 1);
     // A red verdict does not end an attempt; `attempt_failed` does, and that is charged. Counting
     // the verdict too would spend two attempts for one.
     let failed = vec![scoped(
@@ -374,7 +395,7 @@ fn a_green_verdict_is_charged_but_a_failed_one_is_not() {
         Kind::GateResult,
         serde_json::json!({ "gate": "verdict", "passed": false }),
     )];
-    assert_eq!(Spent::read(&failed, &here()).attempts, 0);
+    assert_eq!(Spent::read(&failed, &our_task(), &here()).attempts, 0);
 }
 
 #[test]
@@ -383,7 +404,46 @@ fn another_subtasks_records_do_not_count() {
     // subtask with another's attempts.
     let records = vec![scoped(1, Kind::AttemptFailed, serde_json::json!({}))];
     let elsewhere = SubtaskId::from_suffix("01ARZ3NDEKTSV4RRFFQ69G5FAB");
-    assert_eq!(Spent::read(&records, &elsewhere), Spent::EMPTY);
+    assert_eq!(Spent::read(&records, &our_task(), &elsewhere), Spent::EMPTY);
+}
+
+#[test]
+fn another_tasks_records_do_not_count() {
+    // The measured regression: `.agent/JOURNAL.jsonl` is shared by every task of a repository,
+    // and a plan reuses subtask ids, so filtering by subtask alone carried one task's attempts
+    // into the next. The second `black_jack` run began at attempt 2 or 4 on all six subtasks.
+    let other = crate::domain::TaskId::from_suffix("01ARZ3NDEKTSV4RRFFQ69G5FAC");
+    let records = vec![
+        scoped_to(&other, 1, Kind::AttemptFailed),
+        scoped_to(&other, 2, Kind::AttemptFailed),
+        scoped_to(&other, 3, Kind::AttemptRestarted),
+    ];
+    let spent = Spent::read(&records, &our_task(), &here());
+    assert_eq!(
+        spent,
+        Spent::EMPTY,
+        "another task's attempts must not spend this task's budget, and must not move its numbers"
+    );
+    assert_eq!(
+        spent.left(room(3, 2)),
+        room(3, 2),
+        "the whole budget is still there"
+    );
+}
+
+#[test]
+fn a_second_task_numbering_starts_at_one_even_when_the_first_spent_everything() {
+    // The same journal holds both tasks: the first one's records must be invisible to the second,
+    // while the second's own records keep counting normally.
+    let other = crate::domain::TaskId::from_suffix("01ARZ3NDEKTSV4RRFFQ69G5FAC");
+    let records = vec![
+        scoped_to(&other, 1, Kind::AttemptFailed),
+        scoped_to(&other, 2, Kind::AttemptFailed),
+        scoped(1, Kind::AttemptFailed, serde_json::json!({})),
+    ];
+    let spent = Spent::read(&records, &our_task(), &here());
+    assert_eq!(spent.attempts, 1, "only our own attempt is charged");
+    assert_eq!(spent.next, 2, "and the next number follows our own, not theirs");
 }
 
 #[test]
@@ -393,7 +453,7 @@ fn a_journal_that_recorded_more_than_the_config_allows_stops_the_subtask() {
     let records: Vec<JournalRecord> = (1..=5)
         .map(|number| scoped(number, Kind::AttemptFailed, serde_json::json!({})))
         .collect();
-    let spent = Spent::read(&records, &here());
+    let spent = Spent::read(&records, &our_task(), &here());
     assert_eq!(
         spent.left(room(2, 1)),
         room(0, 1),
