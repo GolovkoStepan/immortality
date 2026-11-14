@@ -959,8 +959,13 @@ fn killed(record: &ProcessRecord) -> ToolResult {
 }
 
 fn signal_group(pid: u32, signal: &str) {
+    // `--` before the operand is not decoration: procps `kill` (Debian, and so the Linux CI
+    // image) reads a leading `-` as a signal specification unless it follows the separator, so
+    // `kill -TERM -1234` signals nothing and reports success. BSD `kill` on macOS accepts both
+    // spellings. Without this, `kill_process` left the whole group running on Linux while
+    // telling the model it had stopped it.
     let _ = std::process::Command::new("kill")
-        .args([signal, &format!("-{pid}")])
+        .args([signal, "--", &format!("-{pid}")])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())

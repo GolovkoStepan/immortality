@@ -38,3 +38,18 @@ A test that shells out to a macOS-only binary. `plutil` (plist validation) and `
 both exist only on macOS; on Linux the test fails on `NotFound`, which says nothing about
 the behaviour under test. Such tests belong under `#![cfg(target_os = "macos")]` — the
 macOS job runs on every push, so the coverage stays where the toolchain does.
+
+The second class is subtler and was found this way: a utility with the same name but
+different argument parsing. `kill` is BSD `kill` on macOS and procps `kill` on Debian, and
+they disagree about a leading `-` in the operand:
+
+```sh
+kill -0 -1234      # procps reads `-1234` as a signal spec, answers success, signals nothing
+kill -0 -- -1234   # both read it as process group 1234
+```
+
+The code used the first form to probe and to kill process groups, so on Linux `group_alive`
+answered "still running" for every finished command: each `shell` call waited out the
+5-second grace period and told the model it had killed a background process that never
+existed. On macOS the same tests were green. Any call that takes a negative argument needs
+`--`, and the separator is portable — both implementations accept it.

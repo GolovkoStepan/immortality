@@ -753,7 +753,7 @@ fn terminate_group(pid: u32) {
 
 fn signal_group(pid: u32, signal: &str) {
     let _ = Command::new("kill")
-        .args([signal, &format!("-{pid}")])
+        .args([signal, "--", &format!("-{pid}")])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -764,9 +764,18 @@ fn signal_group(pid: u32, signal: &str) {
 ///
 /// `kill -0` asks about existence without delivering anything, so this cannot itself kill a group
 /// that has just been recycled for someone else's use.
+///
+/// `--` is load-bearing, and this is the same separator [`signal_group`] needs: procps `kill`
+/// (Debian, and so the Linux CI image) reads a leading `-` in the operand as a *signal
+/// specification* unless it follows `--`. `kill -0 -1234` therefore answers success for a group
+/// that does not exist and delivers nothing to one that does. The effect was not a rare race but
+/// a constant: `group_alive` was always true, so every finished command looked as if it had left
+/// a child behind, the step waited out [`KILL_GRACE`] and the model was told a process had been
+/// killed that never was. BSD `kill` on macOS accepts both spellings, so the separator is the
+/// portable one.
 fn group_alive(pid: u32) -> bool {
     Command::new("kill")
-        .args(["-0", &format!("-{pid}")])
+        .args(["-0", "--", &format!("-{pid}")])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -1069,16 +1078,30 @@ mod tests {
     #[test]
     fn env_does_not_leak_into_the_next_call() {
         // Documented limitation, pinned so it cannot change silently: `sh -c` cannot export.
+        //
+        // The marker is a word rather than the digit `1`, because the observation carries a
+        // summary of its own — `[exited 0 in 0.1 s, 0 line(s) of stdout, 0 of stderr]` — whose
+        // timing is made of digits. Asserting on `'1'` made this test fail whenever the command
+        // happened to finish in a tenth of a second, which is on a fast machine nearly always.
         let dir = fixture();
         let shell = Shell::standalone(None);
         run_shell(
             dir.path(),
             &shell,
-            json!({"command": "true", "env": {"LEAK": "1"}}),
+            json!({"command": "true", "env": {"LEAK": "leaked-value"}}),
         )
         .unwrap();
         let result = run_shell(dir.path(), &shell, json!({"command": "printf '%s' \"$LEAK\""})).unwrap();
-        assert!(!result.observation.contains('1'), "{}", result.observation);
+        assert!(
+            !result.observation.contains("leaked-value"),
+            "{}",
+            result.observation
+        );
+        assert_eq!(
+            result.data["stdout_bytes"], 0,
+            "the second call printed something, so it saw an environment it should not have: {}",
+            result.observation
+        );
     }
 
     #[test]
@@ -1262,6 +1285,45 @@ mod tests {
         assert!(captured.omitted > 0, "{}", captured.omitted);
         assert!(captured.shown <= SHOWN_LINES, "{}", captured.shown);
         assert_eq!(captured.bytes, std::fs::metadata(&path).unwrap().len());
+    }
+
+    #[test]
+    fn a_finished_command_does_not_look_as_if_it_left_a_child_behind() {
+        // The bug this pins: procps `kill` (Debian, and so the Linux CI image) reads a leading
+        // `-` in the operand as a signal name unless it follows `--`, so `kill -0 -<pid>` answered
+        // success for a group that no longer existed. `group_alive` then said "still running" for
+        // every finished command, and each step paid `KILL_GRACE` — five seconds of silence and a
+        // false "a background process has been killed" in the observation.
+        //
+        // The duration assertion is what makes this a test of the separator rather than of
+        // `group_alive`'s return value alone: without `--` the code is not merely wrong about
+        // liveness, it is slow in a way the model experiences as a stalled tool.
+        let dir = fixture();
+        let shell = Shell::default();
+        let started = Instant::now();
+        let result = run_shell(dir.path(), &shell, json!({"command": "printf hi"})).unwrap();
+        let elapsed = started.elapsed();
+        assert!(
+            !result.observation.contains("left a background process running"),
+            "a plain command reported a background child it never spawned: {}",
+            result.observation
+        );
+        assert!(
+            elapsed < KILL_GRACE,
+            "a finished command took {elapsed:?}, which is the group-liveness grace period"
+        );
+    }
+
+    #[test]
+    fn a_terminated_group_is_reported_dead() {
+        // The other half of the same separator bug, asserted directly on the helper: a group that
+        // cannot exist must not read as alive, on any `kill`.
+        let missing = 4_000_000;
+        assert!(
+            !group_alive(missing),
+            "a group that cannot exist is reported alive; `kill` is probably parsing `-{missing}` \
+             as a signal specification"
+        );
     }
 
     #[test]
