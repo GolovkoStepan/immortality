@@ -50,6 +50,14 @@ src/parser.rs»), инструменты с эффектом в аргумент
 `Mutate`, а `echo x > /dev/null; echo y > /etc/passwd` по-прежнему отказ — приёмник пропускается,
 остальные пути судятся как обычно (D-102).
 
+Второе исключение — пять документов состояния под `.agent/` (`PLAN.md`, `ACCEPTANCE.md`,
+`TASKS.json`, `DECISIONS.md`, `NOTES.md`). Их пишет только `update_state`, и он спрашивает
+`check_state_write`, который намеренно идёт мимо `check_writes`: иначе правило запретило бы сам
+`update_state`. Обычный `write_file`/`edit_file` на `.agent/NOTES.md` — отказ с указанием на
+`update_state` и `read_state`. Причина в D-103: `update_state` пишет **проектную** копию, а
+`write_file` разрешается внутри worktree, и один документ получил бы две версии. Запрет не
+распространяется на корневой `NOTES.md` и на имена вне `.agent/` — там это обычные файлы (D-107).
+
 `Denied` — это observation модели, а не падение: она получает «действие запрещено
 политикой, причина X, разрешённые альтернативы Y».
 
@@ -86,8 +94,8 @@ src/parser.rs»), инструменты с эффектом в аргумент
 
 | Инструмент | Параметры | Идемпотентность |
 | --- | --- | --- |
-| `write_file` | `path`, `content` | ByContent |
-| `edit_file` | `path`, `old`, `new`, `replace_all` | ByContent |
+| `write_file` | `path`, `content` | ByContent; `.agent/<пять документов>` — отказ, их пишет `update_state` (D-107) |
+| `edit_file` | `path`, `old`, `new`, `replace_all` | ByContent; те же имена — подсказка про `update_state`, а не «создай `write_file`» (D-107) |
 | `git` с `subcommand` = `add`/`commit`/`branch`/`worktree`/`stash` | `args`, `message`, `path`, `reason` | commit → Unknown (probe по `Immortality-Call` trailer) |
 | `update_state` | `file`, `content`, `replace` | ByContent; `NOTES.md`/`DECISIONS.md` создаются, план-документы — нет; урезать вдвое без `replace` нельзя (D-065, D-103) |
 | `shell` (mutating) | `command`, `timeout_secs`, `cwd` | Unknown |

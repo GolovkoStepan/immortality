@@ -537,6 +537,34 @@ impl PolicyGate {
                 );
             };
 
+            // The five state documents are `update_state`'s to write, and that tool asks
+            // `check_state_write` — which deliberately does not come through here. A plain
+            // `write_file` naming `.agent/NOTES.md` would otherwise write the *worktree's* stale
+            // copy while `update_state` writes the project's, so the same document would have two
+            // versions and the model would be reading one while the runner executed the other
+            // (D-103). Measured on two consecutive `black_jack` runs: an `edit_file` on `NOTES.md`
+            // was refused as missing, the model created `NOTES.md` in the repository root instead,
+            // and that file went into its commit.
+            //
+            // Only the `.agent/` names are refused. A repository may legitimately have its own
+            // root `NOTES.md`, and blocking that would be the gate guessing about a file it does
+            // not own.
+            if let Some(name) = relative.strip_prefix(crate::state::AGENT_DIR)
+                && let Some(name) = name.strip_prefix('/')
+                && crate::state::StateFile::is_state_file(name)
+            {
+                return Verdict::Denied(
+                    Denial::new(
+                        "the five state documents belong to `update_state`, not to a file write",
+                        &used.path,
+                    )
+                    .with(format!(
+                        "write the document with `update_state` and `file: \"{name}\"`"
+                    ))
+                    .with("read it back with `read_state`, so both see the project's copy"),
+                );
+            }
+
             if let Some(verdict) = self.check_one_write(&relative, used) {
                 return verdict;
             }
@@ -969,15 +997,14 @@ mod tests {
     }
 
     #[test]
-    fn the_agents_own_state_files_stay_writable() {
-        // The deny list above must not take `update_state` with it: those files are the agent's
-        // working memory, not the audit trail.
+    fn the_agents_own_state_files_stay_writable_through_update_state() {
+        // The deny list above must not take the state tools with it: those files are the agent's
+        // working memory, not the audit trail. Since D-103 they are written by `update_state` into
+        // the *project's* `.agent/`, so it is `check_state_write` that has to stay allowed — a
+        // generic write is refused because it would write the worktree's stale copy instead.
         for path in [".agent/TASKS.json", ".agent/DECISIONS.md", ".agent/NOTES.md"] {
-            assert_eq!(
-                gate().check(Effect::Mutate, &[PathUse::write(path)]),
-                Verdict::Allowed,
-                "{path}"
-            );
+            let name = path.trim_start_matches(".agent/");
+            assert_eq!(gate().check_state_write(name), Verdict::Allowed, "{name}");
         }
     }
 
@@ -1400,6 +1427,59 @@ mod tests {
                 .is_denied()
         );
         assert!(gate.check(Effect::Mutate, &[PathUse::write(".env")]).is_denied());
+    }
+
+    // ── the five state documents ────────────────────────────────────────────────
+
+    #[test]
+    fn a_plain_file_write_may_not_edit_a_state_document() {
+        // `update_state` writes the *project's* `.agent/`; `write_file` resolves inside the
+        // worktree. Letting both through gives one document two versions — the split brain D-103
+        // removed — so the gate sends the model to the tool that owns the name.
+        let gate = gate();
+        for name in [
+            ".agent/NOTES.md",
+            ".agent/PLAN.md",
+            ".agent/DECISIONS.md",
+            ".agent/ACCEPTANCE.md",
+            ".agent/TASKS.json",
+        ] {
+            let verdict = gate.check(Effect::Mutate, &[PathUse::write(name)]);
+            assert!(verdict.is_denied(), "{name}: {verdict:?}");
+            let observation = verdict.observation().expect("an observation");
+            assert!(
+                observation.contains("update_state"),
+                "{name} must name the tool: {observation}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_repositorys_own_notes_file_is_still_writable() {
+        // The state documents are a closed set of five names *under `.agent/`*. A project that
+        // keeps its own `NOTES.md` — and plenty do — must not be told to use `update_state`.
+        let gate = gate();
+        assert_eq!(
+            gate.check(Effect::Mutate, &[PathUse::write("NOTES.md")]),
+            Verdict::Allowed
+        );
+        assert_eq!(
+            gate.check(Effect::Mutate, &[PathUse::write("docs/NOTES.md")]),
+            Verdict::Allowed
+        );
+        assert_eq!(
+            gate.check(Effect::Mutate, &[PathUse::write(".agent/scratch.md")]),
+            Verdict::Allowed
+        );
+    }
+
+    #[test]
+    fn update_state_can_still_write_the_documents_it_owns() {
+        // The refusal lives in `check_writes`, not in `check_one_write`, precisely so this does
+        // not become a rule that locks the state tools out of their own files.
+        let gate = gate();
+        assert_eq!(gate.check_state_write("NOTES.md"), Verdict::Allowed);
+        assert_eq!(gate.check_state_write("PLAN.md"), Verdict::Allowed);
     }
 
     // ── yolo ────────────────────────────────────────────────────────────────────

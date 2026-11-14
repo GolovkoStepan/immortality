@@ -519,7 +519,36 @@ fn temp_path(path: &Path) -> PathBuf {
     }
 }
 
+/// Why `edit_file` found nothing, in a form that points at the right tool when the name is one of
+/// the five state documents.
+///
+/// The plain "use `write_file`" advice was measured causing damage. The model edited the bare
+/// `NOTES.md`, which does not exist because the document lives in the project's `.agent/`, and
+/// following the hint created a *second* `NOTES.md` in the repository root that went into the
+/// commit — on two consecutive runs. A state document's absence is not a missing file to create:
+/// it is a document nobody has written yet, and `update_state` is what writes it.
+///
+/// The refusal is a hint, not a ban. A repository may have its own root `NOTES.md`; if one exists
+/// this function is never called, because the edit finds it.
 fn missing_file(raw: &str) -> String {
+    let bare = raw.trim_start_matches("./");
+    let bare = bare
+        .strip_prefix(crate::state::AGENT_DIR)
+        .and_then(|rest| rest.strip_prefix('/'))
+        .unwrap_or(bare);
+    if crate::state::StateFile::is_state_file(bare) {
+        return json!({
+            "error": "file_missing",
+            "path": raw,
+            "hint": format!(
+                "`{bare}` is a state document and lives in the project's `.agent/`, not in the \
+                 worktree. Write it with `update_state` and `file: \"{bare}\"` — that creates \
+                 `NOTES.md` and `DECISIONS.md` and refuses to create a plan document. Do not \
+                 create a `{bare}` in the repository root."
+            ),
+        })
+        .to_string();
+    }
     json!({
         "error": "file_missing",
         "path": raw,
@@ -949,6 +978,50 @@ mod tests {
         let error = edit(dir.path(), json!({"path": "nope.rs", "old": "a", "new": "b"})).unwrap_err();
         let text = error.to_string();
         assert!(text.contains("file_missing"), "{text}");
+        assert!(text.contains("write_file"), "{text}");
+    }
+
+    #[test]
+    fn editing_a_missing_notes_points_at_update_state_not_at_the_repository_root() {
+        // The measured damage: the model edited the bare `NOTES.md`, got "use `write_file` to
+        // create it", created `NOTES.md` in the worktree root instead, and the file went into its
+        // commit on two consecutive runs. A state document's absence is not a missing file.
+        let dir = fixture(&[]);
+        for name in ["NOTES.md", "./NOTES.md"] {
+            let error = edit(dir.path(), json!({"path": name, "old": "a", "new": "b"})).unwrap_err();
+            let text = error.to_string();
+            assert!(text.contains("file_missing"), "{name}: {text}");
+            assert!(
+                text.contains("update_state"),
+                "{name} must name the tool that owns the document: {text}"
+            );
+            assert!(
+                !text.contains("Use `write_file` to create it"),
+                "{name} must not invite a second copy in the repository: {text}"
+            );
+        }
+        // The `.agent/`-prefixed form never reaches the hint: the gate refuses it first, with the
+        // same advice. Both routes have to name `update_state`, or the model picks the wrong one.
+        let error = edit(
+            dir.path(),
+            json!({"path": ".agent/NOTES.md", "old": "a", "new": "b"}),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("update_state"), "{error}");
+    }
+
+    #[test]
+    fn editing_a_missing_file_that_only_looks_like_state_keeps_the_plain_hint() {
+        // `SUB/NOTES.md` is a document someone may legitimately keep; the set of state documents
+        // is closed and a path is not a member.
+        let dir = fixture(&[]);
+        let error = edit(
+            dir.path(),
+            json!({"path": "docs/NOTES.md", "old": "a", "new": "b"}),
+        )
+        .unwrap_err();
+        let text = error.to_string();
+        assert!(!text.contains("update_state"), "{text}");
         assert!(text.contains("write_file"), "{text}");
     }
 
