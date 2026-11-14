@@ -549,7 +549,16 @@ impl PolicyGate {
             // Only the `.agent/` names are refused. A repository may legitimately have its own
             // root `NOTES.md`, and blocking that would be the gate guessing about a file it does
             // not own.
-            if let Some(name) = relative.strip_prefix(crate::state::AGENT_DIR)
+            //
+            // `used.write` is part of the test. `check_writes` is also the path a *mutating*
+            // command's read paths take — `Cargo.toml` is judged as a mutate because the command
+            // may write somewhere — so a guard that ignored the flag refused
+            // `cat .agent/TASKS.json 2>/dev/null`, a plain read, three times in the third live
+            // run. The sink redirect is what makes the command `Mutate`, and the observation told
+            // the model to "write the document with `update_state`", which is not what it was
+            // doing.
+            if used.write
+                && let Some(name) = relative.strip_prefix(crate::state::AGENT_DIR)
                 && let Some(name) = name.strip_prefix('/')
                 && crate::state::StateFile::is_state_file(name)
             {
@@ -1452,6 +1461,34 @@ mod tests {
                 "{name} must name the tool: {observation}"
             );
         }
+    }
+
+    #[test]
+    fn reading_a_state_document_through_a_mutating_command_is_not_a_write() {
+        // The measured regression from the third live run: `cat .agent/TASKS.json 2>/dev/null` was
+        // refused three times with "write the document with `update_state`". The sink redirect
+        // makes the command `Mutate`, so its paths reach `check_writes` — but the path itself is a
+        // read, and `used.write` is what says so. Without this the D-107 guard answered a question
+        // nobody asked, and the model lost three steps to it.
+        let gate = gate();
+        assert_eq!(
+            gate.check_command("cat .agent/TASKS.json 2>/dev/null"),
+            Verdict::Allowed
+        );
+        assert_eq!(
+            gate.check_command("grep -n subtasks .agent/TASKS.json"),
+            Verdict::Allowed
+        );
+        assert!(
+            gate.check_command("cat .agent/TASKS.json > copy.json")
+                .is_allowed(),
+            "the read of the document is fine; the redirect writes somewhere else"
+        );
+        assert!(
+            gate.check_command("cat .agent/TASKS.json > .agent/TASKS.json")
+                .is_denied(),
+            "the redirect target is a write and stays refused"
+        );
     }
 
     #[test]
