@@ -17,6 +17,15 @@
 //! escalation open, so the reader of `metrics-v0.1.md` can see the difference rather than trust a
 //! label.
 //!
+//! # Why "in a row" is computed separately
+//!
+//! The bar is not "three closures" but "three **consecutive** closures". A total cannot tell a run
+//! that closed three subtasks before its first failure from one that closed one, failed, closed
+//! another, failed, and closed a third: both report `closed_green == 3`, and only the first is the
+//! claim. `longest_green_streak` breaks on every non-green settlement and on every closure that
+//! happened while an escalation was open, and it walks the settlements in journal order, because
+//! that is the order the run produced them in.
+//!
 //! # What this module deliberately does not compute
 //!
 //! Wall-clock time and token cost. Both are in the journal, but a run of this tool is measured in
@@ -52,6 +61,9 @@ pub struct TaskMetrics {
     pub closed_green: usize,
     /// How many of those closed while an escalation was open.
     pub closed_with_escalation: usize,
+    /// The longest run of consecutive settled subtasks that were closed green with no escalation
+    /// open, in journal order.
+    pub longest_green_streak: usize,
     /// Every detector firing, by `` `detector`/`level` ``.
     pub detectors: BTreeMap<String, usize>,
     /// Escalations opened and not yet resolved at the end of the journal.
@@ -72,10 +84,14 @@ pub struct TaskMetrics {
 /// repository, and counting another task's subtasks would inflate every number here.
 #[must_use]
 pub fn compute(task: &str, records: &[JournalRecord]) -> TaskMetrics {
-    let mut subtasks: Vec<SubtaskOutcome> = Vec::new();
     // State per subtask, so a later record for the same id replaces the earlier one rather than
     // being counted twice: `running` followed by `done` is one settled subtask, not two.
-    let mut settled: BTreeMap<String, (String, bool)> = BTreeMap::new();
+    //
+    // The position is stored with the state because the order of settlements is not the order of
+    // ids. "Three subtasks in a row" is a claim about time, and a `BTreeMap` iterated by key would
+    // answer it in an order that a run never produced — `sub_9` sorting after `sub_10` is enough
+    // to turn a broken streak into a whole one.
+    let mut settled: BTreeMap<String, (String, bool, usize)> = BTreeMap::new();
     let mut detectors: BTreeMap<String, usize> = BTreeMap::new();
     // Open escalations by id, not by counter: a journal that has a resolution without its opening
     // (the tail of a rotated segment can start mid-question) would leave a counter negative and
@@ -85,7 +101,7 @@ pub fn compute(task: &str, records: &[JournalRecord]) -> TaskMetrics {
     let mut total_escalations: usize = 0;
     let mut restarts: usize = 0;
 
-    for record in records {
+    for (position, record) in records.iter().enumerate() {
         match record.fields.kind {
             Kind::SubtaskState => {
                 let Some(id) = record
@@ -107,7 +123,10 @@ pub fn compute(task: &str, records: &[JournalRecord]) -> TaskMetrics {
                 };
                 if matches!(state, "done" | "blocked" | "skipped") {
                     let with_escalation = !open_escalations.is_empty();
-                    settled.insert(id, (state.to_string(), with_escalation));
+                    // A later settlement moves the subtask to its latest position: the last word
+                    // on a subtask is where it settled, and a repair that turned `blocked` into
+                    // `done` belongs at the end of the run, not where the first attempt died.
+                    settled.insert(id, (state.to_string(), with_escalation, position));
                 }
             }
             Kind::DetectorFired => {
@@ -141,24 +160,35 @@ pub fn compute(task: &str, records: &[JournalRecord]) -> TaskMetrics {
         }
     }
 
-    for (subtask, (state, with_escalation)) in &settled {
-        subtasks.push(SubtaskOutcome {
-            subtask: subtask.clone(),
-            state: state.clone(),
-            closed_with_escalation: *with_escalation,
-        });
-    }
+    // Journal order, not id order: the reader of "in a row" is asking about the run, and the run
+    // happened in time.
+    let mut ordered: Vec<(String, String, bool, usize)> = settled
+        .into_iter()
+        .map(|(id, (state, with_escalation, position))| (id, state, with_escalation, position))
+        .collect();
+    ordered.sort_by_key(|(_, _, _, position)| *position);
+    let subtasks: Vec<SubtaskOutcome> = ordered
+        .into_iter()
+        .map(|(subtask, state, closed_with_escalation, _)| SubtaskOutcome {
+            subtask,
+            state,
+            closed_with_escalation,
+        })
+        .collect();
+
     let closed_green = subtasks.iter().filter(|one| one.state == "done").count();
     let closed_with_escalation = subtasks
         .iter()
         .filter(|one| one.state == "done" && one.closed_with_escalation)
         .count();
+    let longest_green_streak = longest_green_streak(&subtasks);
 
     TaskMetrics {
         task: task.to_string(),
         subtasks,
         closed_green,
         closed_with_escalation,
+        longest_green_streak,
         detectors,
         escalations_pending: open_escalations.len(),
         escalations_total: total_escalations,
@@ -166,6 +196,36 @@ pub fn compute(task: &str, records: &[JournalRecord]) -> TaskMetrics {
         records: records.len(),
         corrupt: false,
     }
+}
+
+/// The longest run of subtasks that were each closed green with no escalation open.
+///
+/// # Why this is not `closed_green`
+///
+/// The milestone's bar is "three subtasks **in a row**". A total counts three green closures
+/// separated by three blocked ones as progress, and it is: but it is not the claim, and a number
+/// that cannot distinguish the two would let a failing run be reported as a passing one. Breaking
+/// the streak on every non-green settlement — including `skipped`, which is not work done — is
+/// what makes the number mean what the document says.
+///
+/// # Why `closed_with_escalation` breaks it
+///
+/// The bar is "without human intervention". A subtask that closed while a question was open is
+/// work the run did while a human may have been needed; counting it would make the streak weaker
+/// than the claim it is used to support. The escalation's *presence* is enough, whether or not it
+/// was answered later: the settlement is what the streak is about.
+fn longest_green_streak(subtasks: &[SubtaskOutcome]) -> usize {
+    let mut longest = 0;
+    let mut current = 0;
+    for one in subtasks {
+        if one.state == "done" && !one.closed_with_escalation {
+            current += 1;
+            longest = longest.max(current);
+        } else {
+            current = 0;
+        }
+    }
+    longest
 }
 
 #[cfg(test)]
@@ -307,6 +367,94 @@ mod tests {
         assert_eq!(metrics.escalations_pending, 1);
         assert_eq!(metrics.escalations_total, 1);
         assert_eq!(metrics.closed_with_escalation, 1);
+    }
+
+    #[test]
+    fn a_streak_counts_consecutive_green_closures_not_the_total() {
+        // The milestone's bar is "three in a row". Three closures separated by a blocked subtask
+        // are progress, but they are not three in a row, and a total cannot tell the difference.
+        let records = vec![
+            subtask_state("sub_A", "done"),
+            subtask_state("sub_B", "blocked"),
+            subtask_state("sub_C", "done"),
+            subtask_state("sub_D", "done"),
+        ];
+        let metrics = compute("tsk_01ARZ3NDEKTSV4RRFFQ69G5FAV", &records);
+        assert_eq!(metrics.closed_green, 3, "{metrics:?}");
+        assert_eq!(metrics.longest_green_streak, 2, "{metrics:?}");
+    }
+
+    #[test]
+    fn a_streak_is_taken_from_journal_order_not_from_id_order() {
+        // Ids sort as text, and a run does not settle subtasks in id order. Here the greens are
+        // `sub_9`, `sub_10` and `sub_11` — which sort as `sub_10`, `sub_11`, `sub_9` — so an
+        // implementation that walked a `BTreeMap` by key would split the run and report 2.
+        let records = vec![
+            subtask_state("sub_9", "done"),
+            subtask_state("sub_10", "done"),
+            subtask_state("sub_11", "done"),
+        ];
+        let metrics = compute("tsk_01ARZ3NDEKTSV4RRFFQ69G5FAV", &records);
+        assert_eq!(metrics.longest_green_streak, 3, "{metrics:?}");
+        let order: Vec<&str> = metrics.subtasks.iter().map(|one| one.subtask.as_str()).collect();
+        assert_eq!(order, vec!["sub_9", "sub_10", "sub_11"], "{metrics:?}");
+    }
+
+    #[test]
+    fn a_closure_with_an_escalation_open_breaks_the_streak() {
+        // "In a row, unaided" is the claim. A closure that happened while a question was open is
+        // not evidence of autonomy, so it ends the run of green rather than extending it — even
+        // though it is still counted in `closed_green`.
+        let records = vec![
+            subtask_state("sub_A", "done"),
+            record(
+                Kind::EscalationOpened,
+                serde_json::json!({ "id": "esc_1", "key": "git:push", "kind": "irreversible" }),
+            ),
+            subtask_state("sub_B", "done"),
+            record(Kind::EscalationResolved, serde_json::json!({ "id": "esc_1" })),
+            subtask_state("sub_C", "done"),
+        ];
+        let metrics = compute("tsk_01ARZ3NDEKTSV4RRFFQ69G5FAV", &records);
+        assert_eq!(metrics.closed_green, 3, "{metrics:?}");
+        assert_eq!(metrics.closed_with_escalation, 1, "{metrics:?}");
+        assert_eq!(metrics.longest_green_streak, 1, "{metrics:?}");
+    }
+
+    #[test]
+    fn a_skipped_subtask_breaks_the_streak_because_no_work_was_done() {
+        // `skipped` settles a subtask without a green gate. Counting it as part of a run would
+        // let a task that skipped the work be reported as having done three in a row.
+        let records = vec![
+            subtask_state("sub_A", "done"),
+            subtask_state("sub_B", "skipped"),
+            subtask_state("sub_C", "done"),
+        ];
+        let metrics = compute("tsk_01ARZ3NDEKTSV4RRFFQ69G5FAV", &records);
+        assert_eq!(metrics.longest_green_streak, 1, "{metrics:?}");
+    }
+
+    #[test]
+    fn a_streak_uses_the_last_settlement_of_each_subtask() {
+        // A repair can turn `blocked` into `done` later in the run. The subtask settles where it
+        // ends up, so the repair joins the run instead of leaving its earlier failure in the
+        // middle of it.
+        let records = vec![
+            subtask_state("sub_A", "done"),
+            subtask_state("sub_B", "blocked"),
+            subtask_state("sub_C", "done"),
+            subtask_state("sub_B", "done"),
+        ];
+        let metrics = compute("tsk_01ARZ3NDEKTSV4RRFFQ69G5FAV", &records);
+        assert_eq!(metrics.closed_green, 3, "{metrics:?}");
+        assert_eq!(metrics.longest_green_streak, 3, "{metrics:?}");
+    }
+
+    #[test]
+    fn a_run_that_closed_nothing_has_no_streak() {
+        let records = vec![subtask_state("sub_A", "running")];
+        let metrics = compute("tsk_01ARZ3NDEKTSV4RRFFQ69G5FAV", &records);
+        assert_eq!(metrics.longest_green_streak, 0, "{metrics:?}");
     }
 
     #[test]

@@ -192,10 +192,15 @@ fn admit_into(name: &str, target: &Path) {
 fn every_dogfood_task_starts_with_a_failing_gate() {
     // The milestone's criterion is "three subtasks closed with green gates, unaided". A gate that
     // is green before the run makes that criterion satisfiable by doing nothing, so each task's
-    // gate is run in the directory the run actually works in and must fail. This is the assertion
-    // that stops a fixture from quietly becoming a no-op.
+    // first subtask is run in the directory the run actually works in and must fail. This is the
+    // assertion that stops a fixture from quietly becoming a no-op.
+    //
+    // The first subtask specifically: `every_subtask_is_red_when_it_starts` covers the later ones,
+    // which need the earlier fixes applied to be checked honestly.
     for task in tasks() {
         let name = task.file_name().expect("name").to_string_lossy().into_owned();
+        let plan = Plan::load(&task, MAX_DEPTH).expect("the plan must load");
+        let first = plan.subtasks().first().expect("a subtask");
         let scratch = tempfile::tempdir().expect("tempdir");
         let target = scratch.path().join("repo");
         admit_into(&name, &target);
@@ -214,15 +219,29 @@ fn every_dogfood_task_starts_with_a_failing_gate() {
                 "agent/probe",
             ],
         );
-        assert!(
-            worktree.join("tests").join("behaviour.rs").exists(),
-            "{name}: the specification is not in the worktree, so the gate there is green"
-        );
-        if let Err(message) = gate_fails(&worktree) {
-            panic!(
-                "the gate of {name} passes before the work, so a subtask could close without changing anything: {message}"
+        // Every specification the task ships must be in the worktree; an untracked one is absent
+        // from every worktree git creates, and a worker that cannot see the test cannot fail it.
+        for entry in std::fs::read_dir(task.join("tests")).expect("tests dir") {
+            let path = entry.expect("entry").path();
+            let file = path.file_name().expect("file name");
+            let shown_name = file.to_string_lossy();
+            assert!(
+                worktree.join("tests").join(file).exists(),
+                "{name}: {shown_name} is not in the worktree, so a gate that needs it is green"
             );
         }
+        let failing = failing_checks(&worktree, first);
+        assert!(
+            !failing.is_empty(),
+            "the gate of {name}'s first subtask passes before the work, so it could close \
+             without changing anything; its checks are {:?}",
+            first
+                .dod
+                .checks
+                .iter()
+                .map(|check| check.command.as_str())
+                .collect::<Vec<_>>()
+        );
     }
 }
 
@@ -253,19 +272,25 @@ fn an_admitted_task_is_a_git_repository_of_its_own() {
         "the admitted target is not its own repository: git says {}",
         reported.display()
     );
-    // The failing specification must already be committed: an untracked file is absent from every
+    // The failing specifications must already be committed: an untracked file is absent from every
     // worktree, and a worker that cannot see the test cannot fail it.
-    let shown = Command::new("git")
-        .arg("-C")
-        .arg(&target)
-        .args(["show", "HEAD:tests/behaviour.rs"])
-        .output()
-        .expect("run git");
-    assert!(
-        shown.status.success(),
-        "tests/behaviour.rs is not in the admitted commit: {}",
-        String::from_utf8_lossy(&shown.stderr)
-    );
+    for entry in
+        std::fs::read_dir(dogfood().join("tasks").join("line-count").join("tests")).expect("tests dir")
+    {
+        let file = entry.expect("entry").file_name();
+        let name = file.to_string_lossy();
+        let shown = Command::new("git")
+            .arg("-C")
+            .arg(&target)
+            .args(["show", &format!("HEAD:tests/{name}")])
+            .output()
+            .expect("run git");
+        assert!(
+            shown.status.success(),
+            "tests/{name} is not in the admitted commit: {}",
+            String::from_utf8_lossy(&shown.stderr)
+        );
+    }
     // And the base checkout's own gate is red too, so a run that somehow worked in place rather
     // than in a worktree is still measured honestly.
     if let Err(message) = gate_fails(&target) {
@@ -510,7 +535,11 @@ fn a_dogfood_task_reaches_ready_for_review_through_the_real_gate() {
     assert_eq!(report.escalations_pending, 0, "{report:?}");
 }
 
-/// The smallest honest fix for each task, as a model reading the failing spec would write it.
+/// The smallest honest fix for each subtask, as a model reading the failing spec would write it.
+///
+/// Grouped by subtask, in plan order, because the property that matters is per subtask: each one's
+/// gate must be red when it starts. A flat list would let a later subtask's red be satisfied by an
+/// earlier one's fix, which is the failure this grouping exists to catch.
 ///
 /// # Why this is a test
 ///
@@ -519,15 +548,15 @@ fn a_dogfood_task_reaches_ready_for_review_through_the_real_gate() {
 /// outside the agent. Red-before-work is only half the property; green-after-a-real-fix is the
 /// other half, and it is the half nobody notices is missing until three live runs fail the same
 /// way.
-fn fixes(name: &str) -> Vec<(&'static str, &'static str, &'static str)> {
+fn fixes(name: &str) -> Vec<Vec<(&'static str, &'static str, &'static str)>> {
     match name {
-        "line-count" => vec![(
+        "line-count" => vec![vec![(
             "src/count.rs",
             "    text.split('\\n').count()",
             "    text.split('\\n').count() - usize::from(text.ends_with('\\n'))",
-        )],
+        )]],
         "word-count" => vec![
-            (
+            vec![(
                 "src/count.rs",
                 "/// Number of distinct words, compared case-insensitively.",
                 "/// Number of words that appear exactly once, compared case-insensitively.\n\
@@ -540,15 +569,33 @@ fn fixes(name: &str) -> Vec<(&'static str, &'static str, &'static str)> {
                  \x20   counts.values().filter(|count| **count == 1).count()\n\
                  }\n\n\
                  /// Number of distinct words, compared case-insensitively.",
-            ),
-            (
+            )],
+            vec![(
                 "src/main.rs",
                 "    println!(\"unique: {}\", count::unique_words(&text));",
                 "    println!(\"unique: {}\", count::unique_words(&text));\n\
                  \x20   println!(\"once: {}\", count::once_words(&text));",
-            ),
+            )],
+            vec![(
+                "src/count.rs",
+                "/// Number of distinct words, compared case-insensitively.",
+                "/// The words that appear exactly once, normalised and sorted.\n\
+                 pub fn once_words_sorted(text: &str) -> Vec<String> {\n\
+                 \x20   let mut counts: std::collections::BTreeMap<String, usize> =\n\
+                 \x20       std::collections::BTreeMap::new();\n\
+                 \x20   for word in text.split_whitespace() {\n\
+                 \x20       *counts.entry(normalise(word)).or_default() += 1;\n\
+                 \x20   }\n\
+                 \x20   counts\n\
+                 \x20       .into_iter()\n\
+                 \x20       .filter(|(_, count)| *count == 1)\n\
+                 \x20       .map(|(word, _)| word)\n\
+                 \x20       .collect()\n\
+                 }\n\n\
+                 /// Number of distinct words, compared case-insensitively.",
+            )],
         ],
-        "dedupe" => vec![(
+        "dedupe" => vec![vec![(
             "src/count.rs",
             "pub fn unique_words(text: &str) -> usize {\n\
              \x20   let mut seen: Vec<String> = Vec::new();\n\
@@ -571,17 +618,98 @@ fn fixes(name: &str) -> Vec<(&'static str, &'static str, &'static str)> {
              \x20   }\n\
              \x20   seen.into_iter().collect()\n\
              }",
-        )],
+        )]],
         other => panic!("no fix recorded for `{other}`; every dogfood task needs one"),
+    }
+}
+
+/// Run every required check of `subtask` in `dir`, returning the failing commands.
+///
+/// The plan is the authority on what a subtask's gate is, so the test reads it rather than
+/// hard-coding `cargo test`: a plan whose gate was weakened would otherwise still pass here.
+fn failing_checks(dir: &Path, subtask: &immortality_core::domain::Subtask) -> Vec<String> {
+    let mut failed = Vec::new();
+    for check in subtask.dod.checks.iter().filter(|check| check.required) {
+        let output = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&check.command)
+            .current_dir(dir)
+            .env("CARGO_TERM_COLOR", "never")
+            .output()
+            .expect("run the check");
+        if !output.status.success() {
+            failed.push(check.command.clone());
+        }
+    }
+    failed
+}
+
+#[test]
+fn every_subtask_is_red_when_it_starts_not_only_when_the_task_is_admitted() {
+    // The v0.1 bar is three subtasks closed **consecutively**, and the failure this catches is the
+    // one that would have made it a lie: a subtask whose gate is already green because the previous
+    // subtask's work satisfied it. `word-count` had exactly that — after `once_words` landed,
+    // `cargo test` was green while `src/main.rs` still printed nothing, so the second subtask could
+    // have closed having changed no file.
+    //
+    // So each subtask is checked at its own start: admit fresh, apply every previous subtask's fix,
+    // and require the checks the plan names for *this* subtask to still fail.
+    for task in tasks() {
+        let name = task.file_name().expect("name").to_string_lossy().into_owned();
+        let plan = Plan::load(&task, MAX_DEPTH).expect("the plan must load");
+        let per_subtask = fixes(&name);
+        assert_eq!(
+            plan.subtasks().len(),
+            per_subtask.len(),
+            "{name}: every subtask needs a recorded fix, or the property cannot be checked"
+        );
+
+        for (index, subtask) in plan.subtasks().iter().enumerate() {
+            let scratch = tempfile::tempdir().expect("tempdir");
+            let target = scratch.path().join("repo");
+            admit_into(&name, &target);
+
+            // Everything the earlier subtasks would have landed, and nothing else.
+            for earlier in &per_subtask[..index] {
+                apply(&target, earlier);
+            }
+
+            let failing = failing_checks(&target, subtask);
+            assert!(
+                !failing.is_empty(),
+                "{name}: subtask {} (`{}`) is green before its own work, because an earlier \
+                 subtask's fix satisfied its gate; its checks are {:?}",
+                index + 1,
+                subtask.title,
+                subtask
+                    .dod
+                    .checks
+                    .iter()
+                    .map(|check| check.command.as_str())
+                    .collect::<Vec<_>>()
+            );
+
+            // And with this subtask's own fix it goes green, so the gate is a gate rather than a
+            // wall. Both halves in one place, because either alone is a fixture that misleads.
+            apply(&target, &per_subtask[index]);
+            let still_failing = failing_checks(&target, subtask);
+            assert!(
+                still_failing.is_empty(),
+                "{name}: subtask {} (`{}`) is still red after a plausible fix, so no run could \
+                 pass it: {still_failing:?}",
+                index + 1,
+                subtask.title
+            );
+        }
     }
 }
 
 #[test]
 fn every_dogfood_task_can_be_made_green_by_a_plausible_fix() {
-    // The other half of "the gate is red before the work". A gate that nothing can satisfy makes
-    // every run fail for a reason that has nothing to do with the agent, and the failure reads
-    // exactly like a model that could not do the job. So each task's spec must be green after the
-    // kind of edit the goal asks for, and the existing tests must stay green with it.
+    // The whole-suite half: after every subtask's fix, the repository's own `cargo test` passes.
+    // The per-subtask test above proves each gate; this one proves the subtasks together leave a
+    // repository that is actually healthy, not one passing three narrow targets with a broken
+    // suite.
     for task in tasks() {
         let name = task.file_name().expect("name").to_string_lossy().into_owned();
         let scratch = tempfile::tempdir().expect("tempdir");
@@ -591,7 +719,9 @@ fn every_dogfood_task_can_be_made_green_by_a_plausible_fix() {
             panic!("{name} is green before the fix: {message}");
         }
 
-        apply(&target, &fixes(&name));
+        for patches in fixes(&name) {
+            apply(&target, &patches);
+        }
 
         let gate = Command::new("cargo")
             .args(["test", "--offline", "--quiet"])

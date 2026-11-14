@@ -5,11 +5,11 @@
       "id": "sub_01M7A5K28000014D2PF28AQKFF",
       "depth": 1,
       "title": "count words that appear exactly once",
-      "goal": "Add a public function once_words to src/count.rs that returns how many whitespace-separated words appear exactly once in the text, comparing words case-insensitively and ignoring surrounding punctuation the same way unique_words does. The repository's tests/behaviour.rs already calls count::once_words and is currently failing to compile; make those assertions pass without editing the test file. Keep every existing function and test in src/count.rs unchanged and green.",
+      "goal": "Add a public function once_words to src/count.rs that returns how many whitespace-separated words appear exactly once in the text, comparing words case-insensitively and ignoring surrounding punctuation the same way unique_words does. The repository's tests/once.rs already calls count::once_words and is currently failing to compile; make those assertions pass without editing the test file. Keep every existing function and test in src/count.rs unchanged and green.",
       "dod": {
-        "statement": "test/behaviour.rs compiles and its word-count assertions pass with the counting rule implemented in src/count.rs",
+        "statement": "tests/once.rs compiles and its assertions pass with the counting rule implemented in src/count.rs",
         "checks": [
-          { "id": "test", "command": "cargo test --offline", "required": true }
+          { "id": "test", "command": "cargo test --offline --test once", "required": true }
         ],
         "review": false
       },
@@ -22,17 +22,34 @@
       "id": "sub_01M7A5K37800014D2PF28AQKFG",
       "depth": 1,
       "title": "print the once-only count in the binary",
-      "goal": "In src/main.rs print a line 'once: N' after the existing three lines, using count::once_words from the previous subtask. Read the file the same way the other counts do, print it in the same format, and do not change the usage message or the existing three lines. The project must still build and its tests must still pass.",
+      "goal": "In src/main.rs print a line 'once: N' after the existing three lines, using count::once_words from the previous subtask. Read the file the same way the other counts do, print it in the same format, and do not change the usage message or the existing lines. The repository's tests/once_line.rs runs the real binary against a file and is currently red; make it pass without editing the test file.",
       "dod": {
-        "statement": "the binary prints the once-only count and the whole project still builds and tests green",
+        "statement": "tests/once_line.rs passes: the binary prints a once line and still prints the counts it printed before",
         "checks": [
-          { "id": "build", "command": "cargo build --offline", "required": true },
-          { "id": "test", "command": "cargo test --offline", "required": true }
+          { "id": "test", "command": "cargo test --offline --test once_line", "required": true }
         ],
         "review": false
       },
       "state": "pending",
       "depends_on": ["sub_01M7A5K28000014D2PF28AQKFF"],
+      "created_at": "2026-11-13T10:00:00Z",
+      "updated_at": "2026-11-13T10:00:00Z"
+    },
+    {
+      "id": "sub_01M7A5K40000014D2PF28AQKFJ",
+      "depth": 1,
+      "title": "list the once-only words in sorted order",
+      "goal": "Add a public function once_words_sorted to src/count.rs that returns the whitespace-separated words appearing exactly once as a sorted Vec<String>, normalised to lowercase with surrounding punctuation stripped the same way once_words and unique_words already do. The repository's tests/once_sorted.rs already calls count::once_words_sorted and is currently failing to compile; make those assertions pass without editing the test file. Keep every existing function and test in src/count.rs unchanged and green.",
+      "dod": {
+        "statement": "tests/once_sorted.rs compiles and its assertions pass: the listing is sorted, normalised the same way the count is, and agrees with it",
+        "checks": [
+          { "id": "test", "command": "cargo test --offline --test once_sorted", "required": true },
+          { "id": "suite", "command": "cargo test --offline", "required": true }
+        ],
+        "review": false
+      },
+      "state": "pending",
+      "depends_on": ["sub_01M7A5K37800014D2PF28AQKFG"],
       "created_at": "2026-11-13T10:00:00Z",
       "updated_at": "2026-11-13T10:00:00Z"
     }

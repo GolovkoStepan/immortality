@@ -9,7 +9,11 @@
       "dod": {
         "statement": "tests/behaviour.rs asserts the trailing-newline rule and passes, and the existing tests in src/count.rs stay green",
         "checks": [
-          { "id": "test", "command": "cargo test --offline", "required": true }
+          {
+            "id": "test",
+            "command": "cargo test --offline --test lines",
+            "required": true
+          }
         ],
         "review": false
       },

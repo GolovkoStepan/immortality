@@ -577,7 +577,51 @@ fn metrics_count_what_the_journal_recorded_for_the_task() {
     assert_eq!(report["restarts"], 1);
     assert_eq!(report["detectors"]["d1/l1"], 1);
     assert_eq!(report["corrupt"], false);
+    assert_eq!(report["longest_green_streak"], 1, "{result}");
     assert_eq!(report["subtasks"].as_array().expect("subtasks").len(), 2);
+}
+
+#[test]
+fn metrics_report_a_streak_the_document_can_cite() {
+    // The v0.1 bar is "three subtasks in a row", and the daemon's answer is where a reader of
+    // `docs/metrics-v0.1.md` gets that number. Three closures with a blocked subtask between the
+    // first and the second would give `closed_green == 3` and a streak of 2, so a test that only
+    // checked the total would pass for a run that missed the bar.
+    let fixture = Fixture::new();
+    record_run(
+        &fixture,
+        &[
+            (
+                Kind::SubtaskState,
+                serde_json::json!({"subtask": "sub_A", "state": "done"}),
+            ),
+            (
+                Kind::SubtaskState,
+                serde_json::json!({"subtask": "sub_B", "state": "blocked"}),
+            ),
+            (
+                Kind::SubtaskState,
+                serde_json::json!({"subtask": "sub_C", "state": "done"}),
+            ),
+            (
+                Kind::SubtaskState,
+                serde_json::json!({"subtask": "sub_D", "state": "done"}),
+            ),
+            (
+                Kind::SubtaskState,
+                serde_json::json!({"subtask": "sub_E", "state": "done"}),
+            ),
+        ],
+    );
+
+    let result = commands::metrics(
+        &fixture.state(),
+        &params(serde_json::json!({"task": task().as_str()})),
+    )
+    .expect("metrics");
+    let report = &result["tasks"][0];
+    assert_eq!(report["closed_green"], 4, "{result}");
+    assert_eq!(report["longest_green_streak"], 3, "{result}");
 }
 
 #[test]

@@ -403,6 +403,21 @@ pub fn log(result: &Value, style: Style) -> String {
 /// restarts and escalations that say how much of the run was the agent and how much was the
 /// ladder. A task whose journal cannot be read is reported as unreadable rather than as zeros —
 /// zero and "unknown" are different facts, and only one of them is evidence.
+/// The line that reports the longest run of green closures against the v0.1 bar.
+///
+/// A reader has to be able to tell "three in a row" from "two in a row" without comparing the
+/// number against the document, so a report that meets the bar is painted green and one that does
+/// not is dim. The comparison is done here rather than left to the reader because the bar is the
+/// whole point of the command.
+fn streak_line(streak: u64, style: Style) -> String {
+    let text = format!("longest streak {streak} in a row — the v0.1 bar is three");
+    if streak >= 3 {
+        style.green(&text)
+    } else {
+        style.dim(&text)
+    }
+}
+
 #[must_use]
 pub fn metrics(result: &Value, style: Style) -> String {
     use std::fmt::Write as _;
@@ -436,6 +451,11 @@ pub fn metrics(result: &Value, style: Style) -> String {
             style.green(&closed.to_string()),
             with_escalation
         );
+        let streak = task
+            .get("longest_green_streak")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let _ = writeln!(out, "{}", streak_line(streak, style));
 
         let subtasks = task
             .get("subtasks")
@@ -1690,6 +1710,7 @@ mod tests {
                 "task": "tsk_01A",
                 "closed_green": 3,
                 "closed_with_escalation": 1,
+                "longest_green_streak": 2,
                 "subtasks": [
                     {"subtask": "sub_A", "state": "done", "closed_with_escalation": false},
                     {"subtask": "sub_B", "state": "done", "closed_with_escalation": true},
@@ -1707,12 +1728,74 @@ mod tests {
         assert!(out.contains("tsk_01A"), "{out}");
         assert!(out.contains("3 closed by a green gate"), "{out}");
         assert!(out.contains("1 of them with an escalation open"), "{out}");
+        assert!(out.contains("longest streak 2 in a row"), "{out}");
         assert!(out.contains("sub_A"), "{out}");
         assert!(out.contains("(escalation open)"), "{out}");
         assert!(out.contains("blocked"), "{out}");
         assert!(out.contains("restarts 2"), "{out}");
         assert!(out.contains("d1/l1"), "{out}");
         assert!(out.contains("d5/l3"), "{out}");
+    }
+
+    #[test]
+    fn a_met_bar_is_painted_differently_from_a_missed_one() {
+        // A reader has to be able to tell "three in a row" from "two in a row" without comparing
+        // the number against the document. The bar is the whole point of the command; leaving it
+        // as an unadorned count makes the reader do arithmetic the tool already knows how to do.
+        let report = |streak: u64| {
+            json!({"count": 1, "tasks": [{
+                "task": "tsk_01A", "closed_green": streak, "closed_with_escalation": 0,
+                "longest_green_streak": streak, "subtasks": [], "detectors": {},
+                "escalations_total": 0, "escalations_pending": 0, "restarts": 0,
+                "records": 5, "corrupt": false,
+            }]})
+        };
+        let met = metrics(&report(3), Style::colour());
+        let missed = metrics(&report(2), Style::colour());
+        // `3` is the bar and gets the green SGR open; `2` is dim. The assertion is about the
+        // streak's own line, because a report also paints the green-closure count green and a
+        // whole-output `contains` would pass for a missed bar too.
+        let streak_line = |text: &str| {
+            text.lines()
+                .find(|line| line.contains("longest streak"))
+                .expect("every report has a streak line")
+                .to_string()
+        };
+        assert!(
+            streak_line(&met).contains("\x1b[32m"),
+            "the met bar is not green: {:?}",
+            streak_line(&met)
+        );
+        assert!(
+            !streak_line(&missed).contains("\x1b[32m"),
+            "a missed bar was painted as met: {:?}",
+            streak_line(&missed)
+        );
+        // And the plain renderer still says both numbers, which is what a pipe sees.
+        assert!(
+            metrics(&report(3), PLAIN).contains("longest streak 3 in a row"),
+            "the number must survive the plain rendering"
+        );
+        assert!(
+            metrics(&report(2), PLAIN).contains("longest streak 2 in a row"),
+            "the number must survive the plain rendering"
+        );
+    }
+
+    #[test]
+    fn a_report_from_an_older_daemon_prints_zero_instead_of_a_missing_line() {
+        // The field is new; a daemon started before it existed answers without it. Silence would
+        // read as "not measured", and this number is measured — as zero, because no settlement
+        // was recorded.
+        let out = metrics(
+            &json!({"count": 1, "tasks": [{
+                "task": "tsk_01A", "closed_green": 1, "closed_with_escalation": 0,
+                "subtasks": [], "detectors": {}, "escalations_total": 0,
+                "escalations_pending": 0, "restarts": 0, "records": 5, "corrupt": false,
+            }]}),
+            PLAIN,
+        );
+        assert!(out.contains("longest streak 0 in a row"), "{out}");
     }
 
     #[test]

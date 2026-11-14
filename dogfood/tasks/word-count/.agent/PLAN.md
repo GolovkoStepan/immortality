@@ -1,11 +1,25 @@
-# Plan — add a `unique` subcommand
+# Plan — the `once` family in `tally`
 
-`tally` already prints lines, words and unique words. The number a reader actually wants when
-comparing two files is the number of words that appear exactly once, so add a `unique` line to
-the output and a `--unique` flag that prints only that number.
+`tally` prints lines, words and unique words. A reader comparing two files wants one more number:
+how many words appear exactly once. This task adds that count, makes the binary print it, and
+exposes the words themselves in sorted order.
 
 ## Why this shape
 
-The counting rule is one function in `src/count.rs`, and the output is one block in `src/main.rs`.
-Splitting the work any finer would produce two subtasks that each touch every file, which is how
-a plan turns into merge conflicts against itself.
+Three subtasks, in a line:
+
+1. the counting rule in `src/count.rs` (`once_words`);
+2. the output in `src/main.rs` (`once: N`);
+3. the listing in `src/count.rs` (`once_words_sorted`).
+
+Each is a separate gate, and each gate is a separate test target, so the green of one does not
+make the next one green. That is not tidiness: `word-count` is the task that has to show three
+consecutive closures, and a plan whose later subtasks are already green when they start would let
+the milestone's bar be met by a run that changed one file.
+
+## Why three and not one
+
+Splitting the count from the printing from the listing would be needless if the only goal were the
+feature. The goal is also the bar: three subtasks, each closing because its own gate went from red
+to green. Two subtasks could not demonstrate three in a row, and one shared gate could not
+demonstrate anything past the first.

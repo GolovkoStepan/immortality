@@ -9,7 +9,11 @@
       "dod": {
         "statement": "the container is a set, the sorted accessor exists, tests/behaviour.rs passes, and no pre-existing assertion was edited",
         "checks": [
-          { "id": "test", "command": "cargo test --offline", "required": true }
+          {
+            "id": "test",
+            "command": "cargo test --offline --test unique",
+            "required": true
+          }
         ],
         "review": false
       },

@@ -30,6 +30,14 @@
 #     steps.
 #
 # Committing it here makes the first impossible and `tests/dogfood.rs` asserts the second.
+#
+# # Why every file under `tests/`, not just `behaviour.rs`
+#
+# A task with several subtasks needs one gate per subtask, and each gate is a test target:
+# `cargo test --test once` compiles only that file, so the first subtask's green leaves the second
+# subtask's gate red. A task whose subtasks shared one `cargo test` would be green for every
+# subtask after the first, and three closures would prove that one file changed. So the plan names
+# a `--test` target per subtask and this script installs all of them.
 
 set -euo pipefail
 
@@ -53,8 +61,9 @@ if [ ! -d "$source_dir/.agent" ]; then
   echo "admit.sh: no such task: $task (looked in $source_dir/.agent)" >&2
   exit 1
 fi
-if [ ! -f "$source_dir/tests/behaviour.rs" ]; then
-  echo "admit.sh: $task has no tests/behaviour.rs; its gate would pass before the work" >&2
+# Every subtask's gate is a test target, so a task with no specifications has no gate at all.
+if [ ! -d "$source_dir/tests" ] || [ -z "$(find "$source_dir/tests" -name '*.rs' -print -quit)" ]; then
+  echo "admit.sh: $task has no Rust files under tests/; its gates would pass before the work" >&2
   exit 1
 fi
 
@@ -75,7 +84,7 @@ mkdir -p "$target/.agent"
 cp "$source_dir/.agent/PLAN.md" "$source_dir/.agent/ACCEPTANCE.md" \
    "$source_dir/.agent/TASKS.json" "$target/.agent/"
 mkdir -p "$target/tests"
-cp "$source_dir/tests/behaviour.rs" "$target/tests/"
+cp "$source_dir"/tests/*.rs "$target/tests/"
 
 git -C "$target" init -q -b main
 # The identity is passed per-command rather than written into `.git/config`: the fixture is

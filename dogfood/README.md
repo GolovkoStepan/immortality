@@ -3,11 +3,14 @@
 Three tasks for the v0.1 exit criterion: on this repository the agent must close at least three
 consecutive subtasks with green gates, unaided, and survive a `kill -9` in the middle of a step.
 
-| Task | Kind | What it exercises |
-| --- | --- | --- |
-| `word-count` | feature | a new counting rule, then a change to the binary that prints it |
-| `line-count` | bugfix | a real defect in the fixture repository, reproducible by one command |
-| `dedupe` | refactor | changing a data structure without changing behaviour, guarded from outside |
+| Task | Kind | Subtasks | What it exercises |
+| --- | --- | --- | --- |
+| `word-count` | feature | 3 | a counting rule, the binary that prints it, then a sorted listing |
+| `line-count` | bugfix | 1 | a real defect in the fixture repository, reproducible by one command |
+| `dedupe` | refactor | 1 | changing a data structure without changing behaviour, guarded from outside |
+
+`word-count` has three subtasks because the v0.1 bar is three **consecutive** closures, and a task
+is admitted into its own repository and run once. Two subtasks could not demonstrate it.
 
 `line-count` is a genuine defect, not a planted one: `count::lines` counts the trailing empty field
 after a final newline, so `tally` reports one line too many for any file that ends with `\n`. The
@@ -20,18 +23,40 @@ A gate has to distinguish "the work was done" from "the work was skipped". `carg
 on the untouched repository is green, so a subtask that changed nothing would still close, and the
 milestone's criterion would be met by a run that did no work.
 
-Each task therefore keeps its specification in `tests/behaviour.rs`, and `admit.sh` installs and
-**commits** it into the admitted repository. The run starts from a repository whose gate is
+Each task therefore keeps its specifications in `tests/`, and `admit.sh` installs and **commits**
+them into the admitted repository. The run starts from a repository whose gate is
 **failing**, and success means making it pass without editing the test. `tests/dogfood.rs` asserts
 that red run for every task, in a worktree — where the run actually works — so a fixture that
 quietly became a no-op fails in `cargo test` rather than during a dogfood session.
 
 Committing it matters for the same reason. A run does not edit the tree it was given: it asks the
 `WorktreeManager` for a worktree and works on a branch there. `git worktree add` reproduces the
-commit, not the checkout, so an untracked `tests/behaviour.rs` simply would not exist on the branch
-and `cargo test --offline` would be green before any work. The two failures look identical from the
-outside — a subtask closes having changed nothing — and only one of them is caught by running the
-gate in the main checkout.
+commit, not the checkout, so an untracked specification simply would not exist on the branch and
+the gate would be green before any work. The two failures look identical from the outside — a
+subtask closes having changed nothing — and only one of them is caught by running the gate in the
+main checkout.
+
+## One gate per subtask, not one per task
+
+A task with several subtasks needs a gate that is red **when that subtask starts**, not one that
+became green when the first one landed. So each subtask names its own test target, and its spec
+lives in its own file:
+
+```json
+{ "id": "test", "command": "cargo test --offline --test once_line", "required": true }
+```
+
+`cargo test --test <name>` compiles only the named target, so `tests/once.rs` passing leaves
+`tests/once_line.rs` and `tests/once_sorted.rs` failing. A single shared `cargo test` would have
+been green for the second and third subtasks the moment the first one landed, and three closures
+would have proved that one file changed.
+
+This is not hypothetical: it is what `word-count` did before this was fixed. After the counting
+rule was added, `cargo test` and `cargo build` both passed while `src/main.rs` still printed
+nothing, so the second subtask could have closed having changed no file. `tests/dogfood.rs` now
+checks every subtask at its own start — admit fresh, apply the earlier subtasks' fixes, require
+this subtask's checks to still fail — and a fixture that regresses to one shared gate fails in
+`cargo test` rather than during a dogfood run.
 
 The specifications live in `tests/` rather than inside `src/count.rs` for a second reason: a test
 that does not exist yet is not a gate at all. `cargo test nothing_matches` exits zero, so "the test
@@ -63,7 +88,8 @@ worktree, a real `cargo test` gate, a model that makes one real edit) so this ca
 Each task is a directory under `tasks/` holding:
 
 - `.agent/` with the three plan files the daemon reads — `PLAN.md`, `ACCEPTANCE.md`, `TASKS.json`;
-- `tests/behaviour.rs`, the failing specification `admit.sh` installs.
+- `tests/`, the failing specifications `admit.sh` installs — one file per subtask, named after the
+  `--test` target its `DoD` names.
 
 `repo/` is the fixture's source material, not a repository to run in: it is a plain directory
 inside this repository, so `git worktree add` run there would produce a worktree of `immortality`
@@ -80,8 +106,8 @@ would refuse fails in `cargo test` rather than hours into a run.
 ## How a task is run
 
 ```sh
-scripts/admit.sh word-count                  # copy to work/word-count, own repo, commit the spec
-cd work/word-count && cargo test --offline   # confirm the gate is red before starting
+scripts/admit.sh word-count                              # copy, own repo, commit the specs
+cd work/word-count && cargo test --offline --test once   # the first subtask's gate is red
 immortality start --project work/word-count "<the task's goal>"
 ```
 
@@ -101,7 +127,8 @@ its sibling `work-agent/` worktree are run artefacts and are ignored by git.
 
 - every subtask closes with green gates — commands from its own `DoD`, plus the reviewer where the
   `DoD` asks for it;
-- at least three consecutive subtasks close without a human answering anything;
+- at least three consecutive subtasks close without a human answering anything, which
+  `immortality metrics` reports as `longest_green_streak`;
 - a `kill -9` between two steps leaves a journal recovery can continue from, with no lost work and
   no double-applied effect.
 

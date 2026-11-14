@@ -1,8 +1,16 @@
-//! Behaviour the `word-count` task must deliver.
+//! Behaviour the `word-count` task must deliver, in its first subtask.
 //!
 //! Red in the repository as committed, because `count::once_words` does not exist yet. That is the
 //! point: a gate has to distinguish "the work was done" from "the work was skipped", and a gate
 //! that passes on the untouched repository cannot.
+//!
+//! # Why one target per subtask
+//!
+//! `word-count` is the task that must show three consecutive closures, so all three subtasks need
+//! a gate that is red **when that subtask starts**. `cargo test --test once` compiles only this
+//! file, so the first subtask going green leaves `tests/once_line.rs` and `tests/once_sorted.rs`
+//! red. A task whose three subtasks shared one `cargo test` would have been green for every
+//! subtask after the first, and three closures would have proved that one file changed.
 //!
 //! They live in `tests/` rather than inside `src/count.rs` for two reasons. An integration test
 //! can only call public items, which is the surface a reader cares about anyway; and a test that
