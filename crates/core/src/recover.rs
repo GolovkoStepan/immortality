@@ -235,13 +235,15 @@ pub enum RecoveryStep {
     /// The probe could not decide. Roll back to the last green checkpoint and start over.
     RollbackToCheckpoint { sha: String, reason: String },
 
-    /// Close an attempt that is being abandoned, so a fresh one can start.
+    /// Close an attempt the journal started and never closed.
     ///
-    /// Emitted only when the plan rolls back: L3 is defined as "roll back to the last green
-    /// checkpoint, fresh context, a different strategy in the brief", so the attempt that was
-    /// interrupted by the crash is over. A plain restart does *not* emit this — the same attempt
-    /// resumes with its conversation replayed from the journal, which is the whole point of
-    /// recording every tool call.
+    /// Every such attempt is over: the process that owned it is gone, and the shipped runner does
+    /// not replay a conversation, so it starts a fresh one regardless of whether the tree is
+    /// rolled back. Closing it here is what keeps its key from being reused by the next attempt
+    /// and keeps the derived cache from carrying an unfinished attempt forever.
+    ///
+    /// This is not a verdict on the work: the record says `cause: "recovery"` and the attempt
+    /// spends no budget (D-027).
     ///
     /// Recorded as `attempt_restarted`; there is no `attempt_abandoned` kind and the list is
     /// closed. Its `attempt` field names the attempt being **closed**, not its replacement, so
@@ -460,20 +462,24 @@ pub fn plan(input: &RecoveryInput<'_>, prober: &impl Prober) -> RecoveryReport {
 
     // ── 5. Attempts ───────────────────────────────────────────────────────────────────────
     //
-    // A plain restart resumes the interrupted attempt: its conversation is rebuilt from the
-    // journal, which is why every tool result is journaled before the model sees it, and why
-    // every unfinished call above gets an observation. Nothing is abandoned.
+    // An attempt the journal never closed is over: the process that owned it is gone. It must be
+    // closed here, or it stays open forever — a `Running` attempt can never be superseded, and the
+    // derived cache would carry it as unfinished for the rest of the task's life.
     //
-    // A rollback is different. L3 is defined as a *fresh context with a different strategy*, so
-    // the attempt that the crash interrupted is over and must be closed — otherwise it stays
-    // `Running` forever and the subtask waits for a process that no longer exists.
-    let rolling_back = steps
-        .iter()
-        .any(|step| matches!(step, RecoveryStep::RollbackToCheckpoint { .. }));
-    if rolling_back {
-        for (subtask, number) in open_attempts(input) {
-            steps.push(RecoveryStep::AbandonAttempt { subtask, number });
-        }
+    // This used to happen only when a rollback was planned, on the theory that a plain restart
+    // resumed the interrupted attempt with its conversation rebuilt from the journal. That theory
+    // is false in the shipped runner: `StepLoop` builds its context from the stable layers alone,
+    // and `model_response` keeps the reply's length rather than its text, so nothing is replayed.
+    // Every process starts an attempt with an empty history, which means the interrupted one is
+    // over whether or not the tree is rolled back. A live `kill -9` showed the bill for the old
+    // rule: two `attempt_started` records under one key, one of them never closed.
+    for (subtask, number) in open_attempts(input) {
+        steps.push(RecoveryStep::AbandonAttempt { subtask, number });
+        // Closing an attempt is a repair even when nothing else is wrong: the journal grows a
+        // record, and `finish` only writes `daemon_recovered` for a non-healthy verdict. Reporting
+        // `clean` while the executor writes a record would make the audit trail describe a pass
+        // that did not happen.
+        verdict = Verdict::Repaired;
     }
 
     // ── 6. State-file divergence ───────────────────────────────────────────────────────────
@@ -1831,10 +1837,13 @@ mod tests {
     }
 
     #[test]
-    fn a_plain_restart_resumes_the_attempt_instead_of_abandoning_it() {
-        // No rollback means the work stands: the same attempt continues with its conversation
-        // replayed from the journal. Abandoning here would throw the context away for free on
-        // every daemon restart.
+    fn a_plain_restart_closes_the_attempt_it_interrupted() {
+        // The process that owned this attempt is gone, and the shipped runner starts a fresh
+        // conversation for whatever comes next — `StepLoop` builds its context from the stable
+        // layers and `model_response` keeps the reply's length rather than its text. So the
+        // interrupted attempt is over even without a rollback, and leaving it open would park the
+        // subtask on a `Running` attempt no process owns. A live `kill -9` produced exactly that:
+        // two `attempt_started` records sharing one key.
         let journal = outcome(vec![scoped(0, 2, Kind::AttemptStarted, serde_json::json!({}))]);
         let report = plan(
             &input(
@@ -1844,12 +1853,12 @@ mod tests {
             ),
             &NoProbe,
         );
-        assert_eq!(report.verdict, Verdict::Healthy);
+        assert_eq!(report.verdict, Verdict::Repaired);
         assert!(
-            !report
+            report
                 .steps
                 .iter()
-                .any(|step| matches!(step, RecoveryStep::AbandonAttempt { .. })),
+                .any(|step| matches!(step, RecoveryStep::AbandonAttempt { number: 2, .. })),
             "{:?}",
             report.steps
         );

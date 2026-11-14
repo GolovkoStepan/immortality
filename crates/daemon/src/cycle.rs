@@ -48,9 +48,9 @@
 
 use immortality_core::domain::{Dod, Subtask, SubtaskId, SubtaskState, TaskState, TaskTrigger, Timestamp};
 use immortality_core::gate::{GateRecord, Reviewer, evaluate};
-use immortality_core::journal::{Journal, Kind, Scope};
+use immortality_core::journal::{Journal, JournalReader, JournalRecord, Kind, Scope};
 use immortality_core::plan::Plan;
-use immortality_core::restart::{Allowance, Stop};
+use immortality_core::restart::{Allowance, Spent, Stop};
 use immortality_core::scheduler;
 use immortality_core::scheduler::backend;
 
@@ -212,6 +212,13 @@ pub fn run(
     // would idle forever — the exact failure `kill -9` recovery exists to survive.
     adopt_leftover_running(plan, journal, runner.clock.now())?;
 
+    // Read once, before the pass. A subtask is settled or blocked the first time it is visited,
+    // so no subtask runs twice here and a snapshot cannot go stale under the loop. Reading at all
+    // is what makes attempt numbers and budgets survive a process start: the tree's `attempts`
+    // field is never written by production, and a live `kill -9` found two attempts under the same
+    // number because of it.
+    let history = journal_records(journal)?;
+
     let mut pass = Pass {
         runner,
         plan: &mut *plan,
@@ -220,6 +227,7 @@ pub fn run(
         last: Stop::Done,
         closed: Vec::new(),
         outage_since: start.outage_since,
+        history: &history,
     };
     if state != TaskState::Verifying {
         pass.drive(&start.strategy)?;
@@ -327,6 +335,13 @@ struct Pass<'a> {
     plan: &'a mut Plan,
     journal: &'a mut Journal,
     limits: Limits,
+    /// The task's records as they stood when the pass started.
+    ///
+    /// Read once, before the loop, and never re-read: this is what a subtask's attempt number and
+    /// remaining budget are derived from, and re-reading inside the loop would both cost a file
+    /// scan per subtask and let the answer change under a `&mut` journal that is the caller's
+    /// proof of what was written. A subtask is visited once per pass, so one snapshot is enough.
+    history: &'a [JournalRecord],
     /// Why the last subtask stopped.
     last: Stop,
     /// Subtasks that closed, in order.
@@ -374,15 +389,20 @@ impl Pass<'_> {
             .ok_or_else(|| CycleError::Store(format!("{} vanished from the tree", subtask.id)))?;
         running.state = SubtaskState::Running;
 
+        // From the journal, not the tree: `Subtask::attempts` is never written by production, and
+        // a live `kill -9` proved the consequence — two `attempt_started` records under the same
+        // `(subtask, 1)` key, and a resumed run with the whole budget back. `Spent` is what makes
+        // the module doc's promise ("a resumed subtask continues counting attempts") true.
+        let spent = Spent::read(self.history, &running.id);
         let mut session = self
             .runner
-            .session(&running, next_attempt_number(&running))
+            .session(&running, spent.next)
             .with_strategy(strategy)
             // A resumed subtask inherits what its last attempt learned. Without this its first
             // brief in the new process is as blind as the very first one.
             .resuming_from(running.report.clone().unwrap_or_default());
         let end = session
-            .drive(self.limits.allowance(), self.journal)
+            .drive(spent.left(self.limits.allowance()), self.journal)
             .map_err(|error| CycleError::Store(error.to_string()))?;
 
         match &end.stop {
@@ -548,11 +568,16 @@ fn acceptance(plan: &Plan) -> Dod {
     }
 }
 
-/// The attempt number a resumed subtask starts from.
-fn next_attempt_number(subtask: &Subtask) -> u32 {
-    u32::try_from(subtask.attempts.len())
-        .unwrap_or(0)
-        .saturating_add(1)
+/// The records of this task's journal, read from disk without disturbing the writer.
+///
+/// A second handle rather than a method on [`Journal`]: the open `&mut Journal` is the caller's
+/// proof that every effect was written, and reading through it would need a `&mut` borrow that
+/// fights the one the pass holds. `JournalReader` reads the same files and closes over nothing.
+fn journal_records(journal: &Journal) -> Result<Vec<JournalRecord>, CycleError> {
+    JournalReader::open(journal.dir(), journal.task())
+        .and_then(|reader| reader.read())
+        .map(|outcome| outcome.records)
+        .map_err(|error| CycleError::Store(format!("cannot read the journal for the cycle: {error}")))
 }
 
 fn record_state(journal: &mut Journal, state: TaskState, at: Timestamp) -> Result<(), CycleError> {

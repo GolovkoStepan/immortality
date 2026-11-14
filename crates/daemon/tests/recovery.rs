@@ -683,11 +683,11 @@ fn a_lost_worktree_is_recreated_from_the_branch() {
 }
 
 #[test]
-fn an_open_attempt_is_closed_when_a_rollback_supersedes_it() {
-    // A plain restart resumes the interrupted attempt — its conversation is replayed from the
-    // journal — so nothing closes it. An attempt ends only when a rollback rewrites the tree
-    // under it. The open `shell` call below is `Unknown` with a checkpoint recorded, which is
-    // exactly the combination that plans a rollback.
+fn an_open_attempt_is_closed_when_recovery_interrupts_it() {
+    // Every open attempt is closed, not only one a rollback supersedes: the process that owned it
+    // is gone and the next one starts a fresh conversation. This case also plans a rollback — the
+    // open `shell` call is `Unknown` with a checkpoint recorded — but the closure no longer
+    // depends on it, and the record's `cause` says recovery rather than a failure.
     let fixture = Fixture::new();
     {
         let mut journal = fixture.journal();

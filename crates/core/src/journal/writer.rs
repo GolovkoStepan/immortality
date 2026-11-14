@@ -195,6 +195,16 @@ impl Journal {
         &self.dir
     }
 
+    /// Task this journal belongs to.
+    ///
+    /// Needed by a caller that wants to re-read what the file already holds — the cycle does, to
+    /// learn which attempt numbers and how much budget a subtask spent before this process
+    /// started — and `dir` alone does not say which task's records to filter for.
+    #[must_use]
+    pub const fn task(&self) -> &TaskId {
+        &self.task
+    }
+
     /// Sequence number the next appended record will get.
     #[must_use]
     pub const fn next_seq(&self) -> u64 {

@@ -5,8 +5,8 @@
 //! field directly; a caller always says *why* it wants a change, and the machine decides
 //! whether that is legal.
 //!
-//! The reason for such strictness is recovery. After a crash the journal is replayed and
-//! each record moves a machine forward; if any record could be applied to any state, a
+//! The reason for such strictness is recovery. After a crash the journal is read back and
+//! replayed against the state machines; if any record could be applied to any state, a
 //! corrupt or hand-edited journal would silently produce an impossible task. Here it
 //! produces an error naming the exact edge that does not exist.
 //!

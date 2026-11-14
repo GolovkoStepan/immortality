@@ -33,8 +33,9 @@ fn a_split_is_the_trees_decision() {
 
 #[test]
 fn an_interrupted_attempt_is_not_restarted_from_scratch() {
-    // A backend outage is not evidence about the work (D-027). It is retried as the same attempt
-    // with its conversation replayed, which is a different operation from L3.
+    // A backend outage is not evidence about the work (D-027), so it spends no restart. That is a
+    // different operation from L3, which does spend one — but "no restart" is not "same attempt":
+    // the process is gone and the next one starts a fresh conversation.
     assert_eq!(
         decide(Ended::Abandoned, room(3, 2)),
         Decision::Stop(Stop::Abandoned)
@@ -269,4 +270,132 @@ fn a_retry_also_needs_budget_on_both_counts() {
             Decision::Stop(Stop::Exhausted(_))
         ));
     }
+}
+
+// ── what the journal says a subtask already spent ────────────────────────────────────────
+
+/// One record with an explicit scope, for the budget reader.
+fn scoped(number: u32, kind: Kind, payload: serde_json::Value) -> JournalRecord {
+    JournalRecord::new(
+        crate::journal::RecordFields {
+            seq: 0,
+            at: at(),
+            task: crate::domain::TaskId::from_suffix("01ARZ3NDEKTSV4RRFFQ69G5FAV"),
+            subtask: Some(SubtaskId::from_suffix("01ARZ3NDEKTSV4RRFFQ69G5FAA")),
+            attempt: Some(number),
+            kind,
+        },
+        crate::journal::JournalEvent::with_payload(payload),
+        None,
+    )
+}
+
+fn at() -> crate::domain::Timestamp {
+    use chrono::TimeZone as _;
+    chrono::Utc.with_ymd_and_hms(2026, 11, 12, 10, 14, 3).unwrap()
+}
+
+fn here() -> SubtaskId {
+    SubtaskId::from_suffix("01ARZ3NDEKTSV4RRFFQ69G5FAA")
+}
+
+#[test]
+fn a_subtask_the_journal_never_mentioned_starts_at_one_with_the_whole_budget() {
+    assert_eq!(Spent::read(&[], &here()), Spent::EMPTY);
+    assert_eq!(Spent::EMPTY.next, 1);
+}
+
+#[test]
+fn a_failed_attempt_is_charged_and_the_next_number_follows_it() {
+    // The budget is about attempts, so a failed one has to be visible; and the number has to move
+    // or the next attempt reuses a key the journal already holds.
+    let records = vec![scoped(1, Kind::AttemptFailed, serde_json::json!({}))];
+    let spent = Spent::read(&records, &here());
+    assert_eq!(spent.attempts, 1);
+    assert_eq!(spent.restarts, 0);
+    assert_eq!(spent.next, 2);
+    assert_eq!(
+        spent.left(room(3, 2)),
+        room(2, 2),
+        "a failed attempt spends an attempt, not a restart"
+    );
+}
+
+#[test]
+fn a_ladder_restart_spends_both_budgets() {
+    let records = vec![scoped(
+        1,
+        Kind::AttemptRestarted,
+        serde_json::json!({ "cause": "stalled" }),
+    )];
+    let spent = Spent::read(&records, &here());
+    assert_eq!(spent.attempts, 1);
+    assert_eq!(spent.restarts, 1);
+    assert_eq!(spent.left(room(3, 2)), room(2, 1));
+}
+
+#[test]
+fn an_abandoned_attempt_spends_nothing_but_still_takes_its_number() {
+    // D-027: a reboot is not evidence about the model's approach, so the budget is untouched.
+    // The number still has to advance, or the resumed attempt would collide with the one the
+    // crash left open.
+    let records = vec![
+        scoped(
+            1,
+            Kind::AttemptFailed,
+            serde_json::json!({ "state": "abandoned", "ending": "backend" }),
+        ),
+        scoped(
+            2,
+            Kind::AttemptRestarted,
+            serde_json::json!({ "cause": "recovery" }),
+        ),
+    ];
+    let spent = Spent::read(&records, &here());
+    assert_eq!(spent.attempts, 0, "an abandoned attempt is free");
+    assert_eq!(spent.restarts, 0, "recovery is not an L3 restart");
+    assert_eq!(spent.next, 3, "but the number still moved past both");
+    assert_eq!(spent.left(room(3, 2)), room(3, 2));
+}
+
+#[test]
+fn a_green_verdict_is_charged_but_a_failed_one_is_not() {
+    let passed = vec![scoped(
+        1,
+        Kind::GateResult,
+        serde_json::json!({ "gate": "verdict", "passed": true }),
+    )];
+    assert_eq!(Spent::read(&passed, &here()).attempts, 1);
+    // A red verdict does not end an attempt; `attempt_failed` does, and that is charged. Counting
+    // the verdict too would spend two attempts for one.
+    let failed = vec![scoped(
+        1,
+        Kind::GateResult,
+        serde_json::json!({ "gate": "verdict", "passed": false }),
+    )];
+    assert_eq!(Spent::read(&failed, &here()).attempts, 0);
+}
+
+#[test]
+fn another_subtasks_records_do_not_count() {
+    // A journal is shared by the whole task; a budget read without the filter would drain one
+    // subtask with another's attempts.
+    let records = vec![scoped(1, Kind::AttemptFailed, serde_json::json!({}))];
+    let elsewhere = SubtaskId::from_suffix("01ARZ3NDEKTSV4RRFFQ69G5FAB");
+    assert_eq!(Spent::read(&records, &elsewhere), Spent::EMPTY);
+}
+
+#[test]
+fn a_journal_that_recorded_more_than_the_config_allows_stops_the_subtask() {
+    // A human can lower `max_attempts_per_subtask` under a running task. Subtracting would wrap
+    // to `u32::MAX` and hand the subtask an effectively infinite budget.
+    let records: Vec<JournalRecord> = (1..=5)
+        .map(|number| scoped(number, Kind::AttemptFailed, serde_json::json!({})))
+        .collect();
+    let spent = Spent::read(&records, &here());
+    assert_eq!(
+        spent.left(room(2, 1)),
+        room(0, 1),
+        "attempts clamp at zero; restarts are untouched, since none of these were L3"
+    );
 }

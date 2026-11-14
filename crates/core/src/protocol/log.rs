@@ -17,9 +17,11 @@
 //!
 //! `completed` is written *before* the model sees the result — that is the documented rule and
 //! it is what makes the journal authoritative. The consequence is that a crash immediately
-//! after `completed` leaves a result the model never saw. That is the safe direction: on
-//! recovery the observation is replayed into the conversation from the journal, so the model
-//! sees exactly what was durable, and no tool runs twice.
+//! after `completed` leaves a result the model never saw. That is the safe direction: recovery
+//! treats the call as finished rather than re-running it, so no tool runs twice and the effect
+//! stays exactly what was durable. (The observation is not replayed into a conversation: the
+//! shipped runner starts each attempt with an empty history, and `model_response` stores the
+//! reply's length, not its text.)
 
 use std::collections::{BTreeMap, BTreeSet};
 

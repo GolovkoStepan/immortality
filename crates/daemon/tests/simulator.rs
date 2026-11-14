@@ -837,18 +837,45 @@ fn a_crash_between_the_rollback_marker_and_its_confirmation_completes_the_rollba
 }
 
 #[test]
-fn a_crash_before_any_effect_leaves_nothing_to_repair() {
+fn a_crash_before_any_effect_invents_no_work_but_closes_the_attempt() {
+    // Two separate claims, and the test is only useful if it holds both.
+    //
     // Recovery inventing work is a bug in its own right: an attempt that died between its start
-    // record and its first tool call has done nothing, and the next process must simply carry on.
+    // record and its first tool call has done nothing, so no call may be probed, retried,
+    // synthesized or abandoned, and nothing may be invented about the state files.
+    //
+    // The attempt itself, though, is over — the process that owned it is gone, and the shipped
+    // runner starts a fresh conversation for whatever comes next (`StepLoop` builds its context
+    // from the stable layers; `model_response` keeps the reply's length, not its text). Leaving it
+    // open is what a live `kill -9` left behind: two `attempt_started` records under one key.
     let sim = Sim::new();
     run_cycle(&sim, scenario_script());
     die_after(&sim.journal_dir(), Kind::AttemptStarted, 1);
 
     let report = recover_now(&sim.journal_dir(), &sim.task, ProbeAnswer::Unknown);
-    assert_eq!(report.verdict, Verdict::Healthy, "{:?}", report.steps);
-    assert_eq!(report.steps.len(), 0, "{:?}", report.steps);
-    assert_eq!(report.calls.len(), 0);
-    assert_eq!(report.divergences.len(), 0);
+    assert_eq!(report.calls.len(), 0, "{:?}", report.calls);
+    assert_eq!(report.divergences.len(), 0, "{:?}", report.divergences);
+    // Exactly one step that touches the work, and it is the closure: anything else would be
+    // recovery inventing work the crashed attempt never did. `RecordRecovery` is the audit line
+    // every non-clean pass writes, not an effect on the tree or the calls.
+    let effects: Vec<&RecoveryStep> = report
+        .steps
+        .iter()
+        .filter(|step| !matches!(step, RecoveryStep::RecordRecovery { .. }))
+        .collect();
+    assert_eq!(effects.len(), 1, "{:?}", report.steps);
+    assert!(
+        matches!(
+            effects.first(),
+            Some(RecoveryStep::AbandonAttempt { number: 1, .. })
+        ),
+        "{:?}",
+        report.steps
+    );
+    // Closing an attempt writes a record, so the pass is a repair rather than `clean`; reporting
+    // `Healthy` while the executor appends `attempt_restarted` would make the audit trail describe
+    // a pass that did not happen.
+    assert_eq!(report.verdict, Verdict::Repaired, "{:?}", report.steps);
 }
 
 #[test]

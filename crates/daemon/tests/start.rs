@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 
 use immortality_core::config::{Config, Policy};
 use immortality_core::domain::{Dod, DodCheck, Subtask, SubtaskState, TaskState, Timestamp};
-use immortality_core::journal::{Journal, JournalReader, JournalRecord, Kind};
+use immortality_core::journal::{Journal, JournalReader, JournalRecord, Kind, Scope};
 use immortality_core::plan::SCHEMA_VERSION;
 use immortality_core::registry::Registry;
 use immortality_core::time::{Clock as _, SystemClock};
@@ -723,6 +723,96 @@ fn a_subtask_a_kill_left_running_is_reopened_instead_of_deadlocking_the_resume()
     let text = std::fs::read_to_string(fixture.agent().join("TASKS.json")).expect("tasks");
     // Nothing in the tree may still claim a worker.
     assert!(!text.contains("\"running\""), "{text}");
+}
+
+#[test]
+fn a_resumed_subtask_neither_reuses_an_attempt_number_nor_restarts_its_budget() {
+    // The defect a live `kill -9` exposed. `TASKS.json` carries an `attempts` field that
+    // production never appended to — `cache::derived` fills `attempts.json`, a different file — so
+    // the cycle began at attempt 1 with the whole budget on every process start. A journal from
+    // that run holds two `attempt_started` records under one key and one of them never closed.
+    //
+    // The fixture journals two spent attempts and leaves the second open, which is the shape a
+    // crash mid-attempt leaves behind. After the resume the third attempt must be numbered 3, not
+    // 1, and the budget must arrive with two of three attempts already gone.
+    let fixture = Fixture::new();
+    // `false` is a classified `Read` program, so a red gate costs no escalation — the subtask
+    // simply never passes and every attempt spends the budget. That is what makes the second half
+    // of this test observable: a claim that failed is a charged attempt.
+    let mut subtask = fixture.write_plan(SubtaskState::Running);
+    subtask.dod.checks[0].command = "false".to_string();
+    std::fs::write(
+        fixture.agent().join("TASKS.json"),
+        serde_json::to_string_pretty(&json!({ "v": SCHEMA_VERSION, "subtasks": [subtask] })).expect("json"),
+    )
+    .expect("tasks");
+    let task = write_journal(&fixture, &[("running", TaskState::Running)]);
+    {
+        let mut journal = Journal::open(
+            fixture.agent(),
+            immortality_core::ids::TaskId::parse(&task).expect("task id"),
+        )
+        .expect("journal");
+        let mut spend = |number: u32, kind: Kind| {
+            journal
+                .append_scoped(
+                    SystemClock.now(),
+                    kind,
+                    json!({ "attempt": format!("att_{number}"), "number": number }),
+                    &Scope::attempt(subtask.id.clone(), number),
+                )
+                .expect("attempt record");
+        };
+        spend(1, Kind::AttemptStarted);
+        spend(1, Kind::AttemptFailed);
+        spend(2, Kind::AttemptStarted);
+        journal.close().expect("close");
+    }
+    let model = Scripted::new(Work::Claim);
+    let state = fixture.state(model.clone());
+
+    start_now(&state, &json!({ "task": task })).expect("the resume must be admitted");
+    Fixture::wait_until_idle(&state);
+
+    let records = fixture.records(&task);
+    let numbers: Vec<u64> = records
+        .iter()
+        .filter(|record| record.fields.kind == Kind::AttemptStarted)
+        .filter_map(|record| record.fields.attempt.map(u64::from))
+        .collect();
+    // Attempt 1 failed and attempt 2 was left open by the crash, so the resume starts at 3 and
+    // gets one more. A process that began again at 1 would produce a repeated key — the live
+    // journal held `[1, 2, 1]`, and the next attempt would collide with the open one.
+    assert_eq!(
+        numbers,
+        vec![1, 2, 3, 4],
+        "a resumed subtask must continue counting attempts: {numbers:?}"
+    );
+    // One of the three attempts was charged before the crash, and the open one is free (D-027:
+    // recovery's closure says `cause: recovery`). Two were left, and exactly two ran. A restarted
+    // budget would have run three, and the red gate would have driven the numbers past 4.
+    assert_eq!(
+        model.executor_calls(),
+        2,
+        "the budget must survive the process boundary"
+    );
+    let states: Vec<String> = records
+        .iter()
+        .filter(|record| record.fields.kind == Kind::SubtaskState)
+        .filter_map(|record| {
+            record
+                .event
+                .payload
+                .get("state")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .collect();
+    assert_eq!(
+        states.last().map(String::as_str),
+        Some("blocked"),
+        "the last attempt was spent, so the subtask is exhausted: {states:?}"
+    );
 }
 
 #[test]

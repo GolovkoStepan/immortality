@@ -28,12 +28,17 @@
 //! # Why `Abandoned` is not a restart
 //!
 //! An attempt interrupted from outside — a backend outage, a reboot — says nothing about the
-//! model's approach (D-027). It is retried as *the same attempt* when the daemon is ready, with
-//! its conversation replayed from the journal, and it never spends a restart. Only a verdict on
-//! the work does.
+//! model's approach (D-027). It is retried without spending a restart, but it is **not** the same
+//! attempt: the process that owned it is gone, the shipped runner starts a fresh conversation
+//! (`StepLoop` builds its context from the stable layers, and `model_response` keeps the reply's
+//! length rather than its text), and recovery closes the interrupted attempt before the new one
+//! begins. Only a verdict on the work spends a budget.
+
+use std::collections::BTreeSet;
 
 use crate::detect::Detector;
-use crate::domain::FailureReason;
+use crate::domain::{FailureReason, SubtaskId};
+use crate::journal::{JournalRecord, Kind};
 
 /// The most failed approaches a brief repeats.
 ///
@@ -257,6 +262,124 @@ pub struct Allowance {
     pub attempts_left: u32,
     /// Restarts that may still happen, `max_restarts_per_subtask` minus the ones already used.
     pub restarts_left: u32,
+}
+
+/// What the journal says a subtask has already spent, and which number comes next.
+///
+/// # Why this is read from records rather than from the tree
+///
+/// `TASKS.json` carries an `attempts` field, and its doc comment promises that a resumed subtask
+/// "continues counting attempts". Nothing in production ever appended to it: the only writer
+/// (`cache::derived`) fills `attempts.json`, a different file. So the field was always empty and
+/// every process start began again at attempt 1 with a full budget.
+///
+/// A live `kill -9` proved both halves of that at once: the journal held **two** `attempt_started`
+/// records with the same key `(subtask, 1)`, one of them never closed, and the resumed run had a
+/// fresh `max_attempts_per_subtask`. A run that crashes every time it starts therefore never
+/// reaches `blocked`, which contradicts the budget's whole purpose.
+///
+/// The journal is the authority — recovery's first rule — so the count comes from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Spent {
+    /// Attempts already charged against `max_attempts_per_subtask`.
+    pub attempts: u32,
+    /// L3 restarts already charged against `max_restarts_per_subtask`.
+    pub restarts: u32,
+    /// Number the next attempt of this subtask takes; 1 for a subtask that never started.
+    pub next: u32,
+}
+
+impl Spent {
+    /// A subtask the journal says nothing about.
+    pub const EMPTY: Self = Self {
+        attempts: 0,
+        restarts: 0,
+        next: 1,
+    };
+
+    /// What `records` say this subtask has spent.
+    ///
+    /// Only *charged* endings count. An attempt closed as abandoned — the runner's backend-outage
+    /// closure and recovery's crash closure both write `attempt_failed` with `state: "abandoned"` —
+    /// spends nothing, because D-027 is explicit that a reboot is not evidence about the model's
+    /// approach. An `attempt_restarted` with `cause: "recovery"` is the same thing under the older
+    /// spelling, and an older journal may still contain one.
+    ///
+    /// `next` is driven by the highest number the journal has *seen*, not by the budget: a
+    /// subtask that abandoned three attempts still gets number 4, and its key never collides.
+    #[must_use]
+    pub fn read(records: &[JournalRecord], subtask: &SubtaskId) -> Self {
+        let mut charged: BTreeSet<u32> = BTreeSet::new();
+        let mut restarted: BTreeSet<u32> = BTreeSet::new();
+        let mut seen: BTreeSet<u32> = BTreeSet::new();
+        for record in records {
+            if record.fields.subtask.as_ref() != Some(subtask) {
+                continue;
+            }
+            let Some(number) = record.fields.attempt else {
+                continue;
+            };
+            seen.insert(number);
+            match record.fields.kind {
+                Kind::AttemptFailed => {
+                    if payload_is(&record.event.payload, "state", "abandoned") {
+                        continue;
+                    }
+                    charged.insert(number);
+                }
+                Kind::AttemptRestarted => {
+                    if payload_is(&record.event.payload, "cause", "recovery") {
+                        continue;
+                    }
+                    charged.insert(number);
+                    restarted.insert(number);
+                }
+                Kind::GateResult => {
+                    let passed = record
+                        .event
+                        .payload
+                        .get("passed")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true);
+                    if passed && payload_is(&record.event.payload, "gate", "verdict") {
+                        charged.insert(number);
+                    }
+                }
+                _ => {}
+            }
+        }
+        // `seen` is a superset of what was charged; taking the max of all three means a journal
+        // that lost a close record to a torn tail still cannot hand out a number twice.
+        let highest = seen
+            .iter()
+            .chain(charged.iter())
+            .chain(restarted.iter())
+            .copied()
+            .max()
+            .unwrap_or(0);
+        Self {
+            attempts: u32::try_from(charged.len()).unwrap_or(u32::MAX),
+            restarts: u32::try_from(restarted.len()).unwrap_or(u32::MAX),
+            next: highest.saturating_add(1),
+        }
+    }
+
+    /// `budget` minus what this subtask already spent.
+    ///
+    /// Saturating rather than wrapping: a journal that records more attempts than the config now
+    /// allows (the limit was lowered by a human) must stop the subtask, not hand it `u32::MAX`.
+    #[must_use]
+    pub const fn left(self, budget: Allowance) -> Allowance {
+        Allowance {
+            attempts_left: budget.attempts_left.saturating_sub(self.attempts),
+            restarts_left: budget.restarts_left.saturating_sub(self.restarts),
+        }
+    }
+}
+
+/// Whether a payload field is the given string.
+fn payload_is(payload: &serde_json::Value, field: &str, value: &str) -> bool {
+    payload.get(field).and_then(serde_json::Value::as_str) == Some(value)
 }
 
 /// Whether to restart, and if not, why.
