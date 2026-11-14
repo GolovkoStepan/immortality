@@ -47,6 +47,11 @@ push, а в PR — только с меткой `macos` (это дорогой �
 зависимости отдельно проверяет `just audit`, а условие по слоям приходится повторять руками
 (`grep -E '^(tokio|reqwest|hyper|immortality-daemon|immortality-tools)' crates/core/Cargo.toml`).
 
+`just ci` идёт на macOS и о Linux-джобе молчит. Если push покраснел там, а локально всё зелёное,
+прогон воспроизводится контейнером — рецепт в [`docs/linux-check.md`](docs/linux-check.md).
+Класс, который так ловится: тест зовёт macOS-only бинарь (`plutil`, `launchctl`) — такие тесты
+обязаны быть под `#![cfg(target_os = "macos")]`.
+
 ## Куда смотреть
 
 | Вопрос | Документ |

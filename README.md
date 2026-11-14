@@ -110,6 +110,7 @@ CLI-клиент подключается к демону по unix-сокету
 | [docs/decisions.md](docs/decisions.md) | Журнал решений с обоснованиями и отвергнутыми альтернативами |
 | [docs/non-goals-v0.1.md](docs/non-goals-v0.1.md) | Что сознательно не входит в v0.1 |
 | [docs/backend-check-swift-iq2xs.md](docs/backend-check-swift-iq2xs.md) | Проверка живого бэкенда: скорость, кэш префикса, reasoning, потолок контекста |
+| [docs/linux-check.md](docs/linux-check.md) | Как воспроизвести Linux-джоб CI в контейнере, когда локальный прогон зелёный |
 | [docs/spike-findings.md](docs/spike-findings.md) | Результаты S1: 7 сценариев на живой модели |
 | [dogfood/README.md](dogfood/README.md) | Тестовый репозиторий и три задачи, на которых проверяется планка v0.1 |
 | [CHANGELOG.md](CHANGELOG.md) | История изменений по версиям |

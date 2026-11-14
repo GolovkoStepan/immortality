@@ -6,7 +6,15 @@
 //! hand-rolled check ("contains `<dict>`") proves nothing about whether the file loads; a plist
 //! that is well-formed XML with a duplicated key is still rejected by launchd, and the only
 //! symptom would be a daemon that never starts with no message anywhere.
+//!
+//! # Why this file is macOS-only
+//!
+//! `plutil` ships with macOS, and so does the consumer of what it validates. On Linux the tests
+//! would fail on a missing binary, which says nothing about the plist; skipping them keeps the
+//! Linux job honest about what it can actually prove. The macOS job runs on every push, so the
+//! coverage is not lost — it simply lives where the toolchain does.
 
+#![cfg(target_os = "macos")]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::path::PathBuf;
