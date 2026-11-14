@@ -107,8 +107,8 @@ impl TaskState {
     /// The one place the lifecycle's allowed edges are written down.
     ///
     /// Adding a variant to [`TaskState`] without adding edges here is caught by the
-    /// `every_state_has_an_exit` test, which is why this is a `match` and not a table
-    /// indexed by discriminant.
+    /// `every_non_terminal_state_has_an_exit` test, which is why this is a `match` and not a
+    /// table indexed by discriminant.
     pub const fn trigger(self, trigger: TaskTrigger) -> Result<Self, StatusError> {
         let next = match (self, trigger) {
             (Self::Queued, TaskTrigger::StartPlanning) => Self::Planning,

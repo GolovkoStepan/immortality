@@ -212,7 +212,7 @@ pub enum Streamed {
 ///
 /// The daemon runs on a tokio runtime and the loop is synchronous: making it `async` would push
 /// `async` into every detector and every test for no benefit, because steps are strictly
-/// sequential and the global semaphore admits one inference at a time anyway.
+/// sequential: each request starts after the previous one's result is in the journal.
 pub struct LlmModel {
     backend: Backend,
     runtime: tokio::runtime::Runtime,

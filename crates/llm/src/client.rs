@@ -8,8 +8,8 @@
 //! `tool_call_started` record, and the next attempt is then a different protocol step, not a
 //! repeat. Putting the loop inside the client would hide that.
 //!
-//! **It does not hold a semaphore.** Concurrency 1 is a property of the daemon's loop, which
-//! knows what else is running; a client that blocks inside `turn` would hide the wait.
+//! **It does not hold a semaphore.** Serialising turns is the caller's business: the daemon runs
+//! one step at a time, and a client that blocked inside `turn` would hide the wait.
 //!
 //! # Cancellation
 //!
