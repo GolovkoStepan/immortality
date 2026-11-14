@@ -421,17 +421,36 @@ impl CheckOutcome {
         }
     }
 
+    /// The first line of why the check did not run, or an empty string when it did.
+    ///
+    /// The tail is the whole explanation for a refusal (`the policy refused this command: …`), but
+    /// a journal record wants one line, and the first is the sentence the tool wrote.
+    #[must_use]
+    pub fn reason(&self) -> String {
+        self.output_tail
+            .lines()
+            .next()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .unwrap_or("the command produced no exit code and no reason")
+            .to_string()
+    }
+
     /// One line for the journal and the brief.
+    ///
+    /// A check that never ran has no exit code, and "(no exit code)" alone is a lie of omission:
+    /// the first live run's `check_readme` was refused by the policy before it executed, the brief
+    /// said only "`check_readme` (no exit code)", and the next attempt had no way to tell a policy
+    /// refusal from a failing test. It rewrote a README that was already correct.
     #[must_use]
     pub fn summary(&self) -> String {
-        let code = self
-            .exit_code
-            .map_or_else(|| "no exit code".to_string(), |code| format!("exit {code}"));
         if self.timed_out {
-            format!("`{}` timed out after {} ms", self.id, self.duration_ms)
-        } else {
-            format!("`{}` ({})", self.id, code)
+            return format!("`{}` timed out after {} ms", self.id, self.duration_ms);
         }
+        self.exit_code.map_or_else(
+            || format!("`{}` did not run: {}", self.id, self.reason()),
+            |code| format!("`{}` (exit {code})", self.id),
+        )
     }
 }
 
@@ -459,6 +478,15 @@ pub enum GateRecord {
         duration_ms: u64,
         passed: bool,
         required: bool,
+        /// Why there is no exit code: the policy refused the command, or it could not be started.
+        ///
+        /// Only populated when `exit_code` is `None`, and only the first line of the reason, so a
+        /// check with output does not copy its tail into every journal. Without this the record
+        /// said `"exit_code": null, "passed": false` and nothing else: the first live run's
+        /// `check_readme` was refused by the policy before it ran, the journal could not say so,
+        /// and the brief inherited the silence.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        why: Option<String>,
     },
     /// The reviewer's verdict.
     Review { approved: bool, issues: Vec<String> },
@@ -493,6 +521,10 @@ impl GateRecord {
             duration_ms: outcome.duration_ms,
             passed: outcome.passed,
             required: outcome.required,
+            // Only when no code came back: a check that ran has its tail in the report the
+            // reviewer saw, and copying that into the journal would make every record as long as
+            // the test output it came from.
+            why: outcome.exit_code.is_none().then(|| outcome.reason()),
         }));
         if let Some(review) = &report.review {
             records.push(Self::Review {

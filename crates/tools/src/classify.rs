@@ -583,7 +583,9 @@ fn classify_program(program: &str, args: &[&str]) -> Classification {
 
     if let Some((_, writes)) = PATH_PROGRAMS.iter().find(|(name, _)| *name == program) {
         let value_options = options_taking_values(program);
+        let pattern_is_first_operand = takes_a_pattern_operand(program, args);
         let mut skip_next = false;
+        let mut operand = 0usize;
         for arg in args {
             if skip_next {
                 skip_next = false;
@@ -595,6 +597,14 @@ fn classify_program(program: &str, args: &[&str]) -> Classification {
                 }
                 continue;
             }
+            operand += 1;
+            // `grep PATTERN FILE...` — the first operand is what to look for, and reading it as a
+            // path is how a pattern like `~> *3\.4` became a denial: `~` is refused as a path
+            // because a tool argument may not expand it, so the DoD check `grep -qE '~> *3\.4'
+            // README.md` never ran and the gate reported "(no exit code)" with no reason at all.
+            if pattern_is_first_operand && operand == 1 {
+                continue;
+            }
             result.paths.push(PathUse {
                 path: (*arg).to_string(),
                 write: *writes,
@@ -603,6 +613,31 @@ fn classify_program(program: &str, args: &[&str]) -> Classification {
     }
 
     result
+}
+
+/// Whether the program's first non-flag operand is a pattern rather than a file.
+///
+/// `grep PATTERN FILE` puts a non-path first operand in front of the files, and reading it as a
+/// path is not harmless. `grep -qE '~> *3\.4' README.md` is the exact definition-of-done check the
+/// first live run used, and `~` is refused outright because a tool argument may not expand it: the
+/// check was denied before it ran and the gate recorded "(no exit code)", which reads as a failing
+/// test rather than as a policy refusal. The agent then spent two more attempts rewriting a README
+/// that was already correct.
+///
+/// `-e` and `-f` supply the pattern themselves, so with either present the first operand is a file
+/// again and must stay checked.
+fn takes_a_pattern_operand(program: &str, args: &[&str]) -> bool {
+    if !matches!(program, "grep" | "egrep" | "fgrep" | "rg") {
+        return false;
+    }
+    // Both the separated form (`-e pattern`) and the joined one (`-epattern`) count: either way
+    // the pattern came from the flag, not from a bare operand.
+    let supplied = args.iter().any(|arg| {
+        (*arg == "-e" || *arg == "-f")
+            || (arg.starts_with("-e") && arg.len() > 2)
+            || (arg.starts_with("-f") && arg.len() > 2)
+    });
+    !supplied
 }
 
 /// Options whose following word is a value rather than a path, per program.
@@ -1267,6 +1302,33 @@ mod tests {
         let extracted = paths("grep -A 3 TODO src/main.rs");
         assert!(!extracted.iter().any(|(path, _)| path == "3"), "{extracted:?}");
         assert!(extracted.iter().any(|(path, _)| path == "src/main.rs"));
+    }
+
+    #[test]
+    fn grep_pattern_is_not_a_path() {
+        // The check the first live run never got to run. `~` is refused as a path by design — a
+        // tool argument may not expand it — so reading the pattern as one denied
+        // `grep -qE '~> *3\.4' README.md` before it executed and the gate recorded "(no exit
+        // code)". Only the file operand is a path.
+        let classified = classify("grep -qE '~> *3\\.4' README.md");
+        assert_eq!(classified.effect, Effect::Read);
+        assert_eq!(classified.paths, vec![PathUse::read("README.md")]);
+
+        // A pattern that happens to be a real path-looking word is still a pattern, and the file
+        // after it is still checked: dropping both would let `grep secret.txt config/.env` read
+        // the file it names.
+        let extracted = paths("grep pattern config/.env");
+        assert_eq!(extracted, vec![("config/.env".to_string(), false)]);
+
+        // `-e` supplies the pattern, so the first operand is a file again.
+        assert_eq!(
+            paths("grep -e pattern README.md"),
+            vec![("README.md".to_string(), false)]
+        );
+        assert_eq!(
+            paths("grep -epattern README.md"),
+            vec![("README.md".to_string(), false)]
+        );
     }
 
     #[test]

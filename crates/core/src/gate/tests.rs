@@ -415,6 +415,62 @@ fn kinds(records: &[GateRecord]) -> Vec<&'static str> {
 }
 
 #[test]
+fn a_check_that_never_ran_says_why_instead_of_no_exit_code() {
+    // The first live run's failure mode. `check_readme` was refused by the policy before it ran, so
+    // it had no exit code, and the brief the next attempt read was "`check_readme` (no exit code)"
+    // — indistinguishable from a failing test. The model rewrote a README that was already correct
+    // and the subtask blocked. The reason is in the tail; the summary has to reach it.
+    let refused = CheckOutcome::not_run(
+        "check_readme",
+        "grep -qE '~> *3\\.4' README.md",
+        true,
+        "the policy refused this command: the path could not be resolved",
+    );
+    let summary = refused.summary();
+    assert!(!summary.contains("no exit code"), "{summary}");
+    assert!(summary.contains("did not run"), "{summary}");
+    assert!(summary.contains("the policy refused this command"), "{summary}");
+
+    // A check that ran keeps the exit code: the reason is not invented for a real result.
+    assert_eq!(
+        CheckOutcome {
+            exit_code: Some(1),
+            ..refused
+        }
+        .summary(),
+        "`check_readme` (exit 1)"
+    );
+}
+
+#[test]
+fn a_refused_check_records_the_reason_in_the_journal() {
+    // `exit_code: null, passed: false` and nothing else is what made the first run's journal
+    // unreadable after the fact: "a check failed" and "a check never ran" looked identical.
+    let mut report = green();
+    report.checks = vec![CheckOutcome::not_run(
+        "check_readme",
+        "grep -qE '~> *3\\.4' README.md",
+        true,
+        "the policy refused this command: the path could not be resolved",
+    )];
+    let records = GateRecord::of(&report);
+    let GateRecord::Check { why, .. } = &records[1] else {
+        panic!("the second record must be the check: {records:?}");
+    };
+    let why = why.as_deref().expect("a refused check records its reason");
+    assert!(why.contains("the policy refused"), "{why}");
+
+    // A check that ran has no reason to record, so the field stays out of the journal entirely.
+    let mut report = green();
+    report.checks = vec![check("test", true, true)];
+    let records = GateRecord::of(&report);
+    let GateRecord::Check { why, .. } = &records[1] else {
+        panic!("the second record must be the check: {records:?}");
+    };
+    assert!(why.is_none(), "{why:?}");
+}
+
+#[test]
 fn a_green_report_records_sanity_then_checks_then_review_then_verdict() {
     // The journal order is the gate order. A reviewer record that appeared before the check it
     // was paid for would make a post-mortem read the causes backwards.

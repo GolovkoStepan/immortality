@@ -1092,6 +1092,28 @@ mod tests {
     }
 
     #[test]
+    fn a_gate_check_can_check_for_a_tilde_pattern() {
+        // The check the first live run never ran. `~` as a *path* is refused by design, but a grep
+        // pattern is not a path, and `grep -qE '~> *3\.4' README.md` is exactly how a definition of
+        // done asks "does the README name this requirement". Reading the pattern as a path denied
+        // the check before it executed and blocked the subtask on a README that was already
+        // correct.
+        for command in [
+            "grep -qE '~> *3\\.4' README.md",
+            "grep -q '~> 3.4' README.md",
+            "grep -c '~' README.md",
+        ] {
+            assert_eq!(gate().check_command(command), Verdict::Allowed, "{command}");
+        }
+        // The file operand is still judged: a pattern does not launder the path beside it.
+        let verdict = gate().check_command("grep -q 'x' /etc/passwd");
+        let Verdict::Denied(denial) = verdict else {
+            panic!("the file operand must still be checked, got {verdict:?}");
+        };
+        assert!(denial.reason.contains("outside"), "{denial:?}");
+    }
+
+    #[test]
     fn a_redirect_to_dev_null_is_not_a_write_outside_the_worktree() {
         // The bug the first live run hit hardest: `/dev/null` was read as a write outside the
         // worktree, so `bundle exec rspec 2>/dev/null` — and every other ordinary way to silence
