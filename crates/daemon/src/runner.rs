@@ -794,6 +794,11 @@ pub struct AttemptSession<'a> {
     report: SubtaskReport,
     /// The checkpoint the current attempt's tree came from.
     base: Option<restart::Snapshot>,
+    /// Why no base could be taken, when one could not.
+    ///
+    /// Kept so a restart stops with git's own words instead of taking a late snapshot of the
+    /// failed attempt's tree — the bug this field exists to make unrepeatable.
+    base_error: Option<String>,
     /// The strategy the caller started the subtask with, quoted by every restart.
     ///
     /// Deliberately the *initial* one and never the generated text: quoting a generated strategy
@@ -825,6 +830,7 @@ impl<'a> AttemptSession<'a> {
             next: attempt_number,
             report: SubtaskReport::default(),
             base: None,
+            base_error: None,
             seed: String::new(),
             last: None,
         }
@@ -866,6 +872,27 @@ impl<'a> AttemptSession<'a> {
         allowance: Allowance,
         journal: &mut Journal,
     ) -> immortality_core::Result<SessionEnd> {
+        // The base is the state the subtask *started* from, so it has to be taken before the
+        // first attempt touches the tree. Taking it inside the rollback — which is what this did
+        // — snapshots a tree that already contains the failed attempt's work, journals that as
+        // "base", and then resets the branch onto it: the rollback discards nothing, and the
+        // attempt's own work becomes the commit its gates are reviewing, so `git diff HEAD` is
+        // empty and the reviewer rejects work that is on disk. Measured in a live run: the three
+        // checkpoint records of one restart all named the same SHA.
+        if self.base.is_none() && self.base_error.is_none() {
+            match self.capture_base(journal) {
+                Ok(Some(base)) => self.base = Some(base),
+                // Nothing to roll back to. Kept as a reason rather than a stop of its own: a
+                // session that never restarts does not need a base, and refusing to start it
+                // would turn a missing commit into a task that cannot run at all.
+                Ok(None) => {
+                    self.base_error = Some(
+                        "the worktree has no commits, so a restart has nothing to roll back to".to_string(),
+                    );
+                }
+                Err(why) => self.base_error = Some(why),
+            }
+        }
         let mut left = allowance;
         loop {
             let number = self.next;
@@ -962,13 +989,41 @@ impl<'a> AttemptSession<'a> {
         }
     }
 
+    /// Take the checkpoint a restart would roll back to.
+    ///
+    /// Called once, before the first attempt, so the base is the tree the subtask *started* from.
+    /// `Ok(None)` is a repository with no commits: there is nothing to return to, which is a fact
+    /// about the repository rather than an error.
+    fn capture_base(&self, journal: &mut Journal) -> Result<Option<restart::Snapshot>, String> {
+        let Some(checkpoints) = self.runner.checkpoints.as_deref() else {
+            return Err("a restart needs a checkpoint world, and none is wired".to_string());
+        };
+        let taken = checkpoint_snapshot(
+            checkpoints,
+            &format!("base for attempt {} of `{}`", self.next, self.subtask.title),
+        )?;
+        let Some(taken) = taken else {
+            return Ok(None);
+        };
+        record_checkpoint(
+            self.runner.clock.now(),
+            journal,
+            &self.subtask.id,
+            self.next,
+            &taken,
+            "base",
+        )
+        .map_err(|error| error.to_string())?;
+        Ok(Some(taken))
+    }
+
     /// Snapshot, journal, then move the tree back to the base.
     ///
     /// The base is the checkpoint taken before the *first* attempt of the session, not the last
     /// one: L3 gets back to the last state that was green, and an attempt that started on a broken
     /// tree must not make that broken tree the new base.
     fn roll_back(
-        &mut self,
+        &self,
         outcome: &RunOutcome,
         cause: &Cause,
         journal: &mut Journal,
@@ -980,28 +1035,15 @@ impl<'a> AttemptSession<'a> {
         };
         let closed = outcome.attempt.number;
         let reason = format!("L3 restart after attempt {closed}: {}", cause.observation());
+        // No late snapshot here. A base taken now would contain the failed attempt's own work —
+        // the branch would be reset onto it and the rollback would discard nothing. `drive` takes
+        // it before the first attempt; a missing one is a stop, not something to invent.
         if self.base.is_none() {
-            let taken = match checkpoint_snapshot(
-                checkpoints,
-                &format!("base for a restart of `{}`", self.subtask.title),
-            ) {
-                Ok(Some(taken)) => taken,
-                Ok(None) => {
-                    return Ok(RollBack::Blocked(
-                        "the worktree has no commits, so a restart has nothing to roll back to".to_string(),
-                    ));
-                }
-                Err(why) => return Ok(RollBack::Blocked(why)),
-            };
-            record_checkpoint(
-                self.runner.clock.now(),
-                journal,
-                &self.subtask.id,
-                closed,
-                &taken,
-                "base",
-            )?;
-            self.base = Some(taken);
+            return Ok(RollBack::Blocked(self.base_error.clone().unwrap_or_else(|| {
+                "no base checkpoint was taken before the attempt, so there is nothing to roll \
+                 back to"
+                    .to_string()
+            })));
         }
         let Some(base) = self.base.clone() else {
             // Unreachable: the branch above fills it or returns. Written as a branch rather than
@@ -1125,6 +1167,16 @@ struct StepLoop<'a> {
     scope: Scope,
     steps: u32,
     tokens: u64,
+    /// The largest prompt this attempt has been billed for.
+    ///
+    /// The prompt is re-sent in full on every step, and its prefix is the same bytes the previous
+    /// step already paid for. Charging `prompt + completion` each time would make
+    /// `max_tokens_per_attempt` a disguised *step* limit whose real value depends on how large the
+    /// context happened to be: at ~10K a step, 120000 is spent after twelve steps of the sixty the
+    /// config allows, which is what a live run measured. Only the part of the prompt that is new
+    /// since the last step is charged, so the budget counts the work an attempt added rather than
+    /// the work it re-read.
+    charged_prompt: u32,
     /// Steps since the last successful tool call. Any success resets it; talking does not.
     stalled: u32,
     /// Paths tools said they touched, for the report.
@@ -1171,6 +1223,7 @@ impl<'a> StepLoop<'a> {
             scope: Scope::attempt(subtask.id.clone(), attempt.number),
             steps: 0,
             tokens: 0,
+            charged_prompt: 0,
             stalled: 0,
             touched: Vec::new(),
             last_text: String::new(),
@@ -1210,11 +1263,9 @@ impl<'a> StepLoop<'a> {
                 Step::Backend(detail) => return Ok(Ending::Backend { detail }),
             };
             self.steps = self.steps.saturating_add(1);
-            self.tokens = self
-                .tokens
-                .saturating_add(reply.usage.map_or(0, |(prompt, completion)| {
-                    u64::from(prompt) + u64::from(completion)
-                }));
+            let (charge, charged_prompt) = attempt_charge(reply.usage, self.charged_prompt);
+            self.tokens = self.tokens.saturating_add(charge);
+            self.charged_prompt = charged_prompt;
             self.record_response(journal, &reply)?;
 
             if reply.content.trim().is_empty() && reply.tool_calls.is_empty() {
@@ -1953,6 +2004,33 @@ fn summary_of(call: &ToolCall) -> Option<String> {
     }
 }
 
+/// What one step costs an attempt's token budget, and the prompt it has now charged for.
+///
+/// The prompt is re-sent in full on every step and its stable prefix is the same bytes the
+/// previous step already paid for. Charging `prompt + completion` every time turns
+/// `max_tokens_per_attempt` into a step limit whose real size depends on the context: a live run
+/// billed ~10K a step, so the 120000 budget was gone after twelve of the sixty steps the config
+/// allows, and two of three subtasks restarted for a reason that had nothing to do with the model
+/// looping.
+///
+/// So the charge is what this step *added*: the completion, plus the part of the prompt that is
+/// larger than the previous prompt. A prompt that shrank (a compaction, a rolled-back attempt)
+/// charges nothing extra — the tokens are already spent, and billing a negative number would let a
+/// shrinking history buy back budget it never had.
+///
+/// `usage: None` charges nothing, which is the honest answer for a backend that reported no
+/// counts: the alternative is an estimate that over- or under-charges every step.
+fn attempt_charge(usage: Option<(u32, u32)>, already_charged: u32) -> (u64, u32) {
+    let Some((prompt, completion)) = usage else {
+        return (0, already_charged);
+    };
+    let new_prompt = prompt.saturating_sub(already_charged);
+    (
+        u64::from(new_prompt) + u64::from(completion),
+        prompt.max(already_charged),
+    )
+}
+
 fn calls_of(reply: &Reply) -> Vec<ToolCall> {
     reply
         .tool_calls
@@ -2110,7 +2188,6 @@ mod tests {
     /// A tool that always succeeds and touches one path.
     #[derive(Debug)]
     struct Touch;
-
     impl immortality_tools::Tool for Touch {
         fn name(&self) -> &'static str {
             "touch"
@@ -2973,6 +3050,64 @@ mod tests {
             .collect();
         assert_eq!(prefixes[0], prefixes[1]);
         assert_eq!(prefixes[1], prefixes[2]);
+    }
+
+    #[test]
+    fn a_growing_prompt_is_charged_for_what_it_added_not_for_what_it_reread() {
+        // The live run's first defect. Every step re-sends the whole prompt, and its prefix is the
+        // bytes the previous step already paid for. Charging `prompt + completion` each time made
+        // `max_tokens_per_attempt` a disguised step limit: at ~10K a step, the 120000 budget was
+        // spent after twelve of the sixty steps the config allows, and two of three subtasks
+        // restarted for "it ran out of tokens" while the context was nowhere near its 64K budget.
+        //
+        // Fourteen steps with a 10K prompt and a 100-token completion cost 14 * 100 + the prompt's
+        // growth, not 14 * 10100.
+        let replies = (0..14)
+            .map(|index| {
+                Ok(Reply {
+                    content: String::new(),
+                    // A distinct path each step, so D1's exact-repeat ladder is not what ends this.
+                    tool_calls: vec![immortality_llm::turn::ToolCall::function(
+                        format!("call_{index}"),
+                        "touch",
+                        format!(r#"{{"path":"a{index}"}}"#),
+                    )],
+                    usage: Some((10_000 + index * 100, 100)),
+                })
+            })
+            .collect();
+        let model = Scripted::new(replies);
+        let (dir, mut runner) = runner(model, registry(vec![Arc::new(Touch)]));
+        runner.limits.max_steps = 14;
+        runner.limits.max_tokens = 120_000;
+        let mut journal = journal(&dir);
+        let outcome = runner.run(&subtask(), 1, "", &mut journal).expect("run");
+
+        assert_eq!(
+            outcome.ending,
+            Ending::Steps,
+            "the step budget must be what ends this, not the token budget"
+        );
+        assert_eq!(outcome.steps, 14);
+        // Completion is 100 a step; the prompt grows 100 a step; so the honest total is
+        // 14 * 100 + (10_000 + ... + 11_300) - 10_000, well under 120000.
+        assert!(
+            outcome.attempt.tokens_used < 120_000,
+            "the attempt spent {} tokens, which is the double-counted number",
+            outcome.attempt.tokens_used
+        );
+    }
+
+    #[test]
+    fn a_prompt_that_does_not_grow_costs_only_its_completion() {
+        // The other half: a repeated prompt of identical size is one prompt paid once. A model
+        // reading a cached prefix does not re-bill the whole context.
+        assert_eq!(attempt_charge(Some((10_000, 120)), 10_000), (120, 10_000));
+        assert_eq!(attempt_charge(Some((10_000, 120)), 0), (10_120, 10_000));
+        // A prompt that shrank charges nothing extra rather than a negative amount.
+        assert_eq!(attempt_charge(Some((4_000, 50)), 10_000), (50, 10_000));
+        // A backend that reported nothing charges nothing, rather than guessing.
+        assert_eq!(attempt_charge(None, 10_000), (0, 10_000));
     }
 
     #[test]
@@ -4077,10 +4212,13 @@ mod tests {
             .expect("session");
 
         assert_eq!(checkpoints.restored(), vec!["ckpt-0".to_string()]);
-        // base, then the discarded work, then the move: no snapshot after the restore.
+        // The base is taken *before* the first attempt, then the discarded work, then the move:
+        // no snapshot after the restore. The base coming first is the whole point — taken inside
+        // the rollback it would contain the failed attempt's own work, and the "restore" would
+        // put the branch back onto exactly what it was meant to throw away.
         let calls = checkpoints.calls();
         assert_eq!(calls.len(), 3, "{calls:?}");
-        assert!(calls[0].starts_with("snapshot:base for a restart"), "{calls:?}");
+        assert!(calls[0].starts_with("snapshot:base for attempt 1"), "{calls:?}");
         assert!(calls[1].starts_with("snapshot:L3 restart"), "{calls:?}");
         assert_eq!(calls[2], "restore:ckpt-0");
         // And the second attempt inherited the base it was rolled back to.
@@ -4161,6 +4299,86 @@ mod tests {
             shas,
             vec!["ckpt-0".to_string(), "ckpt-1".to_string(), "ckpt-0".to_string(),],
             "the marker repeats the base it is about to move to"
+        );
+    }
+
+    #[test]
+    fn the_base_checkpoint_is_taken_before_the_first_attempt_touches_the_tree() {
+        // The bug a live run exposed: the base was taken *inside* the rollback, so it snapshotted
+        // a tree that already held the failed attempt's work, journalled that as "base", and reset
+        // the branch onto it. The rollback then discarded nothing, and the attempt's own work
+        // became the commit the reviewer diffed against — an empty diff, and a rejected subtask
+        // whose checks were green.
+        //
+        // The assertion is on *ordering*, not on the SHAs: the fake hands out a fresh SHA per
+        // snapshot, so a late base looks identical in the journal payload. What differs is when it
+        // happens, and the first model call is the first thing that touches the tree.
+        #[derive(Debug)]
+        struct Watching {
+            dir: Arc<Mutex<Option<std::path::PathBuf>>>,
+            base_at_first_step: Arc<Mutex<Option<bool>>>,
+            replies: Mutex<VecDeque<Result<Reply, String>>>,
+        }
+
+        impl Model for Watching {
+            fn complete(&self, _request: &ChatRequest) -> Result<Reply, String> {
+                let seen = self
+                    .dir
+                    .lock()
+                    .ok()
+                    .and_then(|dir| dir.clone())
+                    .is_some_and(|dir| {
+                        immortality_core::journal::JournalReader::open(
+                            dir,
+                            &TaskId::from_suffix("01ARZ3NDEKTSV4RRFFQ69G5FAJ"),
+                        )
+                        .and_then(|reader| reader.read())
+                        .is_ok_and(|outcome| {
+                            outcome.records.iter().any(|record| {
+                                record.fields.kind == Kind::CheckpointCreated
+                                    && record.event.payload["role"] == serde_json::json!("base")
+                            })
+                        })
+                    });
+                if let Ok(mut slot) = self.base_at_first_step.lock()
+                    && slot.is_none()
+                {
+                    *slot = Some(seen);
+                }
+                self.replies
+                    .lock()
+                    .ok()
+                    .and_then(|mut queue| queue.pop_front())
+                    .unwrap_or_else(|| Err("the script has no reply for this step".to_string()))
+            }
+        }
+
+        let checkpoints = FakeCheckpoints::new();
+        let mut replies = looping_replies(2);
+        replies.push(Ok(finish()));
+        let dir_slot: Arc<Mutex<Option<std::path::PathBuf>>> = Arc::new(Mutex::new(None));
+        let base_at_first_step = Arc::new(Mutex::new(None));
+        let watcher = Arc::new(Watching {
+            dir: Arc::clone(&dir_slot),
+            base_at_first_step: Arc::clone(&base_at_first_step),
+            replies: Mutex::new(replies.into()),
+        });
+        let (dir, mut runner) = runner(watcher, registry(vec![Arc::new(Touch)]));
+        if let Ok(mut slot) = dir_slot.lock() {
+            *slot = Some(dir.path().join("journal"));
+        }
+        runner.limits.max_steps = 2;
+        runner = with_checkpoints(runner, Arc::clone(&checkpoints));
+        let mut journal = journal(&dir);
+        runner
+            .session(&subtask(), 1)
+            .drive(allowance(3, 1), &mut journal)
+            .expect("session");
+
+        assert_eq!(
+            base_at_first_step.lock().ok().and_then(|slot| *slot),
+            Some(true),
+            "the base record must be in the journal before the first model step"
         );
     }
 
@@ -4410,7 +4628,12 @@ mod tests {
 
         assert_eq!(end.stop, Stop::Done);
         assert!(end.outcome.verified(), "{:?}", end.outcome.gates);
-        assert_eq!(checkpoints.snapshot_count(), 0, "nothing to snapshot");
+        // One snapshot, and it is the base taken before the first attempt: a session that never
+        // restarts never restores, but the base still has to exist for the first attempt to know
+        // what its gates should diff against. It is not the "discarded work" snapshot, which only
+        // a rollback takes.
+        assert_eq!(checkpoints.snapshot_count(), 1);
+        assert_eq!(checkpoints.restored(), Vec::<String>::new());
     }
 
     #[test]

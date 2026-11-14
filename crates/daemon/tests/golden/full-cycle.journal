@@ -26,6 +26,19 @@
   {
     "attempt": 1,
     "dt_ms": 0,
+    "kind": "checkpoint_created",
+    "payload": {
+      "attempt": 1,
+      "branch": "agent/tsk_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+      "role": "base",
+      "sha": "0000000000000000000000000000000000000001"
+    },
+    "seq": 3,
+    "subtask": "sub_01ARZ3NDEKTSV4RRFFQ69G5FAA"
+  },
+  {
+    "attempt": 1,
+    "dt_ms": 0,
     "kind": "attempt_started",
     "payload": {
       "attempt": "att_1",
@@ -33,7 +46,7 @@
       "strategy": "extend the existing parser",
       "subtask": "sub_01ARZ3NDEKTSV4RRFFQ69G5FAA"
     },
-    "seq": 3,
+    "seq": 4,
     "subtask": "sub_01ARZ3NDEKTSV4RRFFQ69G5FAA"
   },
   {
@@ -47,7 +60,7 @@
       "step": 1,
       "tool_calls": 1
     },
-    "seq": 4,
+    "seq": 5,
     "subtask": "sub_01ARZ3NDEKTSV4RRFFQ69G5FAA"
   },
   {
@@ -65,7 +78,7 @@
       "idempotency": "by_content",
       "tool": "write_file"
     },
-    "seq": 5,
+    "seq": 6,
     "subtask": "sub_01ARZ3NDEKTSV4RRFFQ69G5FAA"
   },
   {
@@ -76,7 +89,7 @@
       "call": "call_write",
       "detail": null
     },
-    "seq": 6,
+    "seq": 7,
     "subtask": "sub_01ARZ3NDEKTSV4RRFFQ69G5FAA"
   },
   {
@@ -87,7 +100,7 @@
       "call": "call_write",
       "observation": "Created src/parser.rs (1 line(s), 18 bytes)."
     },
-    "seq": 7,
+    "seq": 8,
     "subtask": "sub_01ARZ3NDEKTSV4RRFFQ69G5FAA"
   },
   {
@@ -100,7 +113,7 @@
       "metric": 1,
       "step": 1
     },
-    "seq": 8,
+    "seq": 9,
     "subtask": "sub_01ARZ3NDEKTSV4RRFFQ69G5FAA"
   },
   {
@@ -114,7 +127,7 @@
       "step": 2,
       "tool_calls": 1
     },
-    "seq": 9,
+    "seq": 10,
     "subtask": "sub_01ARZ3NDEKTSV4RRFFQ69G5FAA"
   },
   {
@@ -131,7 +144,7 @@
       "idempotency": "idempotent",
       "tool": "read_file"
     },
-    "seq": 10,
+    "seq": 11,
     "subtask": "sub_01ARZ3NDEKTSV4RRFFQ69G5FAA"
   },
   {
@@ -142,7 +155,7 @@
       "call": "call_read",
       "detail": null
     },
-    "seq": 11,
+    "seq": 12,
     "subtask": "sub_01ARZ3NDEKTSV4RRFFQ69G5FAA"
   },
   {
@@ -153,7 +166,7 @@
       "call": "call_read",
       "observation": "     1: pub fn parse() {}\n"
     },
-    "seq": 12,
+    "seq": 13,
     "subtask": "sub_01ARZ3NDEKTSV4RRFFQ69G5FAA"
   },
   {
@@ -167,7 +180,7 @@
       "step": 3,
       "tool_calls": 1
     },
-    "seq": 13,
+    "seq": 14,
     "subtask": "sub_01ARZ3NDEKTSV4RRFFQ69G5FAA"
   },
   {
@@ -184,7 +197,7 @@
       "idempotency": "idempotent",
       "tool": "read_file"
     },
-    "seq": 14,
+    "seq": 15,
     "subtask": "sub_01ARZ3NDEKTSV4RRFFQ69G5FAA"
   },
   {
@@ -195,7 +208,7 @@
       "call": "call_read",
       "detail": null
     },
-    "seq": 15,
+    "seq": 16,
     "subtask": "sub_01ARZ3NDEKTSV4RRFFQ69G5FAA"
   },
   {
@@ -206,7 +219,7 @@
       "call": "call_read",
       "observation": "     1: pub fn parse() {}\n"
     },
-    "seq": 16,
+    "seq": 17,
     "subtask": "sub_01ARZ3NDEKTSV4RRFFQ69G5FAA"
   },
   {
@@ -219,7 +232,7 @@
       "metric": 2,
       "step": 3
     },
-    "seq": 17,
+    "seq": 18,
     "subtask": "sub_01ARZ3NDEKTSV4RRFFQ69G5FAA"
   },
   {
@@ -233,7 +246,7 @@
       "step": 4,
       "tool_calls": 1
     },
-    "seq": 18,
+    "seq": 19,
     "subtask": "sub_01ARZ3NDEKTSV4RRFFQ69G5FAA"
   },
   {
@@ -250,7 +263,7 @@
       "idempotency": "idempotent",
       "tool": "read_file"
     },
-    "seq": 19,
+    "seq": 20,
     "subtask": "sub_01ARZ3NDEKTSV4RRFFQ69G5FAA"
   },
   {
@@ -261,7 +274,7 @@
       "call": "call_read",
       "detail": null
     },
-    "seq": 20,
+    "seq": 21,
     "subtask": "sub_01ARZ3NDEKTSV4RRFFQ69G5FAA"
   },
   {
@@ -272,7 +285,7 @@
       "call": "call_read",
       "observation": "     1: pub fn parse() {}\n"
     },
-    "seq": 21,
+    "seq": 22,
     "subtask": "sub_01ARZ3NDEKTSV4RRFFQ69G5FAA"
   },
   {
@@ -285,7 +298,7 @@
       "metric": 3,
       "step": 4
     },
-    "seq": 22,
+    "seq": 23,
     "subtask": "sub_01ARZ3NDEKTSV4RRFFQ69G5FAA"
   },
   {
@@ -300,19 +313,6 @@
       "state": "failed",
       "steps": 4,
       "tokens": 0
-    },
-    "seq": 23,
-    "subtask": "sub_01ARZ3NDEKTSV4RRFFQ69G5FAA"
-  },
-  {
-    "attempt": 1,
-    "dt_ms": 360000,
-    "kind": "checkpoint_created",
-    "payload": {
-      "attempt": 1,
-      "branch": "agent/tsk_01ARZ3NDEKTSV4RRFFQ69G5FAV",
-      "role": "base",
-      "sha": "0000000000000000000000000000000000000001"
     },
     "seq": 24,
     "subtask": "sub_01ARZ3NDEKTSV4RRFFQ69G5FAA"
