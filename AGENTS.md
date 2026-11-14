@@ -39,8 +39,9 @@ CI добавляет `clippy -D warnings`. Послабления `unwrap_used`
 CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) — четыре джоба: `fmt`,
 `clippy -D warnings` и `test --all-features` на Linux (без `--offline`), `cargo deny check
 advisories bans licenses sources`, и проверка слоёв: `immortality-core` не должен обзавестись
-`tokio`, `reqwest`, `hyper`, `immortality-tools` или крейтом демона. macOS-джоб идёт только на
-push в `main` или PR с меткой `macos`, и в нём один `cargo test`.
+`tokio`, `reqwest`, `hyper`, `immortality-tools` или крейтом демона. Воркфлоу триггерится на
+**любой** push в любую ветку (и на каждый PR), а не только на `main`. macOS-джоб идёт на каждый
+push, а в PR — только с меткой `macos` (это дорогой раннер).
 
 `just ci` = `fmt-check` + `lint` + `test`; `cargo deny` и проверку слоёв он **не** запускает —
 зависимости отдельно проверяет `just audit`, а условие по слоям приходится повторять руками

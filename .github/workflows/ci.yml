@@ -1,8 +1,9 @@
 name: CI
 
 on:
+  # Every push, on every branch: a red run should never be the first sign of breakage
+  # after a merge, and there is no reason a branch should build unverified code.
   push:
-    branches: [main]
   pull_request:
   schedule:
     # Security advisories appear without any push; a weekly audit finds them.
@@ -39,8 +40,9 @@ jobs:
   test-macos:
     name: test (macos)
     runs-on: macos-latest
-    # The supported platform: run on every push to main, and on pull requests only when
-    # they touch code that can behave differently here (paths, sockets, `df` parsing).
+    # The supported platform: runs on every push, on every branch. On pull requests only
+    # when they touch code that can behave differently here (paths, sockets, `df` parsing),
+    # because a macOS runner costs several minutes more than a Linux one.
     if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'macos')
     steps:
       - uses: actions/checkout@v4
