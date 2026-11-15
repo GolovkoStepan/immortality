@@ -391,6 +391,20 @@ pub struct RunOutcome {
     pub base_checkpoint: Option<String>,
 }
 
+/// What [`Runner::settle_exhausted`] decided about a spent step budget.
+///
+/// Two variants rather than an `Option<RunOutcome>` because the attempt and the report have to
+/// come back when nothing was settled: the caller continues down the ordinary failure path and
+/// still owns both values. An `Option` would either drop them or force a clone of the attempt, and
+/// a clone of the value that is about to be written to the journal is how the journal and the
+/// attempt start disagreeing.
+enum Settlement {
+    /// The gates were green and the attempt is closed as a success.
+    Settled(RunOutcome),
+    /// Nothing could be settled, and the caller's ordinary path applies.
+    NotSettled { attempt: Attempt, report: SubtaskReport },
+}
+
 impl RunOutcome {
     /// Whether the model claimed the subtask done.
     #[must_use]
@@ -412,13 +426,19 @@ impl RunOutcome {
     #[must_use]
     pub fn ended(&self) -> Ended {
         match (&self.ending, &self.gates) {
-            // A claim is only a failure when the gates say so. `None` means nothing could check
-            // it, which is also a closure: the runner never certifies a claim it did not see.
-            (Ending::Claimed, None | Some(GateVerdict::Passed)) => Ended::Verified,
+            // Two different questions, one answer. A claim is only a failure when the gates say
+            // so, and `None` means nothing could check it, which is also a closure: the runner
+            // never certifies a claim it did not see. A spent step budget is asked the same
+            // question (`settle_exhausted`), because green gates mean the work is done even
+            // though no sentence said so — so the session stops as `Done` instead of rolling the
+            // subtask back, which is the whole point of asking.
+            (Ending::Claimed, None | Some(GateVerdict::Passed))
+            | (Ending::Steps, Some(GateVerdict::Passed)) => Ended::Verified,
             (Ending::Claimed, Some(GateVerdict::Failed { reason, why })) => Ended::Failed(Cause::Gate {
                 reason: *reason,
                 why: why.clone(),
             }),
+            // Red, or nothing could be checked: the budget ending is the cause, as before.
             (Ending::Steps, _) => Ended::Failed(Cause::Limit(Limit::Steps)),
             (Ending::Tokens, _) => Ended::Failed(Cause::Limit(Limit::Tokens)),
             (Ending::Time, _) => Ended::Failed(Cause::Limit(Limit::Time)),
@@ -569,9 +589,28 @@ impl Runner {
         attempt.steps_used = state.steps;
         attempt.tokens_used = state.tokens;
         let base = attempt.base_checkpoint.clone();
-        let report = state.report(&ending);
+        let mut report = state.report(&ending);
         if ending == Ending::Claimed {
             return self.settle_claim(subtask, attempt, report, state.steps, base, journal);
+        }
+        // The step budget running out is not the same thing as the work not being done, and the
+        // difference is not hypothetical: measured on the third live `black_jack` run, an attempt
+        // found the fix and left the gates green (`rspec` 148/0) but spent its last step before
+        // `finish_subtask`, so the attempt closed empty-handed and the next one started over. The
+        // gates are therefore asked once, here, when the budget — and only the step budget —
+        // runs out. Once, not per step: `evaluate_gates` runs the `DoD` commands, and asking on
+        // every step would double the cost of the cheapest attempt to make the rarest one work.
+        if ending == Ending::Steps {
+            match self.settle_exhausted(subtask, attempt, report, state.steps, base.clone(), journal)? {
+                Settlement::Settled(outcome) => return Ok(outcome),
+                Settlement::NotSettled {
+                    attempt: back,
+                    report: back_report,
+                } => {
+                    attempt = back;
+                    report = back_report;
+                }
+            }
         }
 
         let trigger = match &ending {
@@ -698,6 +737,138 @@ impl Runner {
             gates: Some(verdict),
             base_checkpoint: base,
         })
+    }
+
+    /// Turn a spent step budget into a closed attempt, if and only if the gates are green.
+    ///
+    /// # Why this exists at all
+    ///
+    /// `settle_claim` judges a claim the model made. This judges the *work*, when the model never
+    /// got to speak. The two are not the same question but they have the same answer: if the
+    /// `DoD` commands pass against the tree on disk, the subtask is done whether or not a sentence
+    /// said so. The measured case is the third live `black_jack` run, where the first attempt
+    /// found the fix and received `GATE_EXIT=0` with `rspec` 148/0, but `finish_subtask` did not
+    /// arrive before the step budget; the attempt closed empty and the found work was rolled back.
+    ///
+    /// # Why an empty diff settles nothing
+    ///
+    /// Green gates on an attempt that changed no file are not evidence of work — they are evidence
+    /// that there was nothing to judge. A `DoD` whose only gate is a review is the sharpest case:
+    /// a reviewer asked about an empty diff can answer "approve", and this path would then close a
+    /// subtask nobody worked on. That is strictly worse than the bug being fixed, because a lost
+    /// attempt is visible in the next brief while a false closure is not visible at all. So the
+    /// diff is read first, and an empty one falls through to the ordinary failure path. The check
+    /// is also the cheap one: it skips the `DoD` commands entirely when they could not mean
+    /// anything.
+    ///
+    /// # Why only the step budget
+    ///
+    /// `Ending::Tokens` and `Ending::Time` mean the attempt could not *continue*, and a subtask
+    /// closed on gates after a token exhaustion is a subtask whose remaining `DoD` checks may not
+    /// have been affordable either. Steps are the one budget that says "the work kept going and
+    /// simply ran out of turns", which is exactly the shape that loses a finished subtask.
+    ///
+    /// # Why this is not a bypass
+    ///
+    /// The verdict is the same [`GateVerdict`] a claim gets, from the same [`Self::evaluate_gates`],
+    /// recorded the same way and diffed against the same base. A red gate leaves the attempt
+    /// failed with `FailureReason::GateFailed`, which is what a rejected claim gets too — so
+    /// nothing here can close a subtask that a claim could not have closed.
+    ///
+    /// # Errors
+    /// The journal cannot be written.
+    fn settle_exhausted(
+        &self,
+        subtask: &Subtask,
+        mut attempt: Attempt,
+        mut report: SubtaskReport,
+        steps: u32,
+        base: Option<String>,
+        journal: &mut Journal,
+    ) -> immortality_core::Result<Settlement> {
+        // Read the diff before the gates run. `None` for the gate world means there is nothing to
+        // verify, which `evaluate_gates` already turns into a failed verdict — and a failed
+        // verdict here would spend the `DoD` commands on a run that cannot close anyway, so it is
+        // left to the ordinary failure path instead.
+        let Some(gates) = self.gates.as_deref() else {
+            return Ok(Settlement::NotSettled { attempt, report });
+        };
+        match gates.diff(base.as_deref()) {
+            Ok(diff) if diff.is_empty() => return Ok(Settlement::NotSettled { attempt, report }),
+            Ok(_) => {}
+            // A diff that cannot be produced is not a green gate; the ordinary path names the
+            // budget, and the next attempt retries. Swallowing the error here would turn a git
+            // problem into a silent "nothing to settle".
+            Err(_) => return Ok(Settlement::NotSettled { attempt, report }),
+        }
+        let verdict = self.evaluate_gates(subtask, attempt.number, base.as_deref(), journal)?;
+        match &verdict {
+            GateVerdict::Passed => {
+                attempt
+                    .finish(AttemptTrigger::Succeed, None, self.clock.now())
+                    .map_err(|error| immortality_core::Error::Protocol(error.to_string()))?;
+                // The closure is the scheduler's to announce, for the same reason as a claim: the
+                // runner does not hold the tree. The journal therefore says "attempt succeeded"
+                // and leaves `subtask_state` to the caller that owns `TASKS.json`.
+                journal.append_scoped(
+                    self.clock.now(),
+                    Kind::AttemptFailed,
+                    serde_json::json!({
+                        "attempt": attempt.id.to_string(),
+                        "state": attempt.state.as_str(),
+                        "ending": "gate",
+                        "steps": attempt.steps_used,
+                        "tokens": attempt.tokens_used,
+                        // Named so a reader does not mistake this for a claim that was rejected:
+                        // the model never claimed, the budget ended the loop, and the gates
+                        // happened to agree that the work was done.
+                        "settled_by": "gates_after_step_budget",
+                    }),
+                    &Scope::attempt(subtask.id.clone(), attempt.number),
+                )?;
+                report.outcome = format!(
+                    "the step budget ran out, but the gates passed: `{}` is done",
+                    subtask.title
+                );
+            }
+            GateVerdict::Failed { reason, why } => {
+                attempt
+                    .finish(AttemptTrigger::Fail, Some(*reason), self.clock.now())
+                    .map_err(|error| immortality_core::Error::Protocol(error.to_string()))?;
+                journal.append_scoped(
+                    self.clock.now(),
+                    Kind::AttemptFailed,
+                    serde_json::json!({
+                        "attempt": attempt.id.to_string(),
+                        "state": attempt.state.as_str(),
+                        "ending": "steps",
+                        "failure": reason,
+                        "why": why,
+                        "steps": attempt.steps_used,
+                        "tokens": attempt.tokens_used,
+                    }),
+                    &Scope::attempt(subtask.id.clone(), attempt.number),
+                )?;
+                report
+                    .rejected_ideas
+                    .push(format!("the step budget ran out and the gates were red: {why}"));
+                report.outcome = format!(
+                    "the step budget ran out for `{}`, and the gates rejected the work: {why}",
+                    subtask.title
+                );
+            }
+        }
+        Ok(Settlement::Settled(RunOutcome {
+            attempt,
+            // The ending stays `Steps`: the loop did end that way, and the journal now carries the
+            // gate verdict alongside it. Reporting `Claimed` would say the model claimed, which is
+            // the one thing that did not happen.
+            ending: Ending::Steps,
+            report,
+            steps,
+            gates: Some(verdict),
+            base_checkpoint: base,
+        }))
     }
 
     /// Run every gate the subtask's `DoD` asks for, journalling each observation.
@@ -4287,6 +4458,150 @@ mod tests {
         (0..count)
             .map(|index| Ok(Reply::call(format!("call_{index}"), "touch", r#"{"path":"a"}"#)))
             .collect()
+    }
+
+    #[test]
+    fn a_green_gate_settles_the_attempt_when_the_step_budget_ends_the_loop() {
+        // The measured defect: on the third live `black_jack` run the first attempt found the fix
+        // and had `GATE_EXIT=0` with `rspec` 148/0, but `finish_subtask` did not arrive before the
+        // step budget, so the attempt closed empty and the next one began from scratch. The work
+        // is on disk and the gates can see it, so the budget running out is not evidence that the
+        // subtask is incomplete.
+        let mut subtask = subtask();
+        subtask.dod = Dod::reviewed("trailing commas parse");
+        let mut diff = immortality_core::gate::Diff::default();
+        diff.files.push(immortality_core::gate::ChangedFile {
+            path: PathBuf::from("src/parser.rs"),
+            status: immortality_core::gate::FileStatus::Modified,
+            binary: false,
+            added_lines: vec!["let parsed = commas();".to_string()],
+        });
+        let model = Scripted::new(looping_replies(5));
+        let (dir, mut runner) = runner(model, registry(vec![Arc::new(Touch)]));
+        runner.limits.max_steps = 2;
+        runner.gates = Some(Arc::new(FakeGates::with_diff(diff)));
+        let mut journal = journal(&dir);
+        let outcome = runner.run(&subtask, 1, "", &mut journal).expect("run");
+
+        assert_eq!(outcome.ending, Ending::Steps);
+        assert!(
+            outcome.verified(),
+            "a green gate must settle the spent budget: {:?}",
+            outcome.gates
+        );
+        assert_eq!(outcome.attempt.state, AttemptState::Succeeded);
+        assert_eq!(outcome.ended(), Ended::Verified);
+        assert!(
+            outcome.report.outcome.contains("step budget ran out"),
+            "{:?}",
+            outcome.report.outcome
+        );
+    }
+
+    #[test]
+    fn a_red_gate_after_the_step_budget_does_not_close_anything() {
+        // The other half: asking the gates must not become a way to close a subtask that a claim
+        // could not have closed. Same spent budget, one red check, and the attempt still fails.
+        let mut subtask = subtask();
+        subtask.dod = Dod {
+            statement: "the build is green".to_string(),
+            checks: vec![immortality_core::domain::DodCheck {
+                id: "build".to_string(),
+                command: "cargo build".to_string(),
+                required: true,
+            }],
+            review: false,
+        };
+        let mut diff = immortality_core::gate::Diff::default();
+        diff.files.push(immortality_core::gate::ChangedFile {
+            path: PathBuf::from("src/parser.rs"),
+            status: immortality_core::gate::FileStatus::Modified,
+            binary: false,
+            added_lines: vec!["still broken".to_string()],
+        });
+        let model = Scripted::new(looping_replies(5));
+        let (dir, mut runner) = runner(model, registry(vec![Arc::new(Touch)]));
+        runner.limits.max_steps = 2;
+        let gates = FakeGates::with_diff(diff);
+        gates
+            .failing
+            .lock()
+            .expect("lock")
+            .push("cargo build".to_string());
+        runner.gates = Some(Arc::new(gates));
+        let mut journal = journal(&dir);
+        let outcome = runner.run(&subtask, 1, "", &mut journal).expect("run");
+
+        assert_eq!(outcome.ending, Ending::Steps);
+        assert!(!outcome.verified(), "{:?}", outcome.gates);
+        assert_eq!(outcome.attempt.state, AttemptState::Failed);
+        assert_eq!(outcome.attempt.failure, Some(FailureReason::GateFailed));
+        assert_eq!(outcome.ended(), Ended::Failed(Cause::Limit(Limit::Steps)));
+    }
+
+    #[test]
+    fn an_empty_diff_after_the_step_budget_settles_nothing() {
+        // The trap this closes: a `DoD` whose only gate is a review. The fake reviewer approves
+        // everything, so gates on an empty diff come back green — and closing on that would
+        // record a done subtask nobody worked on. An empty diff is not evidence of finished work,
+        // it is evidence that there was nothing to judge.
+        let mut subtask = subtask();
+        subtask.dod = Dod::reviewed("trailing commas parse");
+        let model = Scripted::new(looping_replies(5));
+        let (dir, mut runner) = runner(model, registry(vec![Arc::new(Touch)]));
+        runner.limits.max_steps = 2;
+        runner.gates = Some(Arc::new(FakeGates::green()));
+        let mut journal = journal(&dir);
+        let outcome = runner.run(&subtask, 1, "", &mut journal).expect("run");
+
+        assert_eq!(outcome.ending, Ending::Steps);
+        assert!(outcome.gates.is_none(), "{:?}", outcome.gates);
+        assert_eq!(outcome.attempt.state, AttemptState::Failed);
+        assert_eq!(outcome.attempt.failure, Some(FailureReason::StepsExhausted));
+        assert_eq!(outcome.ended(), Ended::Failed(Cause::Limit(Limit::Steps)));
+    }
+
+    #[test]
+    fn a_token_exhaustion_does_not_ask_the_gates() {
+        // `Ending::Tokens` means the attempt could not continue, not that the work stopped
+        // arriving: the remaining `DoD` checks may not have been affordable either, so a green
+        // result would be a coincidence rather than a verdict. Only the step budget settles.
+        let mut subtask = subtask();
+        subtask.dod = Dod::reviewed("trailing commas parse");
+        let mut diff = immortality_core::gate::Diff::default();
+        diff.files.push(immortality_core::gate::ChangedFile {
+            path: PathBuf::from("src/parser.rs"),
+            status: immortality_core::gate::FileStatus::Modified,
+            binary: false,
+            added_lines: vec!["let parsed = commas();".to_string()],
+        });
+        let gates = Arc::new(FakeGates::with_diff(diff));
+        // Distinct paths, so D1/D6 stay quiet: the ending this test asks about is the token
+        // budget, and a detector firing first would prove something else. Each reply reports a
+        // usage so the charge is real — without it `tokens` never reaches the limit.
+        let model = Scripted::new(
+            (0..50)
+                .map(|index| {
+                    let mut reply = Reply::call(
+                        format!("call_{index}"),
+                        "touch",
+                        format!(r#"{{"path":"src/file_{index}.rs"}}"#),
+                    );
+                    reply.usage = Some((2_000, 2_000));
+                    Ok(reply)
+                })
+                .collect::<Vec<_>>(),
+        );
+        let (dir, mut runner) = runner(model, registry(vec![Arc::new(Touch)]));
+        runner.limits.max_steps = 50;
+        runner.limits.max_tokens = 1_000;
+        runner.gates = Some(Arc::clone(&gates) as Arc<dyn immortality_core::gate::Gates + Send + Sync>);
+        let mut journal = journal(&dir);
+        let outcome = runner.run(&subtask, 1, "", &mut journal).expect("run");
+
+        assert_eq!(outcome.ending, Ending::Tokens);
+        assert!(outcome.gates.is_none(), "{:?}", outcome.gates);
+        assert_eq!(gates.ran(), Vec::<String>::new(), "no check may run");
     }
 
     #[test]
