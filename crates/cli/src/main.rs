@@ -151,7 +151,7 @@ enum Command {
     },
     /// Run the daemon in the foreground until killed.
     Serve,
-    /// Manage the launchd agent that runs the daemon in the background.
+    /// Manage the background daemon: a launchd agent on macOS, a systemd user unit on Linux.
     Service {
         #[command(subcommand)]
         action: ServiceAction,
@@ -162,9 +162,9 @@ enum Command {
 enum ServiceAction {
     /// Install and load the agent. Idempotent; a healthy daemon is never restarted.
     Install,
-    /// Unload the agent and remove its plist. Idempotent.
+    /// Unload the agent and remove its definition. Idempotent.
     Uninstall,
-    /// Show whether the plist is installed and whether launchd is running it.
+    /// Show whether the definition is installed and whether the manager is running it.
     Status,
 }
 
@@ -208,10 +208,11 @@ async fn main() -> Result<()> {
     }
 }
 
-/// `service`: the launchd agent behind a background daemon.
+/// `service`: the launchd agent (macOS) or systemd user unit (Linux) behind a background daemon.
 ///
 /// Not `async`: nothing here talks to the daemon. `install`/`uninstall`/`status` drive `launchctl`
-/// and the filesystem, and making them async would only obscure that they are blocking calls.
+/// or `systemctl --user` and the filesystem, and making them async would only obscure that they
+/// are blocking calls.
 fn service_command(action: &ServiceAction, json: bool) -> Result<()> {
     match action {
         ServiceAction::Install => service_install(json),
@@ -220,12 +221,12 @@ fn service_command(action: &ServiceAction, json: bool) -> Result<()> {
     }
 }
 
-/// `service install`: write the plist and load the agent, disturbing nothing that works.
+/// `service install`: write the launchd plist or the systemd unit, and start the daemon.
 fn service_install(json: bool) -> Result<()> {
     let spec = ServiceSpec::discover().map_err(|error| anyhow::anyhow!("{error}"))?;
     let agent = Agent::discover().map_err(|error| anyhow::anyhow!("{error}"))?;
     let outcome = agent.install(&spec).map_err(|error| anyhow::anyhow!("{error}"))?;
-    let plist = agent.plist().to_path_buf();
+    let unit = agent.unit().to_path_buf();
     if json {
         println!(
             "{}",
@@ -235,7 +236,10 @@ fn service_install(json: bool) -> Result<()> {
                     service::Installed::Unchanged => "unchanged",
                     service::Installed::Reloaded => "reloaded",
                 },
-                "plist": plist,
+                // `plist` is what 0.1.2 scripts read, and it still names the same path, so it
+                // stays as an alias rather than being quietly removed from a machine interface.
+                "unit": unit,
+                "plist": unit,
             }))?
         );
         return Ok(());
@@ -254,7 +258,7 @@ fn service_install(json: bool) -> Result<()> {
             );
         }
     }
-    println!("  plist: {}", plist.display());
+    println!("  unit:  {}", unit.display());
     println!(
         "  state: {}\n  logs:  {}",
         spec.state_root.display(),
@@ -290,7 +294,8 @@ fn service_status(json: bool) -> Result<()> {
                 "installed": status.installed,
                 "running": status.running,
                 "pid": status.pid,
-                "plist": status.plist,
+                "unit": status.unit,
+                "plist": status.unit,
             }))?
         );
         return Ok(());
@@ -300,7 +305,7 @@ fn service_status(json: bool) -> Result<()> {
     // need to know.
     println!("installed: {}", if status.installed { "yes" } else { "no" });
     if status.installed {
-        println!("  plist:   {}", status.plist.display());
+        println!("  unit:    {}", status.unit.display());
     }
     println!(
         "running:   {}",
@@ -313,7 +318,10 @@ fn service_status(json: bool) -> Result<()> {
     if !status.installed {
         println!("Install it with `immortality service install`.");
     } else if !status.running {
-        println!("launchd is not running it. `immortality service install` reloads the agent.");
+        println!(
+            "{} is not running it. `immortality service install` reloads it.",
+            service::MANAGER
+        );
     }
     Ok(())
 }

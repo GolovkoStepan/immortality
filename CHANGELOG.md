@@ -7,7 +7,21 @@
 Версии и этот файл обновляются автоматически через `release-plz` из
 Conventional Commits.
 
-## [Unreleased]
+### Добавлено
+
+- **Linux — поддерживаемая платформа, а не только канарейка CI (D-110).** `service install`,
+  `uninstall` и `status` работают через `systemd --user`: юнит пишется в
+  `$XDG_CONFIG_HOME/systemd/user/`, включается симлинком в `default.target.wants`, поднимается
+  через `daemon-reload` и `restart`. `Restart=on-failure`, а не `always`, — иначе `systemctl
+  --user stop` превращался бы в цикл перезапусков. Состояние на Linux —
+  `$XDG_STATE_HOME/immortality` (по умолчанию `~/.local/state/immortality`), глобальный
+  конфиг — `$XDG_CONFIG_HOME/immortality`, раздельно намеренно. На macOS пути не меняются,
+  миграции нет. `service.rs` разделён на `service/{mod,launchd,systemd}.rs`; оба бэкенда
+  компилируются на любой платформе, поэтому генерация юнита и порядок вызовов `systemctl`
+  проверяются и на macOS — подменённым `systemctl`, как раньше проверялся `launchctl`.
+- **`service install/status --json` получили поле `unit`.** На macOS оно содержит путь к
+  plist, на Linux — к юниту. Прежнее поле `plist` осталось алиасом того же значения, чтобы
+  скрипты `0.1.2` не сломались на переименовании.
 
 ### Изменено
 

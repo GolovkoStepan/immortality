@@ -32,6 +32,13 @@ The first run compiles the whole tree; later runs reuse the `immortality-cargo` 
 Recreate it with `docker volume rm immortality-cargo` if a toolchain bump makes the cache
 stale.
 
+`systemd`-backend is the deliberate exception: `tests/service_systemd.rs` runs on **both**
+platforms, against a scripted `systemctl`. It is not gated on `cfg(target_os = "linux")` for
+the reason D-110 gives — a `cfg` on those tests would mean the sequence (write the unit,
+create the enablement symlink, `daemon-reload`, `restart`) is only ever exercised after a
+push. What genuinely needs Linux is `systemd` itself, and that is outside this repository's
+test scope the same way a real `launchctl` is.
+
 ## The class of failure this catches
 
 A test that shells out to a macOS-only binary. `plutil` (plist validation) and `launchctl`

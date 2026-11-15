@@ -476,12 +476,34 @@ single-writer. Проверено на прод-пути: `an_unknown_program_is
 индирекция (разделяемый слот, заполняемый после постройки обоих), и она заслуживает отдельного
 решения, а не молчаливого `Arc::new(NoSubAgent)`.
 
-**6. Linux — поддерживаемая платформа (D-110).** Второй модуль сервиса для `systemd --user` со
-своими тремя операциями `install`/`uninstall`/`status`: `$XDG_STATE_HOME` для состояния,
-`$XDG_CONFIG_HOME` для конфига, юнит в `$XDG_CONFIG_HOME/systemd/user/`, включение через симлинк в
-`default.target.wants`. «Те же три команды» — это контракт CLI, а не общий код: `service.rs`
-целиком про `launchctl` и plist (D-110). Правило `AGENTS.md` про macOS-only бинари становится
-двусторонним: `plutil`/`launchctl` — только macOS, `systemctl` — только Linux.
+**6. Linux — поддерживаемая платформа (D-110). ✅** `service.rs` разделён на
+`service/{mod,launchd,systemd}.rs`: общее (`LABEL`, `RESTART_SECONDS`, `SUBCOMMAND`, `MANAGER`,
+`ServiceSpec`, `Status`, `Installed`) и два бэкенда. Юнит `systemd --user` пишется в
+`$XDG_CONFIG_HOME/systemd/user/`, включается симлинком в `default.target.wants` (абсолютным:
+относительный systemd ищет внутри wants-каталога и получает висячую ссылку), поднимается через
+`daemon-reload` и `restart`. `Restart=on-failure`, а не `always`: чистый выход — это
+сознательная остановка. Пути: `$XDG_STATE_HOME/immortality` для состояния и
+`$XDG_CONFIG_HOME/immortality` для конфига, раздельно намеренно — `0700` на состоянии осмыслен
+только когда читаемый конфиг лежит в другом месте. На macOS пути не меняются, миграции нет.
+
+Оба бэкенда компилируются на любой платформе, `pub use` выбирает один: генерация юнита и
+последовательность вызовов `systemctl` проверяемы на macOS подменённым скриптом, и `cfg` на
+модуле означал бы, что эти тесты существуют только в CI. Настоящие `plutil` и `launchctl`
+остаются под `cfg(target_os = "macos")`; `systemctl`-тесты намеренно не ограничены платформой.
+JSON-поле `plist` в `service install/status` сохранено как алиас к `unit`, чтобы скрипты
+`0.1.2` не сломались на смене названия.
+
+Две поломки Linux-сборки, найденные при этом и невидимые на macOS по построению (обе
+компилируются только там, где `cfg` уходит в другую ветку):
+
+| Что | Почему macOS не видел |
+| --- | --- |
+| `paths::home()` под `cfg(any(target_os = "macos", test))`, а зовёт его `xdg()` в Linux-ветке | на macOS `home()` нужен самому `data_dir()`, и `test` его тоже включает — функция есть всегда |
+| `tests/service_agent.rs` импортировал `Agent`/`plist` через `pub use`, который на Linux указывает на `systemd` | файл не был под `cfg`, но звал macOS-имена |
+
+Первое — настоящая ошибка компиляции Linux-релиза; второе сломало бы `cargo test` в Linux-джобе.
+Оба стоят одной строки каждый и стоят того, чтобы быть записанными: `cfg` на экспорте — это
+`cfg`-ошибка, которую видит только тот, кто собирает на другой платформе.
 
 **7. `0700` на каталоге состояния. ✅** Сейчас `0600` получают только сокет и токен, а сам
 каталог `~/Library/Application Support/immortality` создавался с умалкой (`0755` на типичной
@@ -521,7 +543,11 @@ macOS-машине), то есть токен и артефакты журнал
 | права ужесточены на существующем каталоге | миграции нет: чужой каталог не переписывается (`an_existing_state_directory_keeps_the_mode_the_user_chose`) |
 | родитель сокета создан с умалкой | каталог, который `bind` создал сам, обязан быть `0700` (`a_socket_directory_this_call_creates_is_owner_only`) |
 | `with_judge` попал в уже расшаренный гейт | `Arc::make_mut` клонирует и судья молча не встаёт (`the_gate_is_exclusive_until_the_judge_is_installed`) |
-| `systemctl`-тесты под `cfg(target_os = "linux")` | Linux-паритет проверяется там, где он есть |
+| `systemctl` без `--user` | адресуется системный менеджер: чужой юнит и мнимое «остановлено» (`installing_twice_does_not_disturb_a_healthy_unit` и все прочие) |
+| висячая ссылка в `default.target.wants` | `is-enabled` называет её включённой, а вход ничего не запускает (`a_stale_enablement_link_is_replaced_rather_than_kept`) |
+| юнит на месте, а ссылки нет | install сообщает успех, а при входе ничего не стартует (`a_unit_that_is_already_written_but_disabled_is_enabled_again`) |
+| `restart` без свежего `daemon-reload` | systemd кэширует файл и запускает старую программу (`a_changed_unit_is_reloaded_after_daemon_reload_and_then_restarted`) |
+| `MainPID=0` выдан за процесс | pid 0 не существует (`status_separates_installed_from_running`) |
 
 ---
 

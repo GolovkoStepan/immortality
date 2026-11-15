@@ -17,37 +17,17 @@
 //! timer, and a task would sit idle for however long that is. `KeepAlive` also covers the reboot
 //! case: launchd starts an agent at login when the key is present.
 //!
-//! `ThrottleInterval` is set because `KeepAlive` on a program that exits immediately is a tight
-//! restart loop; launchd's default is 10 s, and naming it makes the intent visible rather than
-//! inherited from a man page.
-//!
 //! # Why the plist is generated rather than shipped
 //!
 //! It contains absolute paths: the binary, the state directory, the log files. A checked-in plist
 //! would be right for exactly one machine, and a human editing it by hand is a human whose
 //! `service status` no longer describes what is installed. Generating it means the installed file
 //! and `service status` are derived from the same values.
-//!
-//! # Why installing is idempotent
-//!
-//! `service install` twice is what a script does. The second run must not reload a running
-//! daemon (that would kill in-flight work) and must not leave two plists with one label — launchd
-//! keys an agent by label, so two files would be a race whose winner is not defined.
 
 use std::path::PathBuf;
 use std::process::Command;
 
-/// The `launchd` label: both the plist's name and the job's identity.
-///
-/// Reverse-DNS because launchd uses it as a key in a shared namespace; `immortality` alone could
-/// collide with anything a human installed.
-pub const LABEL: &str = "dev.immortality.daemon";
-
-/// Seconds launchd waits before restarting a job that exited.
-///
-/// launchd's own default. Named here so the plist says what it means: without it a daemon that
-/// fails during startup is restarted in a tight loop that fills the log with identical lines.
-const THROTTLE_SECONDS: u32 = 10;
+use super::{Installed, LABEL, RESTART_SECONDS, SUBCOMMAND, ServiceSpec, Status};
 
 /// Where the plist goes: `~/Library/LaunchAgents/<label>.plist`.
 ///
@@ -69,48 +49,6 @@ pub fn plist_path() -> Result<PathBuf, String> {
         .join(format!("{LABEL}.plist")))
 }
 
-/// Everything the plist needs that the daemon cannot guess.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ServiceSpec {
-    /// The absolute path of the `immortality` binary.
-    pub program: PathBuf,
-    /// The absolute state directory, passed as `IMMORTALITY_STATE_DIR`.
-    pub state_root: PathBuf,
-    /// Where stdout and stderr go. launchd appends; it never rotates.
-    pub log_path: PathBuf,
-}
-
-impl ServiceSpec {
-    /// The spec for this machine: the running binary, and the discovered state root.
-    ///
-    /// # Errors
-    /// `current_exe` cannot be read, or `$HOME` is unusable.
-    pub fn discover() -> Result<Self, String> {
-        let program =
-            std::env::current_exe().map_err(|error| format!("cannot locate this binary: {error}"))?;
-        // `current_exe` on macOS can be a path through a symlink that launchd resolves
-        // differently; `canonicalize` makes the plist name the file the kernel would run.
-        let program = std::fs::canonicalize(&program).unwrap_or(program);
-        let state_root = state_root();
-        Ok(Self {
-            log_path: state_root.join("logs").join("daemon.log"),
-            program,
-            state_root,
-        })
-    }
-}
-
-/// The state root as an absolute path, from the same rule the daemon uses.
-///
-/// The same function `serve` calls, not a second copy of the `~/Library/Application Support` path:
-/// the plist and the daemon must agree about where state lives, and two literals is how they would
-/// stop agreeing.
-fn state_root() -> PathBuf {
-    immortality_core::paths::StatePaths::discover()
-        .root()
-        .to_path_buf()
-}
-
 /// The plist document, as XML.
 ///
 /// Hand-written rather than serialized from a crate: a plist is a small, well-specified XML shape,
@@ -129,7 +67,7 @@ pub fn plist(spec: &ServiceSpec) -> String {
   <key>ProgramArguments</key>
   <array>
     <string>{program}</string>
-    <string>serve</string>
+    <string>{subcommand}</string>
   </array>
   <key>EnvironmentVariables</key>
   <dict>
@@ -152,10 +90,11 @@ pub fn plist(spec: &ServiceSpec) -> String {
 </plist>
 "#,
         label = LABEL,
+        subcommand = SUBCOMMAND,
         program = escape(&spec.program.display().to_string()),
         state = escape(&spec.state_root.display().to_string()),
         log = escape(&spec.log_path.display().to_string()),
-        throttle = THROTTLE_SECONDS,
+        throttle = RESTART_SECONDS,
     )
 }
 
@@ -176,19 +115,6 @@ fn escape(text: &str) -> String {
         }
     }
     out
-}
-
-/// What `service status` reports.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Status {
-    /// The plist is on disk.
-    pub installed: bool,
-    /// launchd reports the job as running.
-    pub running: bool,
-    /// Where the plist is (or would be).
-    pub plist: PathBuf,
-    /// launchd's `pid` line, when it reports one.
-    pub pid: Option<u32>,
 }
 
 /// How the module reaches launchd.
@@ -217,6 +143,12 @@ impl Launcher {
         Self {
             program: program.into(),
         }
+    }
+
+    /// The program this launcher runs, for messages and tests.
+    #[must_use]
+    pub fn program(&self) -> &std::ffi::OsStr {
+        &self.program
     }
 
     /// Run `launchctl`, returning its stdout.
@@ -271,7 +203,7 @@ impl Agent {
 
     /// Where the plist is (or would be).
     #[must_use]
-    pub fn plist(&self) -> &std::path::Path {
+    pub fn unit(&self) -> &std::path::Path {
         &self.plist
     }
 
@@ -295,7 +227,7 @@ impl Agent {
         Status {
             installed,
             running,
-            plist: self.plist.clone(),
+            unit: self.plist.clone(),
             pid,
         }
     }
@@ -408,17 +340,6 @@ fn uid() -> String {
         .map_or_else(|| "501".to_string(), |text| text.trim().to_string())
 }
 
-/// What `service install` did, so the command can say it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Installed {
-    /// The plist was written and the job newly loaded.
-    Fresh,
-    /// The plist already said exactly this, and the job was already loaded.
-    Unchanged,
-    /// The plist changed, so the job was reloaded to pick it up.
-    Reloaded,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -469,16 +390,6 @@ mod tests {
         assert!(text.contains("a&amp;b"), "{text}");
         assert!(text.contains("&lt;c&gt;"), "{text}");
         assert!(!text.contains("a&b"), "an unescaped `&` reached the plist");
-    }
-
-    #[test]
-    fn the_plist_lives_where_launchd_reads_agents() {
-        // A plist anywhere else is a file launchd never reads and a `status` that lies.
-        let path = plist_path().expect("HOME");
-        assert!(
-            path.ends_with(format!("Library/LaunchAgents/{LABEL}.plist")),
-            "{path:?}"
-        );
     }
 
     #[test]

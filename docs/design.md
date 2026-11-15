@@ -68,7 +68,7 @@ current-thread runtime и паникует при drop в async-контекст
 | `immortality-core` | Типы домена, дерево задач, машина состояний, журнал, чекпоинты, бюджеты, детекторы зацикливания, сборка контекста | `tokio`, `reqwest`, `hyper`, `immortality-tools`, `immortality-daemon` — ядро чистое и синхронное; проверяется отдельным джобом CI |
 | `immortality-llm` | HTTP-клиент OpenAI-совместимого API, стриминг, парсер и починка tool-call'ов, валидация по JSON Schema, учёт токенов, health/backoff | логика задач |
 | `immortality-tools` | Исполнение инструментов, policy engine, worktree, `shell` (процесс на команду), реестр процессов, прогнозы эффектов (probe) | знания о планировщике |
-| `immortality-daemon` | Планировщик, Runner (агентный цикл), RPC-сервер, launchd-интеграция, lifecycle | — |
+| `immortality-daemon` | Планировщик, Runner (агентный цикл), RPC-сервер, интеграция с launchd и systemd, lifecycle | — |
 | `immortality-cli` | `clap`-команды, подписка на события, рендер в стиле Claude Code | — |
 | `immortality-testkit` | Mock OpenAI-сервер, симулятор точек краха, фикстуры, golden-хелперы (полный прогон-симулятор живёт в `daemon/tests`: testkit не может зависеть от демона) | — |
 
@@ -98,7 +98,8 @@ env → CLI-флаги. Env-слой узкий, а не «любой ключ �
 в env нет намеренно: `IMMORTALITY_STATE_DIR` и `IMMORTALITY_GLOBAL_CONFIG` выбирают файлы,
 а не права, и в эту лестницу не входят.
 
-- **Глобальный** `~/Library/Application Support/immortality/config.toml` — единственное место,
+- **Глобальный** `~/Library/Application Support/immortality/config.toml` (Linux:
+  `$XDG_CONFIG_HOME/immortality/config.toml`, D-110) — единственное место,
   где живут **политики безопасности**: `workspace_root`, `trusted_hosts`, `allow_write_globs`,
   `deny_write_globs`, `deny_read_globs`, `deny_programs`, `yolo` и пять флагов разрешений.
   Встроенный deny-список (`**/.git/**`, `**/.agent/config.toml`, `**/.agent/JOURNAL*`) не
@@ -584,18 +585,27 @@ state-and-recovery.md).
   отказывает и называет pid держателя. Замка на **проект** нет — второй демон на том же
   проекте не стартует лишь потому, что не стартует второй демон вообще.
 
-### 10a. Фоновый запуск: `LaunchAgent`
+### 10a. Фоновый запуск: `LaunchAgent` / `systemd --user`
 
-Демон ставится как `LaunchAgent` (`dev.immortality.daemon`) с `KeepAlive`, `RunAtLoad` и
-`ThrottleInterval = 10`; агент живёт в `~/Library/LaunchAgents/`, plist генерируется из
-абсолютных путей бинаря, каталога состояния и лога (D-012, D-086).
+Один и тот же контракт CLI, два бэкенда (D-012, D-086, D-110). На macOS демон ставится как
+`LaunchAgent` (`dev.immortality.daemon`) с `KeepAlive`, `RunAtLoad` и `ThrottleInterval = 10`;
+агент живёт в `~/Library/LaunchAgents/`, plist генерируется из абсолютных путей бинаря, каталога
+состояния и лога. На Linux — `systemd --user`-юнит с `Restart=on-failure` и `RestartSec=10` в
+`$XDG_CONFIG_HOME/systemd/user/`, включённый симлинком в `default.target.wants`.
 
-- `immortality service install` — пишет plist и загружает агента. Идемпотентна: неизменённый
-  plist не трогается, загруженная задача не перезагружается (это убило бы идущую попытку),
-  изменённый — перезагружается в порядке `bootout` → `bootstrap`.
-- `immortality service uninstall` — выгружает и удаляет. Идемпотентна.
+Обе определены в `daemon::service`, общее (`LABEL`, задержка рестарта, `ServiceSpec`, `Status`,
+`Installed`) вынесено в `mod.rs`, различие — в `launchd.rs` и `systemd.rs`. Оба модуля
+компилируются всегда; `pub use` выбирает один.
+
+- `immortality service install` — пишет определение и запускает демон. Идемпотентна:
+  неизменённое определение не трогается, работающая задача не перезапускается (это убило бы
+  идущую попытку), изменённое — перезапускается (`bootout` → `bootstrap` на macOS,
+  `daemon-reload` → `restart` на systemd).
+- `immortality service uninstall` — останавливает и удаляет вместе со ссылкой включения.
+  Идемпотентна.
 - `immortality service status` — сообщает `installed` и `running` **раздельно**: упавшая задача
-  внутри окна throttle установлена и не работает.
+  внутри окна throttle установлена и не работает. Путь к определению — поле `unit` (на macOS
+  алиас `plist` сохранён для скриптов `0.1.2`).
 
 `serve` в foreground остаётся: это режим отладки и то, что запускает сам агент.
 

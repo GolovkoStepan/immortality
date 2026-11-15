@@ -37,8 +37,8 @@ immortality metrics
 
 Первый `serve` сам чеканит `daemon.token` с правами `0600`; второй экземпляр на том же
 каталоге состояния отказывает и называет pid держателя, не трогая сокет работающего демона.
-Для фоновой работы есть `immortality service install` — `LaunchAgent` с `KeepAlive`,
-переживающий ребут.
+Для фоновой работы есть `immortality service install` — `LaunchAgent` с `KeepAlive` на macOS
+и `systemd --user`-юнит с `Restart=on-failure` на Linux; оба переживают ребут.
 
 ## Идея в одном абзаце
 
@@ -70,7 +70,7 @@ CLI-клиент подключается к демону по unix-сокету
 | `immortality gc [--dry-run]` | Ротация логов и очистка тяжёлых артефактов |
 | `immortality doctor` | Диагностика окружения и бэкенда; `--json` для машинного вида |
 | `immortality serve` | Демон в foreground: файловая блокировка, сокет, токен, сигналы |
-| `immortality service install\|uninstall\|status` | `LaunchAgent` для фонового демона; все три идемпотентны |
+| `immortality service install\|uninstall\|status` | `LaunchAgent` (macOS) или `systemd --user`-юнит (Linux) для фонового демона; все три идемпотентны |
 
 Глобальные флаги — `--json`, `--model`, `--base-url`, `--log-level`, `--global-config`,
 `--project-config`. `--project <path>` есть только у `start` и `plan`: остальные команды

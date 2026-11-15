@@ -194,19 +194,64 @@ impl StatePaths {
     }
 }
 
-/// macOS application support directory for this user.
+/// The platform's application data directory for this user.
 ///
-/// `$HOME` is used rather than the `directories` crate so the path matches what the
-/// documentation promises and needs no extra dependency.
+/// `$HOME` and the XDG variables are read directly rather than through the `directories` crate so
+/// the paths match what the documentation promises and need no extra dependency.
+///
+/// * macOS: `~/Library/Application Support/immortality`.
+/// * Linux: `$XDG_STATE_HOME/immortality`, or `~/.local/state/immortality` (D-110).
 fn data_dir() -> PathBuf {
-    let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("/nonexistent"), PathBuf::from);
-    home.join("Library")
-        .join("Application Support")
-        .join("immortality")
+    #[cfg(target_os = "macos")]
+    {
+        home()
+            .join("Library")
+            .join("Application Support")
+            .join("immortality")
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // `$XDG_STATE_HOME` rather than `$XDG_DATA_HOME`: D-110 puts state here, and the two are
+        // different conventions for a reason — data is shareable, state is not.
+        xdg("XDG_STATE_HOME", ".local/state").join("immortality")
+    }
 }
 
+/// The platform's configuration directory for this user.
+///
+/// Separate from [`data_dir`] because D-110 says the two must be separable: the global config can
+/// be world-readable while the state is `0700`. On macOS both live under
+/// `~/Library/Application Support`, which is where the documentation already points.
 fn config_dir() -> PathBuf {
-    data_dir()
+    #[cfg(target_os = "macos")]
+    {
+        data_dir()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        xdg("XDG_CONFIG_HOME", ".config").join("immortality")
+    }
+}
+
+/// `$HOME`, or `/nonexistent` when it is unset.
+///
+/// Unconditional rather than platform-gated: on macOS it serves `data_dir`, and on Linux it is the
+/// fallback [`xdg`] needs for both variables. A `cfg` here would compile on macOS and fail only in
+/// a Linux release build — exactly the class D-110 is about.
+fn home() -> PathBuf {
+    std::env::var_os("HOME").map_or_else(|| PathBuf::from("/nonexistent"), PathBuf::from)
+}
+
+/// `$VAR`, or `$HOME/<fallback>` when it is unset or empty.
+///
+/// An empty value is treated as unset on purpose: the XDG spec says so, and `XDG_STATE_HOME=` is
+/// what a shell script that meant to clear the override produces.
+#[cfg(not(target_os = "macos"))]
+fn xdg(variable: &str, fallback: &str) -> PathBuf {
+    match std::env::var_os(variable) {
+        Some(value) if !value.is_empty() => PathBuf::from(value),
+        _ => home().join(fallback),
+    }
 }
 
 #[cfg(test)]
@@ -245,6 +290,7 @@ mod tests {
         assert_eq!(paths.artifacts_dir(), PathBuf::from("/tmp/state/artifacts"));
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn default_state_dir_is_under_application_support() {
         // Not the `directories` crate's `dev.immortality.immortality`: the documented path
@@ -252,6 +298,32 @@ mod tests {
         let dir = data_dir();
         assert!(dir.ends_with("Application Support/immortality"), "{dir:?}");
         assert_eq!(config_dir(), dir);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn default_state_dir_follows_xdg_and_config_is_separate() {
+        // D-110: Linux is a supported platform, not a CI canary. State is `$XDG_STATE_HOME` and
+        // config is `$XDG_CONFIG_HOME`, and they are deliberately *not* the same directory — the
+        // `0700` on state is only meaningful when the readable config is somewhere else.
+        //
+        // The environment is read here, so the assertion is on the shape rather than on a value
+        // this test could set: `std::env::set_var` is `unsafe` in edition 2024 and racy under
+        // parallel tests.
+        let state = data_dir();
+        let config = config_dir();
+        assert!(state.ends_with("immortality"), "{state:?}");
+        assert!(config.ends_with("immortality"), "{config:?}");
+        assert_ne!(state, config, "state and config must be separable");
+        let under = |dir: &Path, suffix: &str| dir.components().any(|part| part.as_os_str() == suffix);
+        assert!(
+            under(&state, ".local") || std::env::var_os("XDG_STATE_HOME").is_some(),
+            "the state default must be ~/.local/state: {state:?}"
+        );
+        assert!(
+            under(&config, ".config") || std::env::var_os("XDG_CONFIG_HOME").is_some(),
+            "the config default must be ~/.config: {config:?}"
+        );
     }
 
     #[test]

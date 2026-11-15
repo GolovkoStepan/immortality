@@ -23,7 +23,11 @@
 
 use std::path::{Path, PathBuf};
 
-use immortality_daemon::service::{Agent, Installed, Launcher, ServiceSpec};
+// Imported from `launchd` directly rather than through the platform-selected re-export: this file
+// drives a scripted `launchctl`, so it is testable on any host, and the re-export points at
+// `systemd` on Linux. The same reasoning as `service_systemd.rs`, which runs everywhere too.
+use immortality_daemon::service::launchd::{Agent, Launcher};
+use immortality_daemon::service::{Installed, ServiceSpec};
 
 /// A launchd stand-in whose "loaded" state is a file.
 ///
@@ -171,7 +175,7 @@ fn a_changed_plist_is_reloaded_in_unload_then_load_order() {
         "the old job must be unloaded before the new one is loaded: {tail:?}"
     );
     assert!(
-        std::fs::read_to_string(agent.plist())
+        std::fs::read_to_string(agent.unit())
             .expect("plist")
             .contains(&fixture.dir.path().join("elsewhere").display().to_string()),
         "the written plist must describe the spec that was installed"
@@ -185,10 +189,10 @@ fn uninstalling_twice_is_not_an_error() {
     let fixture = Fixture::new();
     let agent = fixture.agent();
     agent.install(&fixture.spec()).expect("install");
-    assert!(agent.plist().exists());
+    assert!(agent.unit().exists());
 
     agent.uninstall().expect("first uninstall");
-    assert!(!agent.plist().exists());
+    assert!(!agent.unit().exists());
     assert!(
         !fixture.dir.path().join("launchd").join("loaded").exists(),
         "the job must be unloaded, not just the file deleted"
@@ -249,11 +253,11 @@ fn a_failed_load_names_the_path_and_launchds_own_message() {
     assert!(error.contains("Bootstrap failed: 5"), "{error}");
     assert!(error.contains("Input/output error"), "{error}");
     assert!(
-        error.contains(&agent.plist().display().to_string()),
+        error.contains(&agent.unit().display().to_string()),
         "the message must name the plist: {error}"
     );
     assert!(
-        agent.plist().exists(),
+        agent.unit().exists(),
         "the plist is written before loading; the message says so and must be true"
     );
 }
@@ -272,19 +276,19 @@ fn the_written_plist_is_the_one_launchd_is_told_to_load() {
         .find(|call| call.starts_with("bootstrap"))
         .expect("a load");
     assert!(
-        load.contains(&agent.plist().display().to_string()),
+        load.contains(&agent.unit().display().to_string()),
         "bootstrap was not given this agent's plist: {load}"
     );
     assert_eq!(
-        std::fs::read_to_string(agent.plist()).expect("plist"),
-        immortality_daemon::service::plist(&fixture.spec())
+        std::fs::read_to_string(agent.unit()).expect("plist"),
+        immortality_daemon::service::launchd::plist(&fixture.spec())
     );
 }
 
 /// The plist path helper is what `Agent::discover` uses; keep it reachable for the CLI.
 #[test]
 fn the_discovered_agent_points_into_the_users_launch_agents_directory() {
-    let path: PathBuf = immortality_daemon::service::plist_path().expect("HOME");
+    let path: PathBuf = immortality_daemon::service::launchd::plist_path().expect("HOME");
     assert!(Path::new(&path).ends_with(format!(
         "Library/LaunchAgents/{}.plist",
         immortality_daemon::service::LABEL
