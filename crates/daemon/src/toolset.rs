@@ -240,6 +240,38 @@ mod tests {
     }
 
     #[test]
+    fn the_gate_is_exclusive_until_the_judge_is_installed() {
+        // `with_judge` goes through `Arc::make_mut`, which *clones* instead of mutating once a
+        // second strong reference exists. Nothing about that failure is loud: the run keeps
+        // escalating every unknown program and the journal just has no verdicts. So the
+        // precondition — a gate nobody else has cloned yet — is asserted here rather than
+        // trusted, because the clone that breaks it would be added to `for_task` for an
+        // unrelated reason and nothing else would notice.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let deps = deps(dir.path());
+        assert_eq!(
+            Arc::strong_count(&deps.gate),
+            1,
+            "`for_task` must hand out a gate with no other owner, or `with_judge` cannot reach it"
+        );
+
+        let judge: Arc<dyn immortality_tools::judge::Judge> =
+            immortality_tools::judge::Scripted::new(Vec::new());
+        let deps = deps.with_judge(Arc::clone(&judge), "parse trailing commas");
+
+        assert!(
+            deps.gate.judge().is_some(),
+            "the judge was accepted and dropped, so the run would never consult it"
+        );
+        assert!(
+            deps.gate
+                .judge()
+                .is_some_and(|installed| Arc::ptr_eq(installed, &judge)),
+            "a different judge was installed than the one the caller passed"
+        );
+    }
+
+    #[test]
     fn every_design_tool_is_registered_exactly_once() {
         // The set is a contract with the model: a tool named in the prompt but missing here is an
         // unknown-tool error at the first call, and a name registered twice is a dispatch order
