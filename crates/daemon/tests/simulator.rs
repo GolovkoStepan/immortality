@@ -197,6 +197,7 @@ impl Sim {
                 ..Detectors::default()
             },
             max_subtask_depth: 2,
+            delegation_depth: 0,
             gates: Some(Arc::new(FakeGates::green())),
             reviewer: Some(Arc::new(FakeReviewer)),
             checkpoints: Some(Arc::new(FakeCheckpoints::default())),

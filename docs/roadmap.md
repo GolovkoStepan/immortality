@@ -162,7 +162,7 @@
 | M3.6 ✅ | Git-инструменты (один `git` с закрытым набором подкоманд, D-063) + `WorktreeManager` на задачу + связка с чекпоинтами | commit probe по call-id trailer; worktree пересоздаётся из `HEAD`/чекпоинта; правка вне worktree отклоняется; `push`/`fetch`/`branch -D`/`stash clear` отклонены (D-064) | 2 |
 | M3.7 ✅ | Состояние: `read_state`, `update_state`, `grep_journal` (D-065) | атомарная запись состояния; отказ создать отсутствующий файл; отказ урезать вдвое без `replace`; `since_seq` без повторов при постраничном чтении; журнал защищён от записи | 1 |
 | M3.8 ✅ | Эскалации: хранилище `escalations.json`, дедуп по `key`, ответ, `allow_for_task`, macOS-нотификация через `osascript` (D-067). В демоне очередь — `DirectoryQueue`, а нотификатор — `Silent`: записи в журнал и тосты не подключены | дедуп; повтор возвращает ответ; `blocking` только у `journal_corrupt`; нотификация не падает и не висит в headless-режиме; текст не подставляется в AppleScript | 1.5 |
-| M3.9 ✅ | `delegate`: суб-агент с чистым контекстом в том же worktree, отчёт по id (D-068). В поставке `NoSubAgent`: инструмент отказывает `no_sub_agent`, механизм ждёт подключения | probe по id отчёта; повреждённый отчёт → `Unknown`, не `NotApplied`; повторный вызов не запускает субагента; лимит шагов; `scope` проверяется покомпонентно; вложенное делегирование запрещено | 1 |
+| M3.9 ✅ | `delegate`: суб-агент с чистым контекстом в том же worktree, отчёт по id (D-068). С `0.2` подключён настоящий `BriefRunner` через `SubAgentSlot` | probe по id отчёта; повреждённый отчёт → `Unknown`, не `NotApplied`; повторный вызов не запускает субагента; лимит шагов; `scope` проверяется покомпонентно; вложенное делегирование запрещено | 1 |
 | M3.10 ✅ | Минимальный CLI: сокет-клиент, `attach` (стрим событий), `status`, `escalations`, `approve` | клиент убит и перезапущен; два клиента одновременно | 2 |
 | M3.11 ✅ | Отрисовка `attach` в стиле Claude Code: блоки намерения и результата, проза модели, блок эскалации; ANSI вручную, цвет только на TTY (D-072) | в пайп не уходит ни одного ESC-байта; неизвестный вид записи не теряется; результат без намерения не подписывается чужим инструментом | 0.5 |
 
@@ -290,7 +290,7 @@ D-104, вторая — D-106…D-108, третья подтвердила ис�
 | `max_inference_concurrency` | `core::config` | семафора: две задачи дадут два параллельных запроса | `0.4` |
 | `MacNotifier` | `immortality-tools` | `notifying()` в проде; всегда `Silent` | `0.3` |
 | `JournalQueue` (эскалации в журнал) | `immortality-tools` | подключения: демон на `DirectoryQueue` | `0.3` |
-| `delegate` / `SubAgent` | `immortality-tools` | `NoSubAgent`: вызов отказывает `no_sub_agent` | `0.2` |
+| `delegate` / `SubAgent` | `immortality-tools` | `NoSubAgent`: вызов отказывает `no_sub_agent` | сделано в `0.2` |
 | `gc::disk_state` / `hold_for_io_error` | `core::gc` | `Hold::PausedDisk` не выставляется никем | `0.4` |
 | компактация контекста | `core::context` (`Verdict::Compact`) | реакции раннера: `Compact` — сигнал, не действие | `0.3` |
 | `transcripts_dir` | `core::paths` | записи: транскриптов нет | `0.3` |
@@ -466,15 +466,36 @@ S1 ── M0 ── M1 ── M2 ── M3 ── M4 ── M5 ── M6
 `flush_judgements` **после** `drop(log)`, потому что `run_tool` держит `&mut Journal` и журнал
 single-writer. Проверено на прод-пути: `an_unknown_program_is_decided_by_the_judge_on_the_production_path`.
 
-**5. `delegate`.** `deps.sub_agent` сегодня всегда `NoSubAgent` (`toolset.rs:128`), а
-`ToolsetDeps::delegating` (`toolset.rs:141`) не вызывается ниоткуда — единственный живой путь к
-`delegate` идёт через `toolset::build`, который собирает инструмент над этим полем. Внутри
-`toolset::build` настоящий `SubAgent` собрать нельзя: это и есть агентский цикл, и зависимость
-стала бы циклической (комментарий в `toolset.rs:16-23`). Порядок построения цикл не разрывает:
-`Runner` держит `Arc<Registry>` (`runner.rs:466`), а `Registry` нужен `delegate`, то есть `Runner`
-нельзя создать раньше `Registry`. Поэтому `delegate` — это не правка одной строки в `start.rs`, а
-индирекция (разделяемый слот, заполняемый после постройки обоих), и она заслуживает отдельного
-решения, а не молчаливого `Arc::new(NoSubAgent)`.
+**5. `delegate`. ✅** Цикл разорван слотом: `SubAgentSlot` (`RwLock<Arc<dyn SubAgent>>`) живёт в
+`ToolsetDeps::sub_agent` как `Arc`, `toolset::build` собирает `Delegate::deferred` над ним, а
+`start::execute` заполняет слот **после** того, как `Runner` построен над тем же `Registry` —
+`crates/daemon/src/sub_agent.rs::install` через `wire_delegation`. `RwLock`, а не `OnceLock`: вторая
+установка должна заменять, а не молча ничего не делать, иначе повторный прогон делегировал бы
+первому раннеру. Слот стартует с `NoSubAgent`, который отказывает, — сборка, забывшая установку,
+получает ошибку с подсказкой, а не успешный пустой отчёт.
+
+`BriefRunner` — это настоящий `SubAgent`: он берёт у родителя модель, реестр, гейт, артефакты и
+счётчик, а отличает только лимит шагов из вызова, `gates: Some(BriefGates)` и
+`delegation_depth: 1`. Свой журнал субагент пишет в `delegations/<del_id>/` рядом с отчётом:
+`Journal` single-writer, и родитель держит свой писатель на весь вызов, поэтому общий сегмент
+сломал бы цепочку digest. Отсюда же единица восстановления: `delegate` — один вызов, а не шаги
+субагента, и проба смотрит на отчёт.
+
+`BriefGates` — пустой мир гейтов намеренно: `gates: None` означал бы «проверить нечем» и **валил
+бы** каждый claim с сообщением про ошибку проводки (первый прогон теста это и показал). Пустой
+`Diff` и пустой `DoD` дают `Passed` без обращения к миру, а `Finish::Done` значит ровно «бриф
+сказал, что закончил»; работу судит `DoD` родителя на том же worktree.
+
+Вложенность запрещена не вторым реестром, а глубиной: `Runner::delegation_depth` штампуется в
+`ToolCtx::with_depth`, и `refuse_nested` отвергает при `depth != 0`. Без этого субагент делил бы
+реестр родителя и его `delegate` выглядел бы как вызов верхнего уровня — рекурсия до исчерпания
+бюджетов. Проверено на прод-пути:
+`a_delegated_brief_gets_its_own_journal_and_cannot_delegate_onward` (слот заполнен, свой журнал,
+вложенность отвергнута, шаги субагента не попали в журнал задачи) и
+`a_brief_that_spends_its_steps_is_reported_as_exhausted_not_done` (исчерпание ≠ `done`, гейтов
+бриф не гоняет). Пять саботажей: слот не заполняется, журнал пишется в каталог родителя, глубина
+не штампуется, `Done` выдаётся за любое окончание, бриф наследует гейт-мир родителя. Пятый сначала
+не ловился — пришлось проверять отсутствие `gate_result` в журнале брифа.
 
 **6. Linux — поддерживаемая платформа (D-110). ✅** `service.rs` разделён на
 `service/{mod,launchd,systemd}.rs`: общее (`LABEL`, `RESTART_SECONDS`, `SUBCOMMAND`, `MANAGER`,
@@ -543,6 +564,11 @@ macOS-машине), то есть токен и артефакты журнал
 | права ужесточены на существующем каталоге | миграции нет: чужой каталог не переписывается (`an_existing_state_directory_keeps_the_mode_the_user_chose`) |
 | родитель сокета создан с умалкой | каталог, который `bind` создал сам, обязан быть `0700` (`a_socket_directory_this_call_creates_is_owner_only`) |
 | `with_judge` попал в уже расшаренный гейт | `Arc::make_mut` клонирует и судья молча не встаёт (`the_gate_is_exclusive_until_the_judge_is_installed`) |
+| слот субагента не заполнен после постройки раннера | `delegate` отвечает «no sub-agent wired in», и это неотличимо от модели, которая просто не делегировала (`a_delegated_brief_gets_its_own_journal_and_cannot_delegate_onward`) |
+| журнал брифа пишется в каталог родителя | два писателя на один сегмент; свой журнал не найти (`a_delegated_brief_gets_its_own_journal_and_cannot_delegate_onward`) |
+| глубина не штампуется в `ToolCtx` | субагент делегирует дальше, пока не кончатся бюджеты (`a_delegated_brief_gets_its_own_journal_and_cannot_delegate_onward`) |
+| `Done` за любое окончание брифа | родитель не отличит законченный бриф от исчерпавшего шаги (`a_brief_that_spends_its_steps_is_reported_as_exhausted_not_done`) |
+| бриф наследует гейт-мир родителя | `DoD` родителя гоняется по недоделанному дереву, вердикт про чужую работу (`a_brief_that_spends_its_steps_is_reported_as_exhausted_not_done`) |
 | `systemctl` без `--user` | адресуется системный менеджер: чужой юнит и мнимое «остановлено» (`installing_twice_does_not_disturb_a_healthy_unit` и все прочие) |
 | висячая ссылка в `default.target.wants` | `is-enabled` называет её включённой, а вход ничего не запускает (`a_stale_enablement_link_is_replaced_rather_than_kept`) |
 | юнит на месте, а ссылки нет | install сообщает успех, а при входе ничего не стартует (`a_unit_that_is_already_written_but_disabled_is_enabled_again`) |

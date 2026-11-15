@@ -476,7 +476,7 @@ fn execute(run: Run) -> Result<TaskState, String> {
             // instead of introducing a second number nobody tunes.
             max_wall_time: Duration::from_secs(u64::from(config.loop_.max_steps_per_attempt) * 60),
         },
-        counter: Arc::new(CharsCounter::default()) as Arc<dyn TokenCounter>,
+        counter: Arc::new(CharsCounter::default()) as Arc<dyn TokenCounter + Send + Sync>,
         task: task.clone(),
         detectors: config.detectors.clone(),
         gates: Some(Arc::new(RealGates::new(
@@ -490,6 +490,9 @@ fn execute(run: Run) -> Result<TaskState, String> {
             config.models.utility.clone(),
         ))),
         max_subtask_depth: config.loop_.max_subtask_depth,
+        // The top-level agent. Only a delegated brief is deeper, and it is the only runner
+        // that sets this to anything else.
+        delegation_depth: 0,
         checkpoints: Some(Arc::new(
             crate::checkpoints::GitCheckpoints::new(worktree.path, branch.clone())
                 // A model that left the worktree detached or on another branch would otherwise
@@ -498,6 +501,8 @@ fn execute(run: Run) -> Result<TaskState, String> {
         )),
         clock: Arc::new(immortality_core::time::SystemClock),
     };
+
+    wire_delegation(&runner, &deps.sub_agent);
 
     let mut plan = Plan::load(&project.path, config.loop_.max_subtask_depth)
         .map_err(|error| format!("cannot read the plan: {error}"))?;
@@ -523,6 +528,29 @@ fn execute(run: Run) -> Result<TaskState, String> {
         .close()
         .map_err(|error| format!("cannot close the journal: {error}"))?;
     Ok(outcome.state)
+}
+
+/// Make `delegate` real, once the registry and the runner both exist.
+///
+/// # Why this is a separate call and not part of building the runner
+///
+/// The order is load-bearing and a compiler cannot check it. `toolset::build` creates the registry,
+/// and with it the `delegate` tool over `slot`; the runner needs that registry, so the tool exists
+/// before the runner does. [`crate::sub_agent::install`] then fills the slot. Do it the other way
+/// round and the slot would be replaced with a fresh empty one after the tool had already captured
+/// it — both sides are behind an `Arc`, so nothing would complain and every delegated call would
+/// answer "no sub-agent wired in".
+///
+/// One install per run: every attempt, restart and subtask of this task shares the runner
+/// installed here.
+fn wire_delegation(runner: &Runner, slot: &immortality_tools::SubAgentSlot) {
+    let _brief = crate::sub_agent::install(runner, slot);
+    // A `debug` line rather than `info`: "the daemon wired itself correctly" is not news. What
+    // matters is the test that a delegated call now writes a report.
+    tracing::debug!(
+        wired = slot.is_wired(),
+        "the sub-agent runner is installed behind `delegate`"
+    );
 }
 
 /// The judge for one run: the model, the cache, and what the journal already remembers.

@@ -29,9 +29,9 @@ use immortality_core::artifacts::ArtifactStore;
 use immortality_core::config::Config;
 use immortality_core::ids::TaskId;
 use immortality_tools::{
-    Delegate, DirectoryQueue, EditFile, Escalate, Git, GlobTool, Grep, GrepJournal, KillProcess, NoSubAgent,
-    Notifier, OutputBudget, PolicyGate, ProcessRegistry, ReadFile, ReadProcess, ReadState, Registry, Shell,
-    ShellState, Silent, StartProcess, SubAgent, UpdateState, WriteFile,
+    Delegate, DirectoryQueue, EditFile, Escalate, Git, GlobTool, Grep, GrepJournal, KillProcess, Notifier,
+    OutputBudget, PolicyGate, ProcessRegistry, ReadFile, ReadProcess, ReadState, Registry, Shell, ShellState,
+    Silent, StartProcess, SubAgent, UpdateState, WriteFile,
 };
 
 /// Everything a tool needs that the model never names.
@@ -70,8 +70,11 @@ pub struct ToolsetDeps {
     pub queue_root: PathBuf,
     /// How the human is told a question is waiting.
     pub notifier: Arc<dyn Notifier>,
-    /// The sub-agent runner behind `delegate`.
-    pub sub_agent: Arc<dyn SubAgent>,
+    /// The sub-agent runner behind `delegate`, installed after the registry exists.
+    ///
+    /// A slot rather than the runner itself because the real runner holds the registry this tool
+    /// lives in: the tool has to be built first. See [`immortality_tools::SubAgentSlot`].
+    pub sub_agent: Arc<immortality_tools::SubAgentSlot>,
 }
 
 impl ToolsetDeps {
@@ -125,7 +128,7 @@ impl ToolsetDeps {
             },
             queue_root,
             notifier: Arc::new(Silent),
-            sub_agent: Arc::new(NoSubAgent),
+            sub_agent: Arc::new(immortality_tools::SubAgentSlot::new()),
         })
     }
 
@@ -139,7 +142,7 @@ impl ToolsetDeps {
     /// Use `sub_agent` behind the `delegate` tool.
     #[must_use]
     pub fn delegating(mut self, sub_agent: Arc<dyn SubAgent>) -> Self {
-        self.sub_agent = sub_agent;
+        self.sub_agent = Arc::new(immortality_tools::SubAgentSlot::filled(sub_agent));
         self
     }
 
@@ -206,7 +209,7 @@ pub fn build(deps: &ToolsetDeps) -> immortality_core::Result<Registry> {
             Arc::new(DirectoryQueue::new(&deps.queue_root)),
             Arc::clone(&deps.notifier),
         )),
-        Arc::new(Delegate::new(&deps.queue_root, Arc::clone(&deps.sub_agent))),
+        Arc::new(Delegate::deferred(&deps.queue_root, Arc::clone(&deps.sub_agent))),
         Arc::new(StartProcess::new(Arc::clone(&processes), Arc::clone(&shell))),
         Arc::new(ReadProcess::new(Arc::clone(&processes))),
         Arc::new(KillProcess::new(processes)),

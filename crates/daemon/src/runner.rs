@@ -477,7 +477,12 @@ pub struct Runner {
     /// Step, token and time limits.
     pub limits: AttemptLimits,
     /// Counts tokens for the context budget.
-    pub counter: Arc<dyn TokenCounter>,
+    ///
+    /// `Send + Sync` because [`crate::sub_agent::BriefRunner`] shares the parent's counter: a
+    /// delegated run reports through a tool that the registry holds behind an `Arc`, so the whole
+    /// chain has to cross threads. Counting is a pure function of the text, so requiring it costs
+    /// no implementation anything.
+    pub counter: Arc<dyn TokenCounter + Send + Sync>,
     /// The task the subtask belongs to, for journal records.
     pub task: TaskId,
     /// Detector thresholds, read from config once.
@@ -500,6 +505,15 @@ pub struct Runner {
     /// The runner does not enforce it — the scheduler does — but the brief has to know whether
     /// offering a split would be an offer the tree is going to refuse.
     pub max_subtask_depth: u8,
+    /// How deep in a delegation tree the calls this runner issues sit.
+    ///
+    /// `0` for the top-level agent. [`crate::sub_agent::BriefRunner`] sets `1`, and that is what
+    /// makes a sub-agent's `delegate` call refuse: the tool reads [`immortality_tools::ToolCtx`]'s
+    /// depth, the runner stamps this onto every context it builds, and no second registry is
+    /// needed to enforce "a sub-agent cannot delegate". Without this, the sub-agent would share
+    /// the parent's registry and its `delegate` would look like a top-level call — a delegation
+    /// that recurses until the step budgets run out.
+    pub delegation_depth: u8,
     /// The tree a restart rolls back to.
     ///
     /// `None` means "a restart cannot be done": the decision to roll back is still made (it is
@@ -1839,7 +1853,8 @@ impl<'a> StepLoop<'a> {
             },
         )
         .with_call(call.call_id.clone())
-        .with_task(self.runner.task.clone());
+        .with_task(self.runner.task.clone())
+        .with_depth(self.runner.delegation_depth);
 
         let declared = tool.paths(&args);
         match tool.execute(&ctx, args) {
@@ -2496,6 +2511,7 @@ mod tests {
             task: TaskId::from_suffix("01ARZ3NDEKTSV4RRFFQ69G5FAA"),
             detectors: Detectors::default(),
             max_subtask_depth: 2,
+            delegation_depth: 0,
             // A green world by default: these tests are about the loop, and a fixture that
             // failed its own gates would make every claim test assert a failure instead.
             gates: Some(Arc::new(FakeGates::green())),

@@ -91,6 +91,18 @@ pub struct Delegation {
     pub task: TaskId,
     /// The worktree the sub-agent operates in — the *same* one as the parent, by design.
     pub worktree: PathBuf,
+    /// Where the sub-agent writes its own journal.
+    ///
+    /// Not the task's journal: [`immortality_core::journal::Journal`] is single-writer, and the
+    /// parent holds its writer for the whole delegated call. A second writer on the same segment
+    /// would interleave two chains and break the digest the recovery reader checks, so the
+    /// sub-agent gets `delegations/<del_id>/` instead — beside its report, under the same id.
+    ///
+    /// The consequence is deliberate and worth stating: the parent's recovery sees the `delegate`
+    /// call as one unit, never the sub-agent's steps. That is the right unit anyway — re-running
+    /// the call re-runs the brief — and it is why the report, not the sub-agent's journal, is what
+    /// the probe looks for.
+    pub journal_dir: PathBuf,
 }
 
 /// What a runner produced.
@@ -144,9 +156,102 @@ pub trait SubAgent: Send + Sync + std::fmt::Debug {
     /// and then failed belongs in [`SubAgentOutcome`] with `Finish::Failed`, which does write a
     /// report.
     fn run(&self, delegation: &Delegation) -> Result<SubAgentOutcome, ToolError>;
+
+    /// Whether this is a real runner rather than the placeholder.
+    ///
+    /// Defaulted to `true` so a real implementation says nothing; [`NoSubAgent`] overrides it.
+    /// It exists for one assertion that is otherwise impossible to make cheaply: that the
+    /// production path installed a runner rather than leaving the slot at its refusing default,
+    /// which would look exactly like a model that never called `delegate`.
+    fn is_wired(&self) -> bool {
+        true
+    }
 }
 
-/// A runner that refuses. The honest default before the daemon has wired one.
+/// A `SubAgent` that is installed after the tool is built.
+///
+/// # Why a slot and not a constructor argument
+///
+/// `delegate` is a tool inside the [`crate::Registry`], and the real runner holds that registry:
+/// `Runner { registry: Arc<Registry> }`. Building the runner therefore needs the registry, and
+/// building the tool therefore cannot need the runner. Something has to break the cycle, and a
+/// slot does it without either side knowing about the other.
+///
+/// The alternative — passing the runner in and letting `toolset` depend on the daemon — is the
+/// dependency this crate exists to avoid.
+///
+/// # Why `RwLock` and not `OnceLock`
+///
+/// `OnceLock` would make a second install a silent no-op. A run that re-wires its sub-agent (a
+/// resumed task with a fresh model client, a test replacing the fake) would then keep delegating
+/// to the first one, and nothing would say so. Replacing is the honest operation, and it is
+/// cheap: the lock is taken once per `delegate` call, never per step.
+///
+/// The slot starts at [`NoSubAgent`], which refuses. A build that never installs one gets an
+/// error the model can act on rather than a hang or a fabricated report.
+#[derive(Debug)]
+pub struct SubAgentSlot {
+    inner: std::sync::RwLock<Arc<dyn SubAgent>>,
+}
+
+impl Default for SubAgentSlot {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SubAgentSlot {
+    /// A slot with no runner installed yet.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            inner: std::sync::RwLock::new(Arc::new(NoSubAgent)),
+        }
+    }
+
+    /// A slot holding `runner` from the start.
+    #[must_use]
+    pub fn filled(runner: Arc<dyn SubAgent>) -> Self {
+        Self {
+            inner: std::sync::RwLock::new(runner),
+        }
+    }
+
+    /// Install `runner`, replacing whatever was there.
+    ///
+    /// Poisoning is recovered from rather than propagated, for the same reason as [`Self::current`]:
+    /// the value is one `Arc` assignment, so a panic in some other call cannot have left it torn,
+    /// and taking the daemon down over a lock whose contents are still a valid runner would turn a
+    /// recoverable panic elsewhere into a dead task.
+    pub fn install(&self, runner: Arc<dyn SubAgent>) {
+        let mut guard = self
+            .inner
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = runner;
+    }
+
+    /// The runner currently installed.
+    fn current(&self) -> Arc<dyn SubAgent> {
+        // Poisoning is ignored for a read: the value is an `Arc` to a runner, and a panic in a
+        // *different* call cannot have left it half-written. Recovering beats taking the whole
+        // task down over a lock whose contents are still valid.
+        Arc::clone(
+            &self
+                .inner
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
+    /// Whether a real runner is installed, for tests and for `status`.
+    #[must_use]
+    pub fn is_wired(&self) -> bool {
+        self.current().is_wired()
+    }
+}
+
+/// A `SubAgent` that refuses. The honest default before the daemon has wired one.
 ///
 /// Answering with an empty successful report would be worse: the parent would believe a brief
 /// was carried out.
@@ -163,6 +268,10 @@ impl SubAgent for NoSubAgent {
             })
             .to_string(),
         ))
+    }
+
+    fn is_wired(&self) -> bool {
+        false
     }
 }
 
@@ -200,14 +309,35 @@ fn delegate_schema() -> &'static Value {
 /// Hand a brief to a sub-agent with a clean context.
 pub struct Delegate {
     state_root: PathBuf,
-    runner: Arc<dyn SubAgent>,
+    runner: RunnerSource,
+}
+
+/// Where `Delegate` gets its sub-agent: fixed at construction, or installed later.
+///
+/// Both cases are real. A test builds the tool over a fake and never changes it; the daemon
+/// cannot, because the real runner owns the registry this tool lives in, so it installs the
+/// runner into a [`SubAgentSlot`] after both exist. Keeping both shapes here rather than making
+/// every test build a slot is what keeps the common case honest — `Delegate::new` cannot silently
+/// end up unanswered.
+enum RunnerSource {
+    Fixed(Arc<dyn SubAgent>),
+    Slot(Arc<SubAgentSlot>),
+}
+
+impl RunnerSource {
+    fn get(&self) -> Arc<dyn SubAgent> {
+        match self {
+            Self::Fixed(runner) => Arc::clone(runner),
+            Self::Slot(slot) => slot.current(),
+        }
+    }
 }
 
 impl std::fmt::Debug for Delegate {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Delegate")
             .field("state_root", &self.state_root)
-            .field("runner", &self.runner)
+            .field("runner", &self.runner.get())
             .finish()
     }
 }
@@ -218,7 +348,19 @@ impl Delegate {
     pub fn new(state_root: impl Into<PathBuf>, runner: Arc<dyn SubAgent>) -> Self {
         Self {
             state_root: state_root.into(),
-            runner,
+            runner: RunnerSource::Fixed(runner),
+        }
+    }
+
+    /// A tool whose runner is installed after the registry is built.
+    ///
+    /// The daemon's shape: `Runner` holds `Arc<Registry>`, this tool lives in that registry, and
+    /// the runner cannot exist first.
+    #[must_use]
+    pub fn deferred(state_root: impl Into<PathBuf>, slot: Arc<SubAgentSlot>) -> Self {
+        Self {
+            state_root: state_root.into(),
+            runner: RunnerSource::Slot(slot),
         }
     }
 
@@ -323,9 +465,12 @@ impl Tool for Delegate {
             max_steps,
             task: task.clone(),
             worktree: ctx.gate().worktree().to_path_buf(),
+            // Beside the report, under the same id: the sub-agent's journal is readable on its
+            // own and never competes with the parent's single writer.
+            journal_dir: store.dir().join(id.as_str()),
         };
 
-        let outcome = self.runner.run(&delegation).map_err(|error| {
+        let outcome = self.runner.get().run(&delegation).map_err(|error| {
             // No report is written: nothing durable happened, so the probe correctly says
             // `NotApplied` and recovery may retry the call.
             tracing::debug!(%id, "delegated run did not start: {error}");

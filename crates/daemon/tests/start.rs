@@ -259,6 +259,10 @@ enum Work {
     WriteThenFail,
     /// Run a program no table knows, then claim. The judge decides whether it may run.
     UnknownProgramThenClaim,
+    /// Delegate a brief, then claim. The sub-agent tries to delegate onward first, then works.
+    DelegateThenClaim,
+    /// Delegate with a one-step budget to a sub-agent that never claims, then claim the parent.
+    DelegateToABriefThatRunsOut,
     /// Wait until the test releases it, then claim.
     Wait(Arc<Gate>),
 }
@@ -296,6 +300,9 @@ struct Scripted {
     reviewer_calls: AtomicUsize,
     executor_calls: AtomicUsize,
     judge_calls: AtomicUsize,
+    /// Turns taken by a delegated brief, counted separately so one `Work` can script both the
+    /// parent and the sub-agent from the same `Model`.
+    brief_calls: AtomicUsize,
 }
 
 impl Scripted {
@@ -306,6 +313,7 @@ impl Scripted {
             reviewer_calls: AtomicUsize::new(0),
             executor_calls: AtomicUsize::new(0),
             judge_calls: AtomicUsize::new(0),
+            brief_calls: AtomicUsize::new(0),
         })
     }
 
@@ -323,6 +331,10 @@ impl Scripted {
 
     fn judge_calls(&self) -> usize {
         self.judge_calls.load(Ordering::SeqCst)
+    }
+
+    fn brief_calls(&self) -> usize {
+        self.brief_calls.load(Ordering::SeqCst)
     }
 }
 
@@ -356,6 +368,13 @@ impl Model for Scripted {
         }
 
         self.executor_calls.fetch_add(1, Ordering::SeqCst);
+        // The sub-agent is told apart by its brief, not by call order: `brief_for` writes
+        // `# Subtask: delegated brief`, which appears in no parent prompt. Order-based scripting
+        // would pass even if the tool called the wrong agent.
+        let is_brief = system.contains(BRIEF_MARKER);
+        if is_brief {
+            self.brief_calls.fetch_add(1, Ordering::SeqCst);
+        }
         match &self.work {
             Work::Claim => Ok(claim()),
             Work::WriteThenClaim => {
@@ -371,6 +390,50 @@ impl Model for Scripted {
                         "call_unknown",
                         "shell",
                         r#"{"command":"frobnicate --all"}"#,
+                    ))
+                } else {
+                    Ok(claim())
+                }
+            }
+            Work::DelegateThenClaim if is_brief => {
+                // Three turns, in this order: try to delegate onward (which must be refused),
+                // write a file, claim. The nested attempt is first so the refusal is the first
+                // thing the sub-agent's journal records.
+                match self.brief_calls() {
+                    1 => Ok(Reply::call(
+                        "call_nested",
+                        "delegate",
+                        r#"{"brief":"write the notes file","scope":["src"]}"#,
+                    )),
+                    2 => Ok(write_call("call_brief_write")),
+                    _ => Ok(Reply::call(
+                        "call_brief_finish",
+                        FINISH_SUBTASK,
+                        r#"{"summary":"the brief wrote src/notes.txt"}"#,
+                    )),
+                }
+            }
+            Work::DelegateToABriefThatRunsOut if is_brief => {
+                // Never claims, so the brief's only way out is its step budget.
+                Ok(write_call("call_brief_write"))
+            }
+            Work::DelegateToABriefThatRunsOut => {
+                if self.executor_calls() == 1 {
+                    Ok(Reply::call(
+                        "call_delegate",
+                        "delegate",
+                        r#"{"brief":"write src/notes.txt","scope":["src"],"max_steps":1}"#,
+                    ))
+                } else {
+                    Ok(claim())
+                }
+            }
+            Work::DelegateThenClaim => {
+                if self.executor_calls() == 1 {
+                    Ok(Reply::call(
+                        "call_delegate",
+                        "delegate",
+                        r#"{"brief":"write src/notes.txt with one line","scope":["src"]}"#,
                     ))
                 } else {
                     Ok(claim())
@@ -392,6 +455,9 @@ impl Model for Scripted {
         }
     }
 }
+
+/// The heading `brief_for` writes and no parent prompt contains.
+const BRIEF_MARKER: &str = "# Subtask: delegated brief";
 
 fn claim() -> Reply {
     Reply::call("call_finish", FINISH_SUBTASK, r#"{"summary":"the check passes"}"#)
@@ -531,6 +597,175 @@ fn an_unknown_program_is_decided_by_the_judge_on_the_production_path() {
         "the record has to name the command a human can check"
     );
     assert_eq!(record.event.payload["verdict"], json!("allow"));
+}
+
+#[test]
+fn a_delegated_brief_gets_its_own_journal_and_cannot_delegate_onward() {
+    // The production path for `delegate`, through `start::start`. Three things are asserted that
+    // nothing cheaper can prove:
+    //
+    // 1. the slot the tool was built over is filled — `toolset::build` runs before the `Runner`
+    //    exists, so a build that forgot to install one would leave `NoSubAgent` and the model
+    //    would get "no sub-agent wired in" instead of a report;
+    // 2. the sub-agent writes its own journal under `delegations/<del_id>/`, not into the task's
+    //    journal, which the parent holds open for the whole call;
+    // 3. a sub-agent that calls `delegate` is refused, rather than recurring until budgets run out.
+    let fixture = Fixture::new();
+    fixture.write_plan(SubtaskState::Pending);
+    let model = Scripted::new(Work::DelegateThenClaim);
+    let state = fixture.state(model.clone());
+
+    let answer = start_now(&state, &json!({ "project": fixture.repo, "goal": GOAL }))
+        .expect("the task must be admitted");
+    let task = answer["task"].as_str().expect("a task id").to_string();
+    let project = answer["project"].as_str().expect("a project id").to_string();
+    fixture.wait_for(&task, TaskState::ReadyForReview);
+    Fixture::wait_until_idle(&state);
+
+    // Exactly three: the refused nested `delegate`, the write, the claim. Zero means the slot was
+    // never filled; four or more means the nested call was allowed to start a second sub-agent.
+    assert_eq!(
+        model.brief_calls(),
+        3,
+        "the sub-agent's turns are not the three the script expects"
+    );
+
+    let task_id = immortality_core::ids::TaskId::parse(&task).expect("task id");
+    let store = immortality_core::delegation::DelegationStore::for_task(
+        &fixture.state_root.join("state").join(&project),
+        &task_id,
+    );
+    let reports = store.list().expect("the report directory must exist");
+    assert_eq!(reports.len(), 1, "one delegation was asked for: {reports:?}");
+    let report = &reports[0];
+    assert_eq!(report.finish, immortality_core::delegation::Finish::Done);
+    assert_eq!(report.steps, 3);
+    assert!(
+        report.report.outcome.contains("src/notes.txt"),
+        "the parent must inherit what the brief achieved: {:?}",
+        report.report
+    );
+    assert_eq!(
+        report.report.files_touched,
+        vec![std::path::PathBuf::from("src/notes.txt")],
+        "the files the brief wrote are the report's most useful field"
+    );
+
+    // Its own journal, beside the report and under the same id.
+    let brief_dir = store.dir().join(report.id.as_str());
+    let brief_journal = brief_dir.join("JOURNAL.jsonl");
+    assert!(
+        brief_journal.is_file(),
+        "the sub-agent wrote no journal of its own: {} is missing",
+        brief_journal.display()
+    );
+    let brief_records = JournalReader::open(&brief_dir, &task_id)
+        .expect("brief journal")
+        .read()
+        .expect("brief records")
+        .records;
+    // The nested `delegate` was refused, and the attempt went on to do the work.
+    let refusal = brief_records
+        .iter()
+        .find(|record| record.fields.kind == Kind::ToolCallFailed)
+        .expect("the nested delegate must be recorded as a failed call");
+    assert!(
+        refusal.event.payload.to_string().contains("nested_delegation"),
+        "the refusal has to name the reason: {}",
+        refusal.event.payload
+    );
+    assert!(
+        brief_records
+            .iter()
+            .any(|record| record.fields.kind == Kind::ToolCallCompleted),
+        "the brief did the work after the refusal"
+    );
+
+    // The task's own journal must not contain the sub-agent's steps: one writer per segment, and
+    // the parent's recovery sees a delegation as one call.
+    let parent = fixture.records(&task);
+    assert!(
+        parent
+            .iter()
+            .any(|record| record.fields.kind == Kind::ToolCallIntent
+                && record.event.payload["tool"] == json!("delegate")),
+        "the parent's journal must record the delegation it asked for"
+    );
+    assert!(
+        !parent.iter().any(|record| {
+            record.fields.kind == Kind::ToolCallCompleted
+                && record.event.payload["call"] == json!("call_brief_write")
+        }),
+        "the sub-agent's calls leaked into the task journal"
+    );
+}
+
+#[test]
+fn a_brief_that_spends_its_steps_is_reported_as_exhausted_not_done() {
+    // The one number the sub-agent owns is its step budget, and the parent reads the outcome to
+    // decide whether to retry with a bigger brief or do the work itself. Reporting `done` because
+    // the loop stopped rather than because the model claimed would make that decision blind — and
+    // the parent's own gates would still be green, since the work the brief did was real.
+    //
+    // Driven through the production path, because the mapping lives in the daemon's `SubAgent`
+    // implementation and nowhere else: a unit test of the mapping would not prove that the tool
+    // receives what the daemon produced.
+    let fixture = Fixture::new();
+    fixture.write_plan(SubtaskState::Pending);
+    let model = Scripted::new(Work::DelegateToABriefThatRunsOut);
+    let state = fixture.state(model);
+
+    let answer = start_now(&state, &json!({ "project": fixture.repo, "goal": GOAL }))
+        .expect("the task must be admitted");
+    let task = answer["task"].as_str().expect("a task id").to_string();
+    let project = answer["project"].as_str().expect("a project id").to_string();
+    fixture.wait_for(&task, TaskState::ReadyForReview);
+    Fixture::wait_until_idle(&state);
+
+    let task_id = immortality_core::ids::TaskId::parse(&task).expect("task id");
+    let store = immortality_core::delegation::DelegationStore::for_task(
+        &fixture.state_root.join("state").join(&project),
+        &task_id,
+    );
+    let reports = store.list().expect("reports");
+    assert_eq!(reports.len(), 1, "{reports:?}");
+    let report = &reports[0];
+    assert_eq!(
+        report.finish,
+        immortality_core::delegation::Finish::Exhausted,
+        "a brief that never claimed was reported as finished: {report:?}"
+    );
+    assert_eq!(
+        report.max_steps, 1,
+        "the call's budget is what the report must record"
+    );
+    assert_eq!(report.steps, 1, "one step was all it was allowed");
+    assert!(
+        report.error.as_deref().is_some_and(|why| why.contains("step")),
+        "the parent needs to be told the brief ran out of steps: {:?}",
+        report.error
+    );
+
+    // And the brief ran no gates of its own. A brief works in the parent's worktree, so evaluating
+    // a `DoD` here would spend the parent's acceptance commands on a half-finished tree — and the
+    // verdict would be about the whole worktree, including work the parent did before delegating.
+    // `gate_result` in the brief's journal is that mistake's fingerprint.
+    let brief_records = JournalReader::open(store.dir().join(report.id.as_str()), &task_id)
+        .expect("brief journal")
+        .read()
+        .expect("brief records")
+        .records;
+    assert!(
+        !brief_records
+            .iter()
+            .any(|record| record.fields.kind == Kind::GateResult),
+        "the brief evaluated gates: {:?}",
+        brief_records
+            .iter()
+            .filter(|record| record.fields.kind == Kind::GateResult)
+            .map(|record| record.event.payload.clone())
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]

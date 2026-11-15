@@ -24,6 +24,7 @@ pub mod server;
 pub mod service;
 pub mod start;
 pub mod startup;
+pub mod sub_agent;
 pub mod toolset;
 
 /// Version of the daemon<->client protocol.
