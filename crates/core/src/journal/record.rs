@@ -29,7 +29,21 @@ use crate::domain::{SubtaskId, TaskId, Timestamp};
 
 /// Schema version of a record. Bumped whenever the meaning of an existing `kind` changes or a
 /// `kind` is added; a reader refuses records it does not understand rather than guessing.
-pub const SCHEMA_VERSION: u16 = 1;
+///
+/// # Why a bump does not orphan the journals already on disk
+///
+/// The rule is asymmetric on purpose: a reader accepts every version **up to** its own and
+/// refuses anything newer. Old journals stay readable, because a version-1 journal is a subset of
+/// what this build understands — every one of its kinds still exists and still means the same
+/// thing. A version-2 journal read by a version-1 build is refused, which is the direction that
+/// must fail: the older reader would have to skip a record it cannot name, and a skipped record
+/// might be the one saying a mutating command already ran.
+///
+/// Equality would have made the first bump a migration: `v0.1.2` wrote `v: 1`, so every task
+/// recorded by it would have become unreadable, and recovery blocks a task whose journal it
+/// cannot read ([`crate::Error::JournalVersion`]). Refusing only the future is what lets the
+/// schema grow without a migration step that has to be written before it can be used.
+pub const SCHEMA_VERSION: u16 = 2;
 
 /// The closed set of event kinds.
 ///
@@ -79,6 +93,8 @@ pub enum Kind {
     // ── human interaction ──────────────────────────────────────────────────────
     EscalationOpened,
     EscalationResolved,
+    // ── judgment (D-111) ───────────────────────────────────────────────────────
+    JudgeVerdict,
     // ── environment ────────────────────────────────────────────────────────────
     BackendUnavailable,
     BackendRestored,
@@ -135,6 +151,8 @@ impl Kind {
             // ── human interaction ──────────────────────────────────────────────
             Self::EscalationOpened => "escalation_opened",
             Self::EscalationResolved => "escalation_resolved",
+            // ── judgment (D-111) ───────────────────────────────────────────────
+            Self::JudgeVerdict => "judge_verdict",
             // ── environment ────────────────────────────────────────────────────
             Self::BackendUnavailable => "backend_unavailable",
             Self::BackendRestored => "backend_restored",
@@ -181,9 +199,65 @@ impl Kind {
         Self::CacheStats,
         Self::EscalationOpened,
         Self::EscalationResolved,
+        Self::JudgeVerdict,
         Self::BackendUnavailable,
         Self::BackendRestored,
     ];
+
+    /// A number that is distinct for every variant, and that the compiler forces to stay
+    /// complete.
+    ///
+    /// [`Self::ALL`] is a hand-written list, so a new variant can be added to the enum and
+    /// forgotten there. This `match` is the guard: it has no wildcard arm, so adding a variant
+    /// does not compile until an arm is written, and
+    /// `every_kind_is_covered_by_the_all_table` checks that the arms produce exactly the numbers
+    /// `0..ALL.len()`. A new variant that skips `ALL` therefore fails a test, and so does a
+    /// duplicate number — which is what a hasty arm copied from its neighbour would be.
+    ///
+    /// The value is not part of the schema and never reaches the journal.
+    #[cfg(test)]
+    #[must_use]
+    const fn ordinal(self) -> usize {
+        match self {
+            Self::TaskCreated => 0,
+            Self::TaskState => 1,
+            Self::PlanWritten => 2,
+            Self::PlanEdited => 3,
+            Self::PlanApproved => 4,
+            Self::SubtaskState => 5,
+            Self::SubtaskSplit => 6,
+            Self::AttemptStarted => 7,
+            Self::AttemptFailed => 8,
+            Self::AttemptRestarted => 9,
+            Self::ModelRequest => 10,
+            Self::ModelResponse => 11,
+            Self::ModelStreamAborted => 12,
+            Self::NativeToolcall => 13,
+            Self::TextFallback => 14,
+            Self::InvalidToolcall => 15,
+            Self::ToolCallIntent => 16,
+            Self::ToolCallStarted => 17,
+            Self::ToolCallCompleted => 18,
+            Self::ToolCallFailed => 19,
+            Self::ToolCallUnknown => 20,
+            Self::EffectVerified => 21,
+            Self::EffectAbsent => 22,
+            Self::CheckpointCreated => 23,
+            Self::JournalTruncatedTail => 24,
+            Self::DaemonStarted => 25,
+            Self::DaemonStopped => 26,
+            Self::DaemonRecovered => 27,
+            Self::DetectorFired => 28,
+            Self::Compaction => 29,
+            Self::GateResult => 30,
+            Self::CacheStats => 31,
+            Self::EscalationOpened => 32,
+            Self::EscalationResolved => 33,
+            Self::JudgeVerdict => 34,
+            Self::BackendUnavailable => 35,
+            Self::BackendRestored => 36,
+        }
+    }
 
     /// Whether this event describes a tool call's lifecycle.
     ///
@@ -387,7 +461,11 @@ impl JournalRecord {
     pub fn from_line(line: &str) -> crate::Result<Self> {
         let parsed: LineIn =
             serde_json::from_str(line).map_err(|error| crate::Error::JournalCorrupt(error.to_string()))?;
-        if parsed.v != SCHEMA_VERSION {
+        // Accept every version up to this build's, refuse anything newer. An older journal holds
+        // kinds that all still exist and still mean the same thing, so reading it is safe; a newer
+        // one may hold a kind this build cannot name, and skipping it could skip the record that
+        // says an effect already happened. See [`SCHEMA_VERSION`].
+        if parsed.v > SCHEMA_VERSION {
             return Err(crate::Error::JournalVersion {
                 found: parsed.v,
                 expected: SCHEMA_VERSION,
@@ -542,13 +620,23 @@ mod tests {
 
     #[test]
     fn every_kind_is_covered_by_the_all_table() {
-        // Adding a variant without adding it to `ALL` is caught here: the only way to reach
-        // this assertion with a missing entry is to have changed one but not the other.
-        let serialized: std::collections::BTreeSet<String> = Kind::ALL
-            .iter()
-            .map(|k| serde_json::to_string(k).unwrap())
-            .collect();
-        assert_eq!(serialized.len(), Kind::ALL.len());
+        // A hand-written list drifts. This walks the exhaustive `ordinal` match, which the
+        // compiler refuses to leave incomplete, and requires it to produce exactly one number per
+        // entry of `ALL`. A variant added to the enum but not to `ALL` therefore fails here — the
+        // sabotage that dropped `JudgeVerdict` from `ALL` did not fail the old version of this
+        // test, which only checked that the names in `ALL` were unique.
+        let ordinals: std::collections::BTreeSet<usize> =
+            Kind::ALL.iter().map(|kind| kind.ordinal()).collect();
+        assert_eq!(
+            ordinals.len(),
+            Kind::ALL.len(),
+            "two entries of `ALL` share an ordinal"
+        );
+        assert_eq!(
+            ordinals,
+            (0..Kind::ALL.len()).collect::<std::collections::BTreeSet<usize>>(),
+            "`ALL` is missing a variant, or holds one that `ordinal` does not number"
+        );
     }
 
     #[test]
@@ -601,19 +689,39 @@ mod tests {
     }
 
     #[test]
-    fn wrong_schema_version_is_rejected() {
-        let line = record().to_line().unwrap().replace("\"v\":1", "\"v\":99");
+    fn a_future_schema_version_is_rejected() {
+        // The direction that must fail: a newer journal may hold a kind this build cannot name,
+        // and a reader that skipped it could skip the record saying an effect already happened.
+        let future = SCHEMA_VERSION + 1;
+        let line = record()
+            .to_line()
+            .unwrap()
+            .replace(&format!("\"v\":{SCHEMA_VERSION}"), &format!("\"v\":{future}"));
         let err = JournalRecord::from_line(&line).unwrap_err();
         assert!(
             matches!(
                 err,
                 crate::Error::JournalVersion {
-                    found: 99,
-                    expected: 1
-                }
+                    found,
+                    expected: SCHEMA_VERSION
+                } if found == future
             ),
             "{err}"
         );
+    }
+
+    #[test]
+    fn an_older_schema_version_still_reads() {
+        // `v0.1.2` wrote `v: 1`. Refusing it would have made the first bump a migration: every
+        // task recorded by that release would be unreadable, and recovery blocks a task whose
+        // journal it cannot read. The kinds of version 1 all still exist and still mean the same
+        // thing, so reading one is safe.
+        let line = record().to_line().unwrap().replace(
+            &format!("\"v\":{SCHEMA_VERSION}"),
+            &format!("\"v\":{}", SCHEMA_VERSION - 1),
+        );
+        let parsed = JournalRecord::from_line(&line).expect("an older journal still reads");
+        assert_eq!(parsed, record());
     }
 
     #[test]
