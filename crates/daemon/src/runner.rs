@@ -3910,6 +3910,124 @@ mod tests {
         assert_eq!(reactions(&dir), Vec::<(String, String)>::new());
     }
 
+    /// A tool that prints the same summary with a different measured duration each time.
+    ///
+    /// This is the shape the third live `black_jack` run produced: `bundle exec rspec` printed
+    /// `files took 0.04258 seconds` on every run, so 32 repetitions of one action looked like 32
+    /// distinct observations to D3.
+    #[derive(Debug, Default)]
+    struct Timed {
+        calls: std::sync::atomic::AtomicU32,
+    }
+
+    impl immortality_tools::Tool for Timed {
+        fn name(&self) -> &'static str {
+            "timed"
+        }
+
+        fn schema(&self) -> &'static serde_json::Value {
+            static SCHEMA: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
+            SCHEMA.get_or_init(|| {
+                serde_json::json!({
+                    "type": "object",
+                    "properties": { "path": { "type": "string" } },
+                    "required": ["path"],
+                    "additionalProperties": false
+                })
+            })
+        }
+
+        fn description(&self) -> &'static str {
+            "Print a fixed summary with a different duration each call."
+        }
+
+        fn effect(&self, _args: &Args) -> immortality_tools::Effect {
+            immortality_tools::Effect::Read
+        }
+
+        fn idempotency(&self, _args: &Args) -> Idempotency {
+            Idempotency::Idempotent
+        }
+
+        fn paths(&self, _args: &Args) -> Vec<immortality_tools::PathUse> {
+            Vec::new()
+        }
+
+        fn execute(&self, _ctx: &ToolCtx, _args: Args) -> Result<immortality_tools::ToolResult, ToolError> {
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // 0.04258, 0.04311, 0.03977 — the measured shape, three different values.
+            let duration = ["0.04258", "0.04311", "0.03977"][call as usize % 3];
+            Ok(immortality_tools::ToolResult::text(format!(
+                "files took {duration} seconds to load\n148 examples, 0 failures"
+            )))
+        }
+    }
+
+    #[test]
+    fn a_repeated_command_that_only_changes_its_duration_is_not_a_new_observation() {
+        // The measured defect, end to end through the runner: the same command three times, an
+        // output that differs only in how long the files took. Without the duration stripped from
+        // the digest every output is new, `semantic_run` never leaves 1, and no detector fires at
+        // all — which is exactly how 32 repetitions on the live run went unseen.
+        //
+        // D2 reports here rather than D3 because both read the same digest and the ladder yields
+        // one reaction per step, D2 before D3. That is a property of the ladder, not of this fix;
+        // D3's own counter is pinned at the unit level by
+        // `detect::tests::a_run_that_differs_only_in_its_duration_is_one_output_not_a_series`.
+        let model = Scripted::new(vec![
+            Ok(Reply::call("call_1", "timed", r#"{"path":"a"}"#)),
+            Ok(Reply::call("call_2", "timed", r#"{"path":"b"}"#)),
+            Ok(Reply::call("call_3", "timed", r#"{"path":"c"}"#)),
+            Ok(finish()),
+        ]);
+        let (dir, runner) = runner(model, registry(vec![Arc::new(Timed::default())]));
+        let mut journal = journal(&dir);
+        runner.run(&subtask(), 1, "", &mut journal).expect("run");
+
+        let fired = reactions(&dir);
+        assert!(
+            fired.iter().any(|(detector, _)| detector == "d2"),
+            "the three runs must read as one answer: {fired:?}"
+        );
+    }
+
+    #[test]
+    fn the_model_still_reads_the_raw_duration() {
+        // The other side of the boundary D-109 draws. Normalising the digest is what makes D3
+        // work; normalising the *observation* would hide a `5.0 s` that means something is wrong —
+        // exactly how the D-112 regression showed itself — from the one reader who can act on it.
+        let model = Scripted::new(vec![
+            Ok(Reply::call("call_1", "timed", r#"{"path":"a"}"#)),
+            Ok(finish()),
+        ]);
+        let (dir, runner) = runner(model.clone(), registry(vec![Arc::new(Timed::default())]));
+        let mut journal = journal(&dir);
+        runner.run(&subtask(), 1, "", &mut journal).expect("run");
+
+        let requests = model.requests();
+        let saw_raw = requests.iter().any(|request| {
+            request.messages.iter().any(|message| {
+                message
+                    .content
+                    .as_deref()
+                    .is_some_and(|text| text.contains("files took 0.04258 seconds"))
+            })
+        });
+        assert!(
+            saw_raw,
+            "the model must read the measured duration as printed, not the digest's marker"
+        );
+        let saw_marker = requests.iter().any(|request| {
+            request.messages.iter().any(|message| {
+                message
+                    .content
+                    .as_deref()
+                    .is_some_and(|text| text.contains("<duration>"))
+            })
+        });
+        assert!(!saw_marker, "no observation may carry the digest's marker");
+    }
+
     #[test]
     fn two_different_calls_with_identical_output_are_a_semantic_repeat() {
         // `Echo` prints its argument, so two different arguments print different things. The

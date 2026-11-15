@@ -26,9 +26,11 @@ use crate::config::Detectors;
 
 mod normalize;
 mod stream;
+mod timing;
 
 pub use normalize::normalize;
 pub use stream::{Stream, StreamVerdict};
+pub use timing::strip_durations;
 
 /// One path, in the form the repeat detectors compare.
 ///
@@ -304,6 +306,12 @@ impl Signals {
     /// therefore a step without progress *wherever* it appeared earlier, which is what makes an
     /// A-B-A-B alternation visible. D2's run stays adjacent on purpose — two identical results
     /// with real work in between are not a loop.
+    ///
+    /// The digest is taken over the output with measured durations removed
+    /// ([`strip_durations`]), and the removal stops here: `text` itself is never rewritten, so the
+    /// observation the model reads stays raw. That matters for more than tidiness — a command
+    /// that reports `5.0 s` because something is wrong is a fact the model needs, and normalising
+    /// it away would hide the regression from the one reader who could act on it.
     pub fn record_call(
         &mut self,
         tool: &str,
@@ -325,7 +333,8 @@ impl Signals {
             // Nothing ran, so there is no evidence either way about semantics.
             return;
         };
-        let digest = crate::journal::digest_text(&crate::artifacts::digest_of(text.as_bytes()));
+        let digest =
+            crate::journal::digest_text(&crate::artifacts::digest_of(strip_durations(text).as_bytes()));
         // D3: a digest this attempt has not produced before is a new fact, and any position is
         // enough. This is fed for identical calls too — a repeat of `ls` answers with output the
         // model already has, and a step that learns nothing is exactly what D3 counts.

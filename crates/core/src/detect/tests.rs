@@ -132,6 +132,79 @@ fn the_same_call_with_reordered_keys_counts_as_a_repeat() {
 }
 
 #[test]
+fn a_run_that_differs_only_in_its_duration_is_one_output_not_a_series() {
+    // The measured defect: the third live `black_jack` run repeated one action 32 times and D3
+    // saw a series of 1, because `files took 0.04258 seconds` made every output unique. Without
+    // the duration stripped, this loop leaves `unproductive` at 0 and the detector never fires.
+    let mut signals = Signals::default();
+    for duration in ["0.04258", "0.04311", "0.03977"] {
+        let output = format!("files took {duration} seconds to load\n148 examples, 0 failures");
+        record(
+            &mut signals,
+            "shell",
+            r#"{"command":"bundle exec rspec"}"#,
+            &output,
+        );
+    }
+    assert_eq!(
+        signals.unproductive(),
+        2,
+        "the second and third steps taught the attempt nothing new"
+    );
+}
+
+#[test]
+fn a_duration_that_changes_is_still_the_same_observation_for_d2() {
+    // D2 asks "did the model get the same answer back", and an answer that differs only in a
+    // measured duration is the same answer. This is a deliberate consequence of normalising the
+    // digest, not an accident: the shared digest feeds both detectors.
+    let mut signals = Signals::default();
+    record(
+        &mut signals,
+        "shell",
+        r#"{"command":"cargo test"}"#,
+        "[exited 0 in 0.3 s, 2 line(s) of stdout, 0 of stderr]",
+    );
+    record(
+        &mut signals,
+        "shell",
+        r#"{"command":"cargo  test"}"#,
+        "[exited 0 in 1.7 s, 2 line(s) of stdout, 0 of stderr]",
+    );
+    assert_eq!(
+        signals.semantic_run(),
+        2,
+        "the second answer says the same thing as the first"
+    );
+}
+
+#[test]
+fn a_different_example_count_still_reads_as_a_new_observation() {
+    // The guard against the normaliser growing into the rejected general rule (D-104, D-108):
+    // `4 examples` and `148 examples` are different results, so a run that starts covering more
+    // of the suite must count as progress.
+    let mut signals = Signals::default();
+    record(
+        &mut signals,
+        "shell",
+        r#"{"command":"bundle exec rspec"}"#,
+        "4 examples, 0 failures",
+    );
+    assert_eq!(signals.unproductive(), 0);
+    record(
+        &mut signals,
+        "shell",
+        r#"{"command":"bundle exec rspec spec/a_spec.rb"}"#,
+        "148 examples, 0 failures",
+    );
+    assert_eq!(
+        signals.unproductive(),
+        0,
+        "more examples passing is a new fact, not a repeat"
+    );
+}
+
+#[test]
 fn a_call_with_absolute_and_relative_paths_counts_as_a_repeat() {
     let mut signals = Signals::default();
     let root = PathBuf::from("/work/tree");
