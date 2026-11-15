@@ -13,6 +13,7 @@ pub mod escalate;
 pub mod find;
 pub mod git;
 pub mod glob;
+pub mod judge;
 pub mod notify;
 pub mod policy;
 pub mod processes;
@@ -30,6 +31,7 @@ pub use escalate::{DirectoryQueue, Escalate, EscalationQueue, JournalQueue, answ
 pub use find::GlobTool;
 pub use git::Git;
 pub use glob::{Glob, GlobError, PatternSet};
+pub use judge::{Judge, Judgement};
 pub use notify::{MacNotifier, Notifier, Silent};
 pub use policy::{Denial, Escalation, PathUse, PolicyGate, Verdict};
 pub use processes::{

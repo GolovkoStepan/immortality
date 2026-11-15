@@ -451,6 +451,13 @@ S1 ── M0 ── M1 ── M2 ── M3 ── M4 ── M5 ── M6
 `External` несёт `source`, и вопросом считается только незнакомая программа — `git push`, `curl`,
 `perl -e`, `$CMD` и незакрытый `$(` им не являются.
 
+**4b. Судья: трейт, разбор, вызов. ⏳ без кэша и без проводки в проде.** `tools::judge` —
+`Judge`, `Judgement`, фиксированный `SYSTEM`, `prompt`, `parse_reply` (закрыт по умолчанию:
+проза и `deny` без причины — ошибка). `PolicyGate::with_judge` заполняет слот; вызов стоит внутри
+ветки эскалации, поэтому `yolo` и доверенный хост отключают судью по построению. `Allow` не
+отменяет проверку путей. Осталось: кэш вердиктов в журнале отдельным видом записи и заполнение
+слота в `toolset::build`/`start.rs` через разделяемый слот (как у `delegate`).
+
 **5. `delegate`.** `deps.sub_agent` сегодня всегда `NoSubAgent` (`toolset.rs:128`), а
 `ToolsetDeps::delegating` (`toolset.rs:141`) не вызывается ниоткуда — единственный живой путь к
 `delegate` идёт через `toolset::build`, который собирает инструмент над этим полем. Внутри
@@ -484,6 +491,9 @@ S1 ── M0 ── M1 ── M2 ── M3 ── M4 ── M5 ── M6
 | пайп внутри кавычек | `grep -qE 'a\|b'` — часть шаблона, а не пайп (`a_pipe_inside_quotes_is_part_of_the_pattern_and_is_accepted`) |
 | судья не вызывается для причин политики | deny-список и путь вне worktree не пересматриваются моделью (`only_an_unknown_program_is_a_question_for_the_judge`) |
 | `External` без структурной причины | девятый путь к вердикту не уходит судье молча (`every_external_verdict_carries_a_structural_reason`) |
+| судья разрешил команду | проверка путей не отменяется (`an_allowed_command_still_has_its_paths_checked`) |
+| сбой судьи | эскалация, а не `allow` и не `deny` (`a_judge_failure_escalates_rather_than_allowing_or_denying`) |
+| `yolo` | судья не спрашивается вовсе (`yolo_waives_the_judge_as_well`) |
 | сбой судьи — `escalate`, не `allow` и не `deny` | таймаут и мусорный ответ не меняют вердикт |
 | вердикт судьи переживает `kill -9` | кэш из журнала, а не из памяти |
 | `systemctl`-тесты под `cfg(target_os = "linux")` | Linux-паритет проверяется там, где он есть |

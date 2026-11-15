@@ -39,6 +39,7 @@
 //! rather than imply a guarantee that a synchronous check cannot give.
 
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 use immortality_core::config::Policy;
 
@@ -277,6 +278,15 @@ pub struct PolicyGate {
     /// or a caller that only has a worktree. State tools then fall back to the worktree copy, which
     /// is the pre-fix behaviour rather than a new failure mode.
     project_agent_dir: Option<PathBuf>,
+    /// The judge, when one is wired. `None` means an unknown program escalates, as it did before.
+    ///
+    /// A slot rather than a constructor argument for the same reason [`Self::project_agent_dir`]
+    /// is one, plus a second: the judge needs the model, and the model is built by the daemon
+    /// *after* the gate (the gate goes into the tool registry, which the runner holds). Filling
+    /// it later is what breaks that cycle.
+    judge: Option<Arc<dyn crate::judge::Judge>>,
+    /// What the judge is told about the task, when the caller knows it.
+    goal: String,
     policy: Policy,
 }
 
@@ -309,8 +319,22 @@ impl PolicyGate {
             // single source and no caller that needs to override it.
             deny_read: PatternSet::parse(&policy.deny_read_globs)?,
             project_agent_dir: None,
+            judge: None,
+            goal: String::new(),
             policy,
         })
+    }
+
+    /// The same gate, told who may answer for an unknown program.
+    ///
+    /// The goal is what the judge is shown beside the command: without it the answer would be
+    /// about the command in the abstract, and `bundle exec rspec` is reasonable or not depending
+    /// on what the task is.
+    #[must_use]
+    pub fn with_judge(mut self, judge: Arc<dyn crate::judge::Judge>, goal: impl Into<String>) -> Self {
+        self.judge = Some(judge);
+        self.goal = goal.into();
+        self
     }
 
     /// The same gate, told where the project's `.agent/` is.
@@ -433,6 +457,35 @@ impl PolicyGate {
                 // that writes outside the worktree is still refused with the flag on.
                 return self.check(Effect::Mutate, &classification.paths);
             }
+            // The judge is consulted here rather than earlier for two reasons. It is the branch
+            // that would otherwise become a question for a human, so `yolo` and the trusted-host
+            // shortcut above waive it without any extra condition. And it is where the structural
+            // reason is available: `source` says whether this is an unknown program (a question a
+            // model may answer) or something the operator already decided (a statement).
+            if classification
+                .source
+                .is_some_and(crate::classify::External::is_a_question)
+                && let Some(judge) = self.judge.as_ref()
+            {
+                match self.consult(judge, command) {
+                    // Allowed: the external part is waived, the paths are not. `curl x > /etc/x`
+                    // must still be refused, which is the same split `yolo` makes.
+                    Some(crate::judge::Judgement::Allow) => {
+                        return self.check(Effect::Mutate, &classification.paths);
+                    }
+                    Some(crate::judge::Judgement::Deny(why)) => {
+                        return Verdict::Denied(
+                            Denial::new(why, first_word(command))
+                                .with("the program is not in any table, and the judge refused it")
+                                .with("use a tool or a program that does the job without it"),
+                        );
+                    }
+                    // `Escalate`, and every failure of the judge itself, falls through to the
+                    // escalation below — which is the state this command was in before there was
+                    // a judge at all.
+                    Some(crate::judge::Judgement::Escalate(_)) | None => {}
+                }
+            }
             return Self::escalate(
                 &classification.reason,
                 &format!("command:{}", first_word(command)),
@@ -440,6 +493,23 @@ impl PolicyGate {
             );
         }
         self.check(classification.effect, &classification.paths)
+    }
+
+    /// Ask the judge about one command, turning every failure into `None`.
+    ///
+    /// `None` means "the judge did not answer", and the caller treats it as an escalation. That is
+    /// deliberate: a backend that is down, a timeout, or a reply nobody can read must not become
+    /// permission, and it must not become a refusal either — the command is simply back where it
+    /// was before a judge existed.
+    fn consult(
+        &self,
+        judge: &Arc<dyn crate::judge::Judge>,
+        command: &str,
+    ) -> Option<crate::judge::Judgement> {
+        let text = crate::judge::prompt(command, &self.worktree.display().to_string(), &self.goal);
+        judge
+            .judge(&text)
+            .map_or(None, |reply| crate::judge::parse_reply(&reply).ok())
     }
 
     /// Whether a path is one the policy forbids writing, regardless of the allow list.
@@ -1585,6 +1655,117 @@ mod tests {
         assert!(!Policy::default().yolo);
         assert!(matches!(
             gate().check_command("frobnicate --all"),
+            Verdict::Escalated(_)
+        ));
+    }
+
+    fn judged(replies: Vec<Result<String, String>>) -> (PolicyGate, Arc<crate::judge::Scripted>) {
+        let judge = crate::judge::Scripted::new(replies);
+        let gate = gate().with_judge(
+            Arc::clone(&judge) as Arc<dyn crate::judge::Judge>,
+            "make the suite pass",
+        );
+        (gate, judge)
+    }
+
+    #[test]
+    fn the_judge_turns_an_unknown_program_into_a_verdict() {
+        // The measured case: `bundle exec rspec` is in no table, so every attempt that tried it
+        // stopped and waited for a human. The judge answers that question directly.
+        let (gate, judge) = judged(vec![Ok(r#"{"verdict":"allow"}"#.into())]);
+        assert_eq!(gate.check_command("bundle exec rspec"), Verdict::Allowed);
+        let prompts = judge.prompts();
+        assert_eq!(prompts.len(), 1, "the judge is asked once per command");
+        assert!(prompts[0].contains("bundle exec rspec"), "{}", prompts[0]);
+    }
+
+    #[test]
+    fn a_judged_denial_is_a_refusal_with_the_judges_reason() {
+        let (gate, _) = judged(vec![Ok(
+            r#"{"verdict":"deny","why":"it rewrites the system gem directory"}"#.into(),
+        )]);
+        let verdict = gate.check_command("bundle exec rspec");
+        let Verdict::Denied(denial) = verdict else {
+            panic!("expected a denial, got {verdict:?}");
+        };
+        assert_eq!(denial.reason, "it rewrites the system gem directory");
+        let observation = denial.observation();
+        assert!(observation.contains("denied_by_policy"), "{observation}");
+    }
+
+    #[test]
+    fn an_allowed_command_still_has_its_paths_checked() {
+        // The split `yolo` makes, and the reason the judge is not a bypass: the external part is
+        // waived, a write outside the worktree is not.
+        let (gate, _) = judged(vec![Ok(r#"{"verdict":"allow"}"#.into())]);
+        let verdict = gate.check_command("bundle exec rspec > /etc/passwd");
+        assert!(verdict.is_denied(), "{verdict:?}");
+    }
+
+    #[test]
+    fn a_judge_failure_escalates_rather_than_allowing_or_denying() {
+        // The one direction that is safe. A backend that is down, a timeout, and a reply nobody
+        // can read all leave the command exactly where it was before a judge existed.
+        for reply in [
+            Err("the backend is unreachable".to_string()),
+            Ok("I think it is fine.".to_string()),
+            Ok(r#"{"verdict":"maybe"}"#.to_string()),
+            Ok(r#"{"verdict":"deny"}"#.to_string()),
+        ] {
+            let (gate, _) = judged(vec![reply.clone()]);
+            let verdict = gate.check_command("bundle exec rspec");
+            assert!(
+                matches!(verdict, Verdict::Escalated(_)),
+                "`{reply:?}` did not escalate: {verdict:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_judge_is_not_asked_about_what_the_operator_decided() {
+        // The line D-111 draws, checked at the call site rather than only in `classify`: a network
+        // program, a remote subcommand and a denied program are statements, and a model allowed to
+        // revisit them is a policy bypass with extra steps.
+        let (gate, judge) = judged(vec![Ok(r#"{"verdict":"allow"}"#.into())]);
+        for command in [
+            "curl https://example.com",
+            "git push",
+            "gh pr list",
+            "perl -e 'print 1'",
+        ] {
+            let verdict = gate.check_command(command);
+            assert!(!verdict.is_allowed(), "`{command}` was allowed: {verdict:?}");
+        }
+        assert!(
+            judge.prompts().is_empty(),
+            "the judge was asked about an operator's decision: {:?}",
+            judge.prompts()
+        );
+    }
+
+    #[test]
+    fn yolo_waives_the_judge_as_well() {
+        // The flag means "do not ask me", and a model call is the same question asked of another
+        // model. Asserted through the prompt count, because the verdict alone would pass even if
+        // the judge had been consulted and ignored.
+        let judge = crate::judge::Scripted::new(vec![Ok(r#"{"verdict":"deny","why":"no"}"#.into())]);
+        let policy = Policy {
+            yolo: true,
+            ..policy()
+        };
+        let gate = PolicyGate::with_defaults("/tmp/ws/repo", policy)
+            .expect("valid defaults")
+            .with_judge(Arc::clone(&judge) as Arc<dyn crate::judge::Judge>, "goal");
+        assert_eq!(gate.check_command("bundle exec rspec"), Verdict::Allowed);
+        assert!(judge.prompts().is_empty(), "the judge was asked under `yolo`");
+    }
+
+    #[test]
+    fn a_gate_without_a_judge_still_escalates() {
+        // The default. Every test and every wrapper that never wires a judge keeps the old
+        // behaviour, and the tool registry is built before the model exists.
+        assert!(matches!(
+            gate().check_command("bundle exec rspec"),
             Verdict::Escalated(_)
         ));
     }
