@@ -223,6 +223,18 @@ pub async fn run() -> Result<()> {
     let touched = recover_all(&root, &loaded.config);
 
     let socket = state.daemon_socket();
+
+    // The signal handlers are installed *before* the socket exists, and the order is the whole
+    // point. `bind` publishes the socket path, and that file is the only thing a caller waits for
+    // before deciding the daemon is up — so a `kill` arriving in the window between `bind` and
+    // `tokio::select!` used to hit the default disposition and terminate the process with
+    // `SIGTERM`: no cleanup, socket left behind, the promise in the help text broken. The window
+    // is small but it is the exact moment a supervisor, or a test, signals a starting daemon.
+    //
+    // `Signals::install` registers eagerly rather than returning a future, because an `async fn`
+    // body does not run until first poll — awaiting it inside the `select!` below would install
+    // the handler *after* `bind` and leave the same window open.
+    let signals = Signals::install();
     let listener = server::bind(&socket).map_err(|error| anyhow::anyhow!("{error}"))?;
     // Printed to stderr and not stdout: this line is diagnostics, and stdout is reserved for
     // machine-readable output like every other command.
@@ -235,9 +247,18 @@ pub async fn run() -> Result<()> {
         std::process::id()
     );
 
+    // A signal that could not be installed means the daemon cannot clean up, but it should not
+    // stop serving: the branch waits forever rather than resolving immediately.
+    let shutdown = async {
+        match signals {
+            Some(signals) => signals.wait().await,
+            None => std::future::pending().await,
+        }
+    };
+
     let outcome = tokio::select! {
         outcome = server::serve(listener, server_state, Events::new()) => outcome,
-        signal = shutdown_signal() => {
+        signal = shutdown => {
             // Ctrl-C and `kill` both arrive here. Without this the process dies mid-`accept`,
             // no cleanup runs, and the socket survives — which the help text promised it would
             // not. `SIGKILL` cannot be caught, and `bind` already handles that leftover file.
@@ -328,22 +349,40 @@ fn recover_one(
     Ok(recovered.session_open.then_some(recovered))
 }
 
-/// Resolve on `SIGTERM` or `SIGINT`, naming which arrived.
+/// The `SIGTERM`/`SIGINT` handlers, registered at the moment this is called.
 ///
-/// Never resolves if the handler cannot be installed. That is not a reason to refuse to serve —
-/// the daemon still works, it just cannot clean up on a signal — but it *is* a reason not to
-/// treat "no handler" as "shut down now", which is what returning immediately would do.
-async fn shutdown_signal() -> &'static str {
-    use tokio::signal::unix::{SignalKind, signal};
+/// Registration is deliberately split from waiting. `signal()` installs the handler when it is
+/// *called*, but an `async fn` body does not run until first polled — so a `shutdown_signal()`
+/// awaited inside `tokio::select!` leaves the default disposition in place for everything before
+/// that point. That is the whole window between binding the socket (which is how a caller learns
+/// the daemon is up) and entering the `select!`. A signal there killed the process without
+/// cleanup and left the socket behind, which is the case `sigterm_removes_the_socket_and_the_lock`
+/// exists to catch. Building this value registers; awaiting [`Signals::wait`] only waits.
+struct Signals {
+    terminate: tokio::signal::unix::Signal,
+    interrupt: tokio::signal::unix::Signal,
+}
 
-    let (Ok(mut terminate), Ok(mut interrupt)) =
-        (signal(SignalKind::terminate()), signal(SignalKind::interrupt()))
-    else {
-        return std::future::pending().await;
-    };
-    tokio::select! {
-        _ = terminate.recv() => "SIGTERM",
-        _ = interrupt.recv() => "SIGINT",
+impl Signals {
+    /// Install both handlers, or `None` if the platform refused.
+    ///
+    /// Failing to install is not a reason to refuse to serve: the daemon still works, it just
+    /// cannot clean up on a signal. It *is* a reason not to treat "no handler" as "shut down now".
+    fn install() -> Option<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        match (signal(SignalKind::terminate()), signal(SignalKind::interrupt())) {
+            (Ok(terminate), Ok(interrupt)) => Some(Self { terminate, interrupt }),
+            _ => None,
+        }
+    }
+
+    /// Resolve when one of them arrives, naming which.
+    async fn wait(mut self) -> &'static str {
+        tokio::select! {
+            _ = self.terminate.recv() => "SIGTERM",
+            _ = self.interrupt.recv() => "SIGINT",
+        }
     }
 }
 

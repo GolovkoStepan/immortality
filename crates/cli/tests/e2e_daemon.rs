@@ -626,6 +626,53 @@ fn sigterm_removes_the_socket_and_the_lock() {
 }
 
 #[test]
+fn a_signal_arriving_right_after_the_socket_appears_still_cleans_up() {
+    // The window this pins: `bind` publishes the socket, and that file is how a caller learns the
+    // daemon is up — so it is exactly when a supervisor, or `sigterm_removes_the_socket_and_the_lock`,
+    // sends `SIGTERM`. The handlers used to be registered only on the first poll of an `async fn`
+    // inside `tokio::select!`, i.e. after `bind`, so a signal in that gap hit the default
+    // disposition: the process died with `SIGTERM`, no cleanup ran and the socket survived.
+    //
+    // The test does not widen the window (that needs a sleep in production code); it signals as
+    // soon as the socket exists, which is what the sibling test already does. What it adds is the
+    // *repeat*: the gap is small, so one attempt proves little either way.
+    for attempt in 1..=5 {
+        let daemon = Daemon::new();
+        daemon.journal(1);
+        let mut child = daemon
+            .cli()
+            .arg("serve")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !daemon.socket.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(daemon.socket.exists(), "the daemon never bound its socket");
+
+        let killed = std::process::Command::new("kill")
+            .arg("-TERM")
+            .arg(child.id().to_string())
+            .status()
+            .expect("send SIGTERM");
+        assert!(killed.success());
+
+        let status = child.wait().unwrap();
+        assert!(
+            status.success(),
+            "attempt {attempt}: a signal right after `bind` must still run the cleanup path, got {status:?}"
+        );
+        assert!(
+            !daemon.socket.exists(),
+            "attempt {attempt}: the socket must be gone after SIGTERM"
+        );
+    }
+}
+
+#[test]
 fn init_registers_the_repository_so_the_daemon_can_find_it_later() {
     let daemon = Daemon::new();
     let project = daemon.root().join("fresh");
