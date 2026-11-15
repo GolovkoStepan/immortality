@@ -66,6 +66,9 @@ not this conversation.
 - Children run before their parent. Do not make a subtask depend on its own ancestor.
 - `acceptance` is the human-readable bar for the whole task, and it must name a command or an \
 observable result. A task whose acceptance is \"it works\" has no gate.
+- A `command` is one program, not a pipeline. Never write `cargo test | tail -20`: a shell takes \
+the exit code of the last command in a pipe, so `tail` succeeds and the check is green on a build \
+that did not compile. The plan is rejected if a check contains an unquoted `|`.
 - Prefer few, meaningful subtasks. One subtask per file is not a plan.";
 
 /// The user message: the goal, and whatever the caller knows about the repository.

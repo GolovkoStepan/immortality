@@ -64,8 +64,70 @@ pub enum DodInvalid {
     #[error("check id `{id}` is not a usable file-line key")]
     BadId { id: String },
 
+    #[error(
+        "check `{id}` runs a pipeline, whose exit code is the last command's and not the work's: \
+         `{command}` reports `tail`'s success even when the build failed"
+    )]
+    Piped { id: String, command: String },
+
     #[error("no checks and no review: nothing would gate this subtask")]
     NoGate,
+}
+
+/// Whether `command` contains an unquoted single `|`, which makes its exit code the wrong number.
+///
+/// # The defect this exists for
+///
+/// `/bin/sh` gives a pipeline the exit code of its **last** command. `cargo test 2>&1 | tail -30`
+/// therefore exits `0` whenever `tail` succeeded, which is every time, and the gate reads that as
+/// a green check on a build that did not compile. Measured on the `word-count` journals: eleven
+/// such observations, each one `error[E…]` or `could not compile` in the output and `[exited 0 …]`
+/// in the summary.
+///
+/// # Why a check is refused rather than run differently
+///
+/// The other fix is `set -o pipefail`, which is not in `/bin/sh`: `dash` rejects `set -o pipefail`
+/// outright, and `bash`-as-`sh` accepts the option only by accident of the binary. A gate whose
+/// verdict depends on which shell the machine happens to provide is worse than one that says it
+/// cannot judge the command — the whole point of a gate is that its answer means the same thing
+/// everywhere. Refusing is also the direction that fails closed: a plan with a masked check is
+/// rejected at plan time, not trusted later.
+///
+/// `||` is left alone. It is a deliberate short-circuit, `a || b` is how a command says "try this,
+/// otherwise that", and its status is the status of whichever branch ran.
+///
+/// Only unquoted pipes count: `grep -qE 'a|b' README.md` is an ordinary check and its pipe is the
+/// pattern's. This is the one piece of shell the scan has to understand, and it is why quotes are
+/// tracked byte by byte instead of calling `command.contains('|')`.
+#[must_use]
+pub fn masks_exit_code(command: &str) -> bool {
+    let bytes = command.as_bytes();
+    let mut index = 0;
+    // Which quote opened the current region, if any. A backslash escapes the next byte outside
+    // single quotes, exactly as the shell does.
+    let mut quote: Option<u8> = None;
+    while let Some(&byte) = bytes.get(index) {
+        match byte {
+            b'\\' if quote != Some(b'\'') => index += 1,
+            b'\'' | b'"' => match quote {
+                None => quote = Some(byte),
+                Some(open) if open == byte => quote = None,
+                // The other quote character inside this region is an ordinary byte.
+                Some(_) => {}
+            },
+            // `||` is a logical or, and `|&` is a pipe that also passes stderr. The second one
+            // masks the same way, so only the doubled bar is excused.
+            b'|' if quote.is_none() => {
+                if bytes.get(index + 1) != Some(&b'|') {
+                    return true;
+                }
+                index += 1;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    false
 }
 
 impl Dod {
@@ -100,6 +162,12 @@ impl Dod {
             }
             if !seen.insert(check.id.as_str()) {
                 return Err(DodInvalid::DuplicateId { id: check.id.clone() });
+            }
+            if masks_exit_code(&check.command) {
+                return Err(DodInvalid::Piped {
+                    id: check.id.clone(),
+                    command: check.command.trim().to_string(),
+                });
             }
         }
         Ok(())
@@ -248,5 +316,60 @@ mod tests {
     fn unknown_fields_are_rejected() {
         let err = serde_json::from_str::<Dod>(r#"{"statement":"s","cheks":[]}"#).unwrap_err();
         assert!(err.to_string().contains("cheks"), "{err}");
+    }
+
+    fn one_check(command: &str) -> Dod {
+        Dod {
+            statement: "s".into(),
+            checks: vec![DodCheck {
+                id: "test".into(),
+                command: command.into(),
+                required: true,
+            }],
+            review: false,
+        }
+    }
+
+    #[test]
+    fn a_piped_check_is_rejected_because_its_exit_code_is_the_last_commands() {
+        // The measured defect: `/bin/sh -c 'cargo test 2>&1 | tail -30'` exits 0 on a build that
+        // did not compile, so this check turns a real failure into a green gate.
+        assert_eq!(
+            one_check("cargo test 2>&1 | tail -30").validate().unwrap_err(),
+            DodInvalid::Piped {
+                id: "test".into(),
+                command: "cargo test 2>&1 | tail -30".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_pipe_inside_quotes_is_part_of_the_pattern_and_is_accepted() {
+        // `grep -qE 'a|b' README.md` is an ordinary definition-of-done check. Refusing it would
+        // turn a guard into an obstacle and push plan authors away from `DoD` checks entirely.
+        assert!(one_check("grep -qE 'a|b' README.md").validate().is_ok());
+        assert!(one_check(r#"grep -qE "a|b" README.md"#).validate().is_ok());
+        assert!(one_check(r"grep -qE a\|b README.md").validate().is_ok());
+    }
+
+    #[test]
+    fn a_logical_or_is_not_a_masked_exit_code() {
+        // `a || b` means "try this, otherwise that" and its status is the status of whichever
+        // branch ran. That is a verdict, not a mask, and a plan may ask for it.
+        assert!(one_check("cargo test || cargo test --offline").validate().is_ok());
+    }
+
+    #[test]
+    fn a_pipe_that_also_reroutes_stderr_is_still_a_pipeline() {
+        // `|&` passes stderr through the pipe and takes the last command's status, exactly like
+        // `|`. Excusing everything that begins with a bar would leave the defect reachable.
+        assert!(one_check("cargo test |& tail -5").validate().is_err());
+    }
+
+    #[test]
+    fn quotes_do_not_hide_a_pipe_that_is_really_there() {
+        // The scan must not be talked out of a real pipeline by an unbalanced or closed quote.
+        assert!(one_check("echo 'done' | tee log").validate().is_err());
+        assert!(one_check("echo \"x\" | tee log").validate().is_err());
     }
 }
