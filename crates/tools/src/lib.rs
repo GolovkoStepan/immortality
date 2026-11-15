@@ -24,7 +24,7 @@ pub mod tool;
 pub mod write;
 
 pub use args::Args;
-pub use classify::{Classification, classify};
+pub use classify::{Classification, External, classify};
 pub use delegate::{Delegate, Delegation, NoSubAgent, SubAgent, SubAgentOutcome, probe_delegated};
 pub use escalate::{DirectoryQueue, Escalate, EscalationQueue, JournalQueue, answer_question};
 pub use find::GlobTool;

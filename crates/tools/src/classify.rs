@@ -45,6 +45,14 @@ pub struct Classification {
     pub effect: Effect,
     /// Why, in one clause, so a denial can tell the model something usable.
     pub reason: String,
+    /// Why the line is `External`, when it is.
+    ///
+    /// [`Self::reason`] is prose for the model and may be reworded freely; this is the fact a
+    /// caller may branch on. The judge (D-111) has to answer only for a program the classifier
+    /// does not know, and never for something the operator forbade — reading that out of a
+    /// sentence means a reworded phrase silently disables the judge, and a new phrase containing
+    /// the same words silently enables it where the operator decides.
+    pub source: Option<External>,
     /// Programs recognised in the line, in order, for the journal and for `doctor`.
     pub programs: Vec<String>,
     /// Paths the line names in a position where they are written or entered.
@@ -54,6 +62,39 @@ pub struct Classification {
     /// arguments those are. An unknown program contributes nothing here because it is already
     /// `External` and its command line is not interpreted at all.
     pub paths: Vec<PathUse>,
+}
+
+/// Why a command line took [`Effect::External`].
+///
+/// One variant per way the classifier can reach that verdict, because the callers treat them
+/// differently: only [`External::UnknownProgram`] is a question a model may answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum External {
+    /// A program no table knows. The only case a judge may decide (D-111).
+    UnknownProgram,
+    /// A program the operator's configuration names as unreachable — network, another user, the
+    /// whole system. This is a statement, not an uncertainty, and no model may revise it.
+    NamedProgram,
+    /// A subcommand of a known program that is not classified (`git arcane`, `cargo frobnicate`).
+    UnknownSubcommand,
+    /// A subcommand known to reach the network or write outside the worktree (`git push`,
+    /// `cargo publish`, `gh pr`).
+    RemoteSubcommand,
+    /// A wrapper that runs something the classifier cannot see: `npm run`, `xargs rm`,
+    /// `find -exec`, `perl -e`.
+    OpaqueScript,
+    /// The program name is decided at run time (`$CMD`), so there is nothing to classify.
+    DynamicProgram,
+    /// An unterminated `$(` or backtick: the tail of the line cannot be read.
+    Unreadable,
+}
+
+impl External {
+    /// Whether a model may decide this case.
+    #[must_use]
+    pub const fn is_a_question(self) -> bool {
+        matches!(self, Self::UnknownProgram)
+    }
 }
 
 impl Default for Classification {
@@ -67,6 +108,18 @@ impl Classification {
         Self {
             effect,
             reason: reason.into(),
+            source: None,
+            programs: Vec::new(),
+            paths: Vec::new(),
+        }
+    }
+
+    /// A classification with the structural reason attached, which `External` always carries.
+    fn external(source: External, reason: impl Into<String>) -> Self {
+        Self {
+            effect: Effect::External,
+            reason: reason.into(),
+            source: Some(source),
             programs: Vec::new(),
             paths: Vec::new(),
         }
@@ -76,6 +129,7 @@ impl Classification {
         if other.effect > self.effect {
             self.effect = other.effect;
             self.reason = other.reason;
+            self.source = other.source;
         }
         self.programs.extend(other.programs);
         self.paths.extend(other.paths);
@@ -448,8 +502,8 @@ fn take_substitution(chars: &[char], start: usize) -> Option<(String, usize)> {
 
 fn classify_simple(simple: &Simple) -> Classification {
     if simple.opaque {
-        let mut result = Classification::new(
-            Effect::External,
+        let mut result = Classification::external(
+            External::Unreadable,
             "the command contains an unterminated `$(` or backtick, so its tail cannot be read",
         );
         result.programs = simple
@@ -505,6 +559,7 @@ fn classify_simple(simple: &Simple) -> Classification {
         return Classification {
             effect: Effect::External,
             reason: "the program name comes from a variable, so it cannot be checked".to_string(),
+            source: Some(External::DynamicProgram),
             programs: result.programs,
             paths: result.paths,
         };
@@ -518,6 +573,7 @@ fn classify_simple(simple: &Simple) -> Classification {
     if inner.effect > final_result.effect {
         final_result.effect = inner.effect;
         final_result.reason = inner.reason;
+        final_result.source = inner.source;
     }
     final_result.paths.extend(inner.paths);
     final_result
@@ -560,8 +616,8 @@ fn classify_program(program: &str, args: &[&str]) -> Classification {
     }
 
     if EXTERNAL_PROGRAMS.contains(&program) {
-        return Classification::new(
-            Effect::External,
+        return Classification::external(
+            External::NamedProgram,
             format!("`{program}` reaches the network, another user, or the whole system"),
         );
     }
@@ -575,8 +631,8 @@ fn classify_program(program: &str, args: &[&str]) -> Classification {
     } else {
         // The design's rule: an unfamiliar command is external. An agent needs a named program
         // to do its job; a program nobody listed is one nobody reasoned about.
-        return Classification::new(
-            Effect::External,
+        return Classification::external(
+            External::UnknownProgram,
             format!("`{program}` is not a known command, so it is treated as external"),
         );
     };
@@ -709,7 +765,10 @@ fn classify_git(args: &[&str]) -> Classification {
             if flag_only {
                 Classification::new(Effect::Read, "`git remote` lists")
             } else {
-                Classification::new(Effect::External, "`git remote` reconfigures network remotes")
+                Classification::external(
+                    External::RemoteSubcommand,
+                    "`git remote` reconfigures network remotes",
+                )
             }
         }
         "stash" => {
@@ -745,15 +804,18 @@ fn classify_git(args: &[&str]) -> Classification {
             }
         }
         "push" | "fetch" | "pull" | "clone" | "send-email" | "request-pull" | "lfs" | "submodule"
-        | "archive" => Classification::new(Effect::External, format!("`git {subcommand}` talks to a remote")),
+        | "archive" => Classification::external(
+            External::RemoteSubcommand,
+            format!("`git {subcommand}` talks to a remote"),
+        ),
         "add" | "commit" | "rm" | "mv" | "checkout" | "switch" | "restore" | "reset" | "merge" | "rebase"
         | "cherry-pick" | "revert" | "clean" | "apply" | "am" | "init" | "gc" | "prune" | "update-ref"
         | "symbolic-ref" | "notes" | "bisect" | "sparse-checkout" | "maintenance" | "update-index"
         | "filter-branch" | "repack" | "pack-refs" => {
             Classification::new(Effect::Mutate, format!("`git {subcommand}` writes"))
         }
-        other => Classification::new(
-            Effect::External,
+        other => Classification::external(
+            External::UnknownSubcommand,
             format!("`git {other}` is not a known subcommand"),
         ),
     }
@@ -772,12 +834,12 @@ fn classify_cargo(args: &[&str]) -> Classification {
             format!("`cargo {subcommand}` writes `target/` and runs build code"),
         ),
         "update" | "add" | "remove" | "install" | "uninstall" | "publish" | "search" | "login" | "logout"
-        | "yank" | "owner" | "fetch" => Classification::new(
-            Effect::External,
+        | "yank" | "owner" | "fetch" => Classification::external(
+            External::RemoteSubcommand,
             format!("`cargo {subcommand}` reaches the network or writes outside the worktree"),
         ),
-        other => Classification::new(
-            Effect::External,
+        other => Classification::external(
+            External::UnknownSubcommand,
             format!("`cargo {other}` is not a known subcommand"),
         ),
     }
@@ -796,14 +858,14 @@ fn classify_node(program: &str, args: &[&str]) -> Classification {
         "test" | "t" | "run" => {
             // `npm run` executes a script this module cannot see, so the honest answer is
             // external: the script is in `package.json` and nobody classified it.
-            Classification::new(
-                Effect::External,
+            Classification::external(
+                External::OpaqueScript,
                 format!("`{program} {subcommand}` runs a script whose contents are unknown"),
             )
         }
         "install" | "i" | "add" | "ci" | "publish" | "update" | "link" | "exec" | "dlx" | "create" => {
-            Classification::new(
-                Effect::External,
+            Classification::external(
+                External::RemoteSubcommand,
                 format!("`{program} {subcommand}` reaches the network or writes outside the worktree"),
             )
         }
@@ -817,11 +879,12 @@ fn classify_gh(args: &[&str]) -> Classification {
     };
     match *subcommand {
         "pr" | "issue" | "repo" | "release" | "workflow" | "run" | "api" | "auth" | "gist" | "search"
-        | "codespace" | "extension" | "secret" => {
-            Classification::new(Effect::External, format!("`gh {subcommand}` talks to GitHub"))
-        }
-        other => Classification::new(
-            Effect::External,
+        | "codespace" | "extension" | "secret" => Classification::external(
+            External::RemoteSubcommand,
+            format!("`gh {subcommand}` talks to GitHub"),
+        ),
+        other => Classification::external(
+            External::UnknownSubcommand,
             format!("`gh {other}` is not a known subcommand"),
         ),
     }
@@ -846,8 +909,8 @@ fn classify_in_place(program: &str, args: &[&str]) -> Classification {
         }
         result
     } else if program == "perl" {
-        Classification::new(
-            Effect::External,
+        Classification::external(
+            External::OpaqueScript,
             "`perl -e` runs arbitrary code, so its effect cannot be classified",
         )
     } else {
@@ -871,8 +934,8 @@ fn classify_find(args: &[&str]) -> Classification {
         )
     });
     if dangerous {
-        Classification::new(
-            Effect::External,
+        Classification::external(
+            External::OpaqueScript,
             "`find` with `-delete` or `-exec` runs commands this module cannot see",
         )
     } else {
@@ -1006,6 +1069,65 @@ mod tests {
         ] {
             assert_eq!(effect(command), Effect::External, "{command}");
         }
+    }
+
+    #[test]
+    fn every_external_verdict_carries_a_structural_reason() {
+        // The invariant the judge depends on (D-111): it can only branch on `source`, so an
+        // `External` with no `source` is a case nobody can route — silently, since the effect is
+        // still right. This is the test that fails when a ninth way to reach `External` is added
+        // without deciding what it is.
+        for command in [
+            "curl https://example.com",
+            "frobnicate --now",
+            "git arcane",
+            "git push",
+            "cargo publish",
+            "gh pr list",
+            "npm run build",
+            "perl -e 'print 1'",
+            "find . -exec rm {} +",
+            "$CMD x",
+            "echo $(unterminated",
+            "bundle exec rspec",
+        ] {
+            let classified = classify(command);
+            assert_eq!(classified.effect, Effect::External, "{command}");
+            assert!(
+                classified.source.is_some(),
+                "`{command}` is external with no structural reason: {classified:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_an_unknown_program_is_a_question_for_the_judge() {
+        // The line D-111 draws. A named program and an operator's deny are statements, not
+        // uncertainties: letting a model answer those would let it talk the policy round.
+        let question = |command: &str| {
+            let source = classify(command).source.expect("external carries a source");
+            source.is_a_question()
+        };
+        assert!(
+            question("frobnicate --now"),
+            "an unfamiliar program is the one question"
+        );
+        assert!(
+            question("bundle exec rspec"),
+            "the measured case: a wrapper around a gem"
+        );
+        assert!(!question("curl https://example.com"), "a named external program");
+        assert!(!question("git push"), "a remote subcommand");
+        assert!(
+            !question("git arcane"),
+            "an unknown subcommand of a known program"
+        );
+        assert!(!question("perl -e 'print 1'"), "an opaque script");
+        assert!(!question("$CMD x"), "a program decided at run time");
+        assert!(
+            !question("echo $(unterminated"),
+            "an unreadable line is not something a model can judge"
+        );
     }
 
     #[test]
