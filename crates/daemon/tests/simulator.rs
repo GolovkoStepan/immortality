@@ -202,6 +202,9 @@ impl Sim {
             reviewer: Some(Arc::new(FakeReviewer)),
             checkpoints: Some(Arc::new(FakeCheckpoints::default())),
             clock: Arc::clone(&self.clock) as Arc<dyn immortality_core::time::Clock>,
+            // The simulator's registry has no `escalate`, so there is nothing to collect and
+            // nothing to drain.
+            escalations: Vec::new(),
         }
     }
 }

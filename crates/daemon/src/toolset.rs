@@ -29,9 +29,9 @@ use immortality_core::artifacts::ArtifactStore;
 use immortality_core::config::Config;
 use immortality_core::ids::TaskId;
 use immortality_tools::{
-    Delegate, DirectoryQueue, EditFile, Escalate, Git, GlobTool, Grep, GrepJournal, KillProcess, Notifier,
-    OutputBudget, PolicyGate, ProcessRegistry, ReadFile, ReadProcess, ReadState, Registry, Shell, ShellState,
-    Silent, StartProcess, SubAgent, UpdateState, WriteFile,
+    Delegate, EditFile, Escalate, Git, GlobTool, Grep, GrepJournal, KillProcess, Notifier, OutputBudget,
+    PolicyGate, ProcessRegistry, ReadFile, ReadProcess, ReadState, Registry, Shell, ShellState, Silent,
+    StartProcess, SubAgent, UpdateState, WriteFile,
 };
 
 /// Everything a tool needs that the model never names.
@@ -75,6 +75,12 @@ pub struct ToolsetDeps {
     /// A slot rather than the runner itself because the real runner holds the registry this tool
     /// lives in: the tool has to be built first. See [`immortality_tools::SubAgentSlot`].
     pub sub_agent: Arc<immortality_tools::SubAgentSlot>,
+    /// Where `escalate` collects the journal records it cannot write itself.
+    ///
+    /// The runner holds the task journal's writer for the whole run, so a queue that opened it
+    /// again would be a second writer on one segment — a duplicated `seq` and a broken chain
+    /// (D-117). The tool therefore collects and the runner drains, exactly as the judge does.
+    pub escalations: Arc<immortality_tools::JournalQueue>,
 }
 
 impl ToolsetDeps {
@@ -115,6 +121,7 @@ impl ToolsetDeps {
         let queue_root = task_dir
             .parent()
             .map_or_else(|| task_dir.clone(), Path::to_path_buf);
+        let escalations = Arc::new(immortality_tools::JournalQueue::new(queue_root.clone()));
         Ok(Self {
             task_dir,
             task,
@@ -129,6 +136,7 @@ impl ToolsetDeps {
             queue_root,
             notifier: Arc::new(Silent),
             sub_agent: Arc::new(immortality_tools::SubAgentSlot::new()),
+            escalations,
         })
     }
 
@@ -205,8 +213,8 @@ pub fn build(deps: &ToolsetDeps) -> immortality_core::Result<Registry> {
         Arc::new(ReadState),
         Arc::new(UpdateState),
         Arc::new(GrepJournal),
-        Arc::new(Escalate::new(
-            Arc::new(DirectoryQueue::new(&deps.queue_root)),
+        Arc::new(Escalate::collecting(
+            Arc::clone(&deps.escalations),
             Arc::clone(&deps.notifier),
         )),
         Arc::new(Delegate::deferred(&deps.queue_root, Arc::clone(&deps.sub_agent))),

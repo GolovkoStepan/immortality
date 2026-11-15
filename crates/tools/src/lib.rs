@@ -29,12 +29,12 @@ pub use classify::{Classification, External, classify};
 pub use delegate::{
     Delegate, Delegation, NoSubAgent, SubAgent, SubAgentOutcome, SubAgentSlot, probe_delegated,
 };
-pub use escalate::{DirectoryQueue, Escalate, EscalationQueue, JournalQueue, answer_question};
+pub use escalate::{DirectoryQueue, Escalate, EscalationQueue, JournalQueue, Pending, answer_question};
 pub use find::GlobTool;
 pub use git::Git;
 pub use glob::{Glob, GlobError, PatternSet};
 pub use judge::{Judge, Judgement};
-pub use notify::{MacNotifier, Notifier, Silent};
+pub use notify::{MacNotifier, Notifier, Silent, system};
 pub use policy::{Denial, Escalation, PathUse, PolicyGate, Verdict};
 pub use processes::{
     KillProcess, Liveness, ProcessRecord, ProcessRegistry, ReadProcess, StartProcess, probe_started,

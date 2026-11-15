@@ -174,6 +174,16 @@ impl BriefRunner {
             // believes is on disk.
             checkpoints: None,
             clock: Arc::clone(&parent.clock),
+            // A brief does not drain the escalation collector, and that is deliberate rather
+            // than an omission. `escalate` inside a brief queues the question in the parent's
+            // queue root and under the parent's task id, so the record belongs in the *parent's*
+            // journal; the brief's own journal lives in `delegations/<id>/` and nothing reads it
+            // for metrics. Writing it here would put the record in a file no reader looks at.
+            //
+            // The records therefore stay pending until the parent's `run_tool` returns from the
+            // `delegate` call, which is the next thing that happens and which drains into the
+            // journal a human actually reads.
+            escalations: Vec::new(),
         }
     }
 }

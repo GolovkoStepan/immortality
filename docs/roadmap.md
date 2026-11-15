@@ -288,8 +288,8 @@ D-104, вторая — D-106…D-108, третья подтвердила ис�
 | `backend::while_unavailable` / `escalation` | `core::scheduler` | эскалации через 15 мин простоя | `0.3` |
 | `Queue::next_for_offline`, `Ineligible` | `core::scheduler` | диспетчера офлайн-работы; очередь зовёт только `status` | `0.4` |
 | `max_inference_concurrency` | `core::config` | семафора: две задачи дадут два параллельных запроса | `0.4` |
-| `MacNotifier` | `immortality-tools` | `notifying()` в проде; всегда `Silent` | `0.3` |
-| `JournalQueue` (эскалации в журнал) | `immortality-tools` | подключения: демон на `DirectoryQueue` | `0.3` |
+| `MacNotifier` | `immortality-tools` | сделано в `0.3`: `notify::system()` в `start::execute` | сделано (D-117) |
+| `JournalQueue` (эскалации в журнал) | `immortality-tools` | сделано в `0.3`: собирает, вычерпывает `Runner::flush_escalations` | сделано (D-117) |
 | `delegate` / `SubAgent` | `immortality-tools` | `NoSubAgent`: вызов отказывает `no_sub_agent` | сделано в `0.2` |
 | `gc::disk_state` / `hold_for_io_error` | `core::gc` | `Hold::PausedDisk` не выставляется никем | `0.4` |
 | компактация контекста | `core::context` (`Verdict::Compact`) | реакции раннера: `Compact` — сигнал, не действие | `0.3` |
@@ -643,8 +643,24 @@ health-check, эскалацию по простою и диск-гард — т
 начинать с него стоит и по другой причине: уведомление и `JournalQueue` из пункта 2 включаются
 не «когда готово», а когда есть событие, которое надо доставить.
 
-**2. `JournalQueue` и `MacNotifier` — вместе.** Журнал без уведомления: «эскалация была, человек
-не знал». Уведомление без журнала: «человек знал, доказать нечем».
+**2. `JournalQueue` и `MacNotifier` — вместе. ✅ (D-117).** Журнал без уведомления: «эскалация
+была, человек не знал». Уведомление без журнала: «человек знал, доказать нечем».
+
+Сделано иначе, чем планировалось, потому что планировалось неверно. `JournalQueue` открывал
+журнал на каждое изменение, а демон держит писатель задачи открытым весь прогон: второй писатель
+даёт `seq=1` дважды и `corrupt=true`. Замерено пробой, а не выведено. Теперь очередь **собирает**
+записи (`Pending`), а вычерпывает их тот, кто владеет `&mut Journal` — `Runner::flush_escalations`
+рядом с `flush_judgements`, по тому же образцу, что уже применён к судье. `Escalate::collecting`
+принимает `Arc<JournalQueue>`, чтобы инструмент и раннер держали один коллектор: два экземпляра на
+один путь выглядят одинаково и молча теряют записи.
+
+`notify::system()` выбирает `MacNotifier` на macOS и `Silent` на прочих, и `start::execute` ставит
+его в `ToolsetDeps`. До этого прод ставил `Silent` и не звал `.notifying(...)` вовсе — `MacNotifier`
+существовал только в тестах.
+
+**Чего это не закрывает.** Ответ человека всё ещё не доходит до модели: `blocking_question` и
+`answer_question` в проде не зовёт никто. Обещание `escalate` «the decision arrives as an
+observation» остаётся невыполненным, и это следующий шаг, а не этот.
 
 **3. `backoff`/`should_retry`** подключаются к `LlmModel::complete` (`runner.rs:249`), которая
 сегодня делает одну попытку на шаг (D-046).

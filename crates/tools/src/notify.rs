@@ -31,6 +31,7 @@
 //! because a thread waiting on a child that never exits is a leak with extra steps.
 
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// How long a notification may take before it is abandoned.
@@ -107,6 +108,31 @@ impl MacNotifier {
 /// Where `osascript` lives on macOS.
 pub const DEFAULT_PROGRAM: &str = "/usr/bin/osascript";
 
+/// The notifier a daemon should use: the real one on macOS, silence elsewhere.
+///
+/// # Why the platform decides and not the environment
+///
+/// `osascript` exists only on macOS, so on Linux the honest answer is [`Silent`]: an escalation
+/// is still recorded durably, and `escalations`/`status` still show it. Picking by an environment
+/// variable would make the same binary notify on one machine and not another for a reason nothing
+/// records, and a test would then be exercising a different channel than production.
+///
+/// This is the *daemon's* choice, made once and handed to every task's toolset. A caller that
+/// needs a different channel — a test's recorder — passes its own to
+/// [`crate::Escalate`] or [`immortality_core`]-free `notifying`, because substituting here would
+/// be a global.
+#[must_use]
+pub fn system() -> Arc<dyn Notifier> {
+    #[cfg(target_os = "macos")]
+    {
+        Arc::new(MacNotifier::new())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Arc::new(Silent)
+    }
+}
+
 impl Notifier for MacNotifier {
     fn notify(&self, title: &str, body: &str) {
         // `--` ends option parsing so a body starting with `-e` cannot become a flag.
@@ -173,6 +199,27 @@ mod tests {
     #[test]
     fn the_silent_notifier_records_nothing_and_does_not_panic() {
         Silent.notify("title", "body");
+    }
+
+    #[test]
+    fn the_system_notifier_is_the_real_one_only_where_osascript_exists() {
+        // The production toolset's default used to be `Silent`, so an escalation was written to
+        // disk and nobody was told. `system()` is the one place the choice is made, and the
+        // choice is the platform's: `osascript` does not exist off macOS, and a daemon that
+        // claimed to notify there would be lying in the one function that decides.
+        let notifier = system();
+        let debug = format!("{notifier:?}");
+        if cfg!(target_os = "macos") {
+            assert!(
+                debug.contains("MacNotifier"),
+                "on macOS the daemon must try to notify: {debug}"
+            );
+        } else {
+            assert!(
+                debug.contains("Silent"),
+                "without osascript the honest notifier is silence: {debug}"
+            );
+        }
     }
 
     #[test]

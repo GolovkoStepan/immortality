@@ -441,7 +441,11 @@ fn execute(run: Run) -> Result<TaskState, String> {
         project.path.clone(),
         task.clone(),
     )
-    .map_err(|error| format!("cannot build the tool layer: {error}"))?;
+    .map_err(|error| format!("cannot build the tool layer: {error}"))?
+    // The daemon's one notification channel, chosen once. Without this the toolset's default is
+    // `Silent`, and an escalation would be recorded on disk while nobody was told — the exact
+    // hole the 0.3 milestone is about.
+    .notifying(immortality_tools::system());
 
     let model: Arc<dyn Model> = match model {
         Some(model) => model,
@@ -500,6 +504,9 @@ fn execute(run: Run) -> Result<TaskState, String> {
                 .restoring(branch),
         )),
         clock: Arc::new(immortality_core::time::SystemClock),
+        // The same collector the registry's `escalate` holds: the tool could not write the
+        // journal, and this runner is the only thing holding it (D-117).
+        escalations: vec![Arc::clone(&deps.escalations)],
     };
 
     wire_delegation(&runner, &deps.sub_agent);

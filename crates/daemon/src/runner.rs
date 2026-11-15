@@ -526,6 +526,16 @@ pub struct Runner {
     /// so that a 45-minute attempt ends in microseconds and a golden journal has one spelling per
     /// timestamp; production passes [`SystemClock`].
     pub clock: Arc<dyn Clock>,
+    /// The queues whose escalation records this runner writes.
+    ///
+    /// `escalate` cannot write the journal itself — the runner holds `&mut Journal` for the whole
+    /// run, and a second writer duplicates `seq` and breaks the chain (D-117). So the tool
+    /// collects and [`Self::flush_escalations`] drains, which is why the runner needs a handle on
+    /// the same collector the registry's tool holds.
+    ///
+    /// A `Vec` rather than one queue because a sub-agent's brief writes to its own journal: the
+    /// records must follow the writer, not the task.
+    pub escalations: Vec<Arc<immortality_tools::JournalQueue>>,
 }
 
 impl std::fmt::Debug for Runner {
@@ -1901,6 +1911,7 @@ impl<'a> StepLoop<'a> {
                 .map_err(|error| backend(&error))?;
                 drop(log);
                 self.flush_judgements(journal)?;
+                self.flush_escalations(journal)?;
                 self.signals.record_call(
                     &call.name,
                     &call.arguments,
@@ -1921,6 +1932,7 @@ impl<'a> StepLoop<'a> {
                     .map_err(|error| backend(&error))?;
                 drop(log);
                 self.flush_judgements(journal)?;
+                self.flush_escalations(journal)?;
                 // A refusal is a step that produced no evidence about the task, so it feeds the
                 // D1 run but not D2: the model is being told what was wrong, and that is neither
                 // progress nor a repeated experiment.
@@ -1960,6 +1972,34 @@ impl<'a> StepLoop<'a> {
                     &self.scope,
                 )
                 .map_err(|error| backend(&error))?;
+        }
+        Ok(())
+    }
+
+    /// Write the escalation records the queue collected during this tool call.
+    ///
+    /// The same split as [`Self::flush_judgements`], and for the same reason (D-117). The
+    /// difference is the failure policy: a verdict that cannot be written only costs the next
+    /// restart a second judgement, while an `escalation_opened` that is dropped leaves a question
+    /// on disk with no audit line — and `escalations_total` would then report the silence as
+    /// "nothing was asked".
+    ///
+    /// A write failure is not fatal here for the same reason it is not fatal there: the question
+    /// is already durable in the queue file, and a human can still answer it. Aborting the
+    /// attempt would trade a gap in the log for lost work.
+    fn flush_escalations(&self, journal: &mut Journal) -> Result<(), Ending> {
+        for queue in &self.runner.escalations {
+            for one in queue.take_pending() {
+                // Only the journal of the task this record belongs to. A delegated brief has its
+                // own runner, its own journal and its own queue, so the filter keeps a
+                // sub-agent's question out of the parent's chain rather than breaking it.
+                if one.task != *journal.task() {
+                    continue;
+                }
+                journal
+                    .append_event(self.runner.clock.now(), one.kind, one.payload)
+                    .map_err(|error| backend(&error))?;
+            }
         }
         Ok(())
     }
@@ -2520,6 +2560,9 @@ mod tests {
             // with a named reason instead of silently pretending it rolled back.
             checkpoints: None,
             clock: Arc::new(immortality_core::time::SystemClock),
+            // No collector by default: a test that wants an escalation in the journal builds its
+            // own and asserts on it, rather than every loop test carrying a queue it never uses.
+            escalations: Vec::new(),
         };
         (dir, runner)
     }
@@ -4785,6 +4828,116 @@ mod tests {
         (0..count)
             .map(|index| Ok(Reply::call(format!("call_{index}"), "touch", r#"{"path":"a"}"#)))
             .collect()
+    }
+
+    /// A tool named `escalate` that only collects, which is all the real one does now.
+    ///
+    /// The real `Escalate` needs a gate, a queue directory and a `ToolCtx` with a task; this test
+    /// is about what the *runner* does with the records, so the tool's job stops at handing one
+    /// over. Registering it under the real name matters less than the shape: the runner drains
+    /// after every `run_tool`, whatever the tool was.
+    #[derive(Debug)]
+    struct Asking(Arc<immortality_tools::JournalQueue>, TaskId);
+
+    impl immortality_tools::Tool for Asking {
+        fn name(&self) -> &'static str {
+            "escalate"
+        }
+
+        fn schema(&self) -> &'static serde_json::Value {
+            static SCHEMA: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
+            SCHEMA.get_or_init(|| serde_json::json!({"type": "object", "properties": {}}))
+        }
+
+        fn description(&self) -> &'static str {
+            "Ask the human."
+        }
+
+        fn effect(&self, _args: &Args) -> immortality_tools::Effect {
+            immortality_tools::Effect::External
+        }
+
+        fn idempotency(&self, _args: &Args) -> Idempotency {
+            Idempotency::ByContent
+        }
+
+        fn paths(&self, _args: &Args) -> Vec<immortality_tools::PathUse> {
+            Vec::new()
+        }
+
+        fn execute(
+            &self,
+            _ctx: &immortality_tools::ToolCtx,
+            _args: Args,
+        ) -> Result<immortality_tools::ToolResult, immortality_tools::ToolError> {
+            let entry = immortality_core::escalation::Entry::new(
+                self.1.clone(),
+                "k".to_string(),
+                immortality_core::escalation::EscalationKind::ExternalAction,
+                "?".to_string(),
+                Vec::new(),
+                immortality_core::time::now(),
+            );
+            immortality_tools::EscalationQueue::opened(&*self.0, &entry)
+                .map_err(|error| immortality_tools::ToolError::Refused(error.to_string()))?;
+            Ok(immortality_tools::ToolResult::new("asked", serde_json::json!({})))
+        }
+    }
+
+    #[test]
+    fn a_record_for_another_task_is_not_written_to_this_journal() {
+        // The collector is per task in production, so a record for someone else's task is a bug
+        // rather than a routine case. Writing it anyway would put another task's question into
+        // this chain — and the chain is what recovery trusts, so a record about work this journal
+        // never saw is worse than a dropped record.
+        //
+        // The filter is the only thing standing between "a sub-agent's question" and "a record in
+        // the parent's file", which is why it is pinned here rather than left to the call site.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let queue = Arc::new(immortality_tools::JournalQueue::new(dir.path().join("state")));
+        let mine = TaskId::from_suffix("01ARZ3NDEKTSV4RRFFQ69G5FAJ");
+        let theirs = TaskId::from_suffix("01ARZ3NDEKTSV4RRFFQ69G5FAK");
+        // One record for a task this journal does not belong to, collected before the run.
+        let foreign = immortality_core::escalation::Entry::new(
+            theirs,
+            "other".to_string(),
+            immortality_core::escalation::EscalationKind::ExternalAction,
+            "?".to_string(),
+            Vec::new(),
+            immortality_core::time::now(),
+        );
+        immortality_tools::EscalationQueue::opened(&*queue, &foreign).expect("collect");
+
+        let asking = Arc::new(Asking(Arc::clone(&queue), mine.clone()));
+        let model = Scripted::new(vec![Ok(Reply::call("call_ask", "escalate", "{}")), Ok(finish())]);
+        let (_dir, mut runner) = runner(model, registry(vec![asking]));
+        runner.task = mine.clone();
+        runner.escalations = vec![Arc::clone(&queue)];
+
+        let mut journal = Journal::open(dir.path().join("journal"), mine.clone()).expect("journal");
+        let step = runner.run(&subtask(), 1, "", &mut journal);
+        drop(step);
+        journal.close().expect("close");
+
+        let records = immortality_core::journal::JournalReader::open(dir.path().join("journal"), &mine)
+            .expect("reader")
+            .read()
+            .expect("records")
+            .records;
+        let opened_records: Vec<&immortality_core::journal::JournalRecord> = records
+            .iter()
+            .filter(|record| record.fields.kind == Kind::EscalationOpened)
+            .collect();
+        assert_eq!(
+            opened_records.len(),
+            1,
+            "only this task's record belongs here; got {:?}",
+            opened_records
+                .iter()
+                .map(|record| (&record.fields.task, record.fields.kind))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(opened_records[0].fields.task, mine);
     }
 
     #[test]

@@ -105,38 +105,68 @@ impl EscalationQueue for DirectoryQueue {
     }
 }
 
-/// A queue that also appends the two escalation events to the task's journal.
+/// A queue that also hands the two escalation events to whoever holds the journal.
 ///
-/// The file is the working set and the journal is the audit trail, so the same change goes to
-/// both. The journal is opened per change rather than held: this runs from the daemon and from
-/// `immortality approve`, two processes that must not both hold a writer open on one segment.
-/// The cost is a scan of the tail per escalation, which is nothing next to the human's response
-/// time.
+/// # Why this does not write the journal itself
+///
+/// It used to. The daemon holds the task journal's writer for the whole run, so a queue that
+/// opened a second [`immortality_core::journal::Journal`] on the same directory to append one
+/// record produced `seq=1` twice and a broken digest chain — the reader then calls the journal
+/// corrupt. Measured, not assumed: the probe that showed the duplicate is recorded in
+/// `docs/decisions.md` (D-117).
+///
+/// So the two hooks *collect* and the journal's owner drains them, which is the arrangement the
+/// judge already uses ([`crate::judge::Recorded::take_fresh`]). The difference is that a verdict
+/// may be dropped — the next restart pays for the judgement again — while an escalation may not:
+/// the question is already on disk in the queue file, and a lost `escalation_opened` would make
+/// `escalations_total` under-report exactly the events this milestone is about.
 #[derive(Debug, Clone)]
 pub struct JournalQueue {
     directory: DirectoryQueue,
-    journal_dir: std::path::PathBuf,
+    pending: Arc<std::sync::Mutex<Vec<Pending>>>,
+}
+
+/// One journal record an escalation produced, waiting for the journal's owner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pending {
+    /// Which of the two records this is.
+    pub kind: immortality_core::journal::Kind,
+    /// The task the question belongs to.
+    pub task: TaskId,
+    /// The payload the queue entry renders for this record.
+    pub payload: Value,
 }
 
 impl JournalQueue {
-    /// A queue in `root` whose journal records go to `journal_dir`.
+    /// A queue in `root` whose journal records are collected for the caller to write.
     ///
-    /// `journal_dir` is the `.agent/` directory of the task's worktree, because that is where
-    /// recovery reads from. The two are not the same place by design: the queue must survive a
-    /// lost worktree, the journal must be in the repository for a human to review.
+    /// The queue files live under `root`, one directory per task, exactly as [`DirectoryQueue`].
     #[must_use]
-    pub fn new(root: impl Into<std::path::PathBuf>, journal_dir: impl Into<std::path::PathBuf>) -> Self {
+    pub fn new(root: impl Into<std::path::PathBuf>) -> Self {
         Self {
             directory: DirectoryQueue::new(root),
-            journal_dir: journal_dir.into(),
+            pending: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
-    fn append(&self, task: &TaskId, kind: immortality_core::journal::Kind, payload: Value) -> CoreResult<()> {
-        use immortality_core::journal::Journal;
-        let mut journal = Journal::open(&self.journal_dir, task.clone())?;
-        journal.append_event(journal.now(), kind, payload)?;
-        journal.close()
+    /// The records waiting to be written to a journal, clearing them.
+    ///
+    /// Called by whoever holds `&mut Journal` — in the daemon, the runner after each tool call.
+    /// A poisoned lock returns nothing rather than panicking: the caller is mid-run, and a
+    /// question that is durably on disk but missing its audit line is a gap in the log, not a
+    /// reason to abort work a human is waiting for.
+    #[must_use]
+    pub fn take_pending(&self) -> Vec<Pending> {
+        self.pending
+            .lock()
+            .map(|mut pending| std::mem::take(&mut *pending))
+            .unwrap_or_default()
+    }
+
+    fn push(&self, pending: Pending) {
+        if let Ok(mut slot) = self.pending.lock() {
+            slot.push(pending);
+        }
     }
 }
 
@@ -146,13 +176,21 @@ impl EscalationQueue for JournalQueue {
     }
 
     fn opened(&self, entry: &Entry) -> CoreResult<()> {
-        use immortality_core::journal::Kind;
-        self.append(&entry.task, Kind::EscalationOpened, entry.opened_payload())
+        self.push(Pending {
+            kind: immortality_core::journal::Kind::EscalationOpened,
+            task: entry.task.clone(),
+            payload: entry.opened_payload(),
+        });
+        Ok(())
     }
 
     fn resolved(&self, entry: &Entry) -> CoreResult<()> {
-        use immortality_core::journal::Kind;
-        self.append(&entry.task, Kind::EscalationResolved, entry.resolved_payload())
+        self.push(Pending {
+            kind: immortality_core::journal::Kind::EscalationResolved,
+            task: entry.task.clone(),
+            payload: entry.resolved_payload(),
+        });
+        Ok(())
     }
 }
 
@@ -239,6 +277,16 @@ impl Escalate {
     #[must_use]
     pub fn new(queue: Arc<dyn EscalationQueue>, notifier: Arc<dyn Notifier>) -> Self {
         Self { queue, notifier }
+    }
+
+    /// A tool whose escalation records are collected for the journal's owner.
+    ///
+    /// The concrete type is kept rather than widened at the call site so that "the tool and the
+    /// runner hold the *same* collector" is visible in the signature: two `JournalQueue`s built
+    /// from one path would look identical and silently drop each other's records.
+    #[must_use]
+    pub fn collecting(queue: Arc<JournalQueue>, notifier: Arc<dyn Notifier>) -> Self {
+        Self::new(queue, notifier)
     }
 
     /// A tool backed by a directory and a notifier.
@@ -930,8 +978,30 @@ mod tests {
             }
         }
 
+        fn agent_dir(&self) -> std::path::PathBuf {
+            self.dir.path().join("repo/.agent")
+        }
+
         fn queue(&self) -> JournalQueue {
-            JournalQueue::new(self.dir.path().join("state"), self.dir.path().join("repo/.agent"))
+            JournalQueue::new(self.dir.path().join("state"))
+        }
+
+        /// What the journal's owner does after a tool call: take what the queue collected and
+        /// write it. The queue cannot do this itself — it would be a second writer on a segment
+        /// the runner holds open (D-117).
+        fn drain(&self, queue: &JournalQueue) {
+            let pending = queue.take_pending();
+            if pending.is_empty() {
+                return;
+            }
+            let mut journal =
+                immortality_core::journal::Journal::open(self.agent_dir(), self.task.clone()).unwrap();
+            for one in pending {
+                journal
+                    .append_event(journal.now(), one.kind, one.payload)
+                    .unwrap();
+            }
+            journal.close().unwrap();
         }
 
         fn ctx(&self) -> ToolCtx {
@@ -949,7 +1019,7 @@ mod tests {
         }
 
         fn records(&self) -> Vec<immortality_core::journal::JournalRecord> {
-            immortality_core::journal::JournalReader::open(self.dir.path().join("repo/.agent"), &self.task)
+            immortality_core::journal::JournalReader::open(self.agent_dir(), &self.task)
                 .unwrap()
                 .read()
                 .unwrap()
@@ -958,13 +1028,18 @@ mod tests {
     }
 
     #[test]
-    fn opening_and_answering_write_the_two_journal_events() {
+    fn the_queue_collects_and_the_journal_owner_writes() {
         // The file is the working set; the journal is the audit trail. Both must record the
-        // change, and in the order a human reading them expects: opened, then resolved.
+        // change, in the order a human reading them expects: opened, then resolved.
+        //
+        // The split is not cosmetic. A queue that opened the journal itself would be a second
+        // writer on a segment the runner holds, which duplicates `seq` and breaks the digest
+        // chain — `a_second_writer_on_a_held_journal_breaks_its_chain` in `core` pins that.
         use immortality_core::journal::Kind;
 
         let fixture = JournalFixture::new();
-        let tool = Escalate::new(Arc::new(fixture.queue()), Arc::new(Silent));
+        let queue = fixture.queue();
+        let tool = Escalate::new(Arc::new(queue.clone()), Arc::new(Silent));
         let asked = tool
             .execute(
                 &fixture.ctx(),
@@ -977,18 +1052,23 @@ mod tests {
             .unwrap();
         let id = immortality_core::ids::EscalationId::parse(asked.data["id"].as_str().unwrap()).unwrap();
 
+        // Collected, and *not* written: there is no journal file until the owner takes it.
+        assert_eq!(
+            fixture.records(),
+            Vec::<immortality_core::journal::JournalRecord>::new(),
+            "the queue wrote the journal itself; in the daemon that is a second writer"
+        );
+
+        fixture.drain(&queue);
         let kinds: Vec<Kind> = fixture.records().iter().map(|r| r.fields.kind).collect();
         assert_eq!(kinds, vec![Kind::EscalationOpened]);
 
-        let entry = answer_question(
-            &fixture.queue(),
-            &fixture.task,
-            &id,
-            Answer::AllowForTask,
-            time::now(),
-        )
-        .unwrap();
+        // The same instance, not a fresh one: the records live in the collector, so a caller that
+        // rebuilt the queue would silently drop them. In the daemon there is one collector per
+        // task, held by whoever holds the journal.
+        let entry = answer_question(&queue, &fixture.task, &id, Answer::AllowForTask, time::now()).unwrap();
         assert!(entry.is_allowed());
+        fixture.drain(&queue);
 
         let records = fixture.records();
         let kinds: Vec<Kind> = records.iter().map(|r| r.fields.kind).collect();
@@ -1002,12 +1082,33 @@ mod tests {
     }
 
     #[test]
+    fn a_question_that_was_already_asked_is_not_collected_twice() {
+        // The journal must gain one record per real change, not one per call: the model asks the
+        // same key on every step, and a collector that pushed on every call would make the audit
+        // trail say the human was asked sixty times.
+        let fixture = JournalFixture::new();
+        let queue = fixture.queue();
+        let tool = Escalate::new(Arc::new(queue.clone()), Arc::new(Silent));
+        let args = Args::new(json!({"key": "k", "question": "?", "kind": "external_action"}));
+        tool.execute(&fixture.ctx(), args.clone()).unwrap();
+        tool.execute(&fixture.ctx(), args).unwrap();
+
+        assert_eq!(
+            queue.take_pending().len(),
+            1,
+            "the second ask changed nothing, so it must not be journalled again"
+        );
+        assert!(queue.take_pending().is_empty(), "the take cleared it");
+    }
+
+    #[test]
     fn answering_through_the_shared_path_persists_before_it_journals() {
         // The order matters: a crash between the two leaves a resolved file the human sees and
         // a journal that recovery can catch up from. The reverse would journal an answer the
         // queue does not contain.
         let fixture = JournalFixture::new();
-        let tool = Escalate::new(Arc::new(fixture.queue()), Arc::new(Silent));
+        let queue = fixture.queue();
+        let tool = Escalate::new(Arc::new(queue.clone()), Arc::new(Silent));
         let asked = tool
             .execute(
                 &fixture.ctx(),
@@ -1015,10 +1116,20 @@ mod tests {
             )
             .unwrap();
         let id = immortality_core::ids::EscalationId::parse(asked.data["id"].as_str().unwrap()).unwrap();
-        answer_question(&fixture.queue(), &fixture.task, &id, Answer::Deny, time::now()).unwrap();
+        answer_question(&queue, &fixture.task, &id, Answer::Deny, time::now()).unwrap();
 
-        let store = fixture.queue().load(&fixture.task).unwrap();
+        // The file is already durable, before any journal write.
+        let store = queue.load(&fixture.task).unwrap();
         assert_eq!(store.get(&id).unwrap().answer, Some(Answer::Deny));
+        // And the record is waiting, not lost.
+        let pending = queue.take_pending();
+        assert_eq!(
+            pending.iter().map(|one| one.kind).collect::<Vec<_>>(),
+            vec![
+                immortality_core::journal::Kind::EscalationOpened,
+                immortality_core::journal::Kind::EscalationResolved,
+            ]
+        );
     }
 
     #[test]

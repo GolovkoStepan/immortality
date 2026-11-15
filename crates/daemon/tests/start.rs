@@ -263,6 +263,8 @@ enum Work {
     DelegateThenClaim,
     /// Delegate with a one-step budget to a sub-agent that never claims, then claim the parent.
     DelegateToABriefThatRunsOut,
+    /// Ask the human a question, then claim. The question must reach the journal.
+    EscalateThenClaim,
     /// Wait until the test releases it, then claim.
     Wait(Arc<Gate>),
 }
@@ -376,7 +378,6 @@ impl Model for Scripted {
             self.brief_calls.fetch_add(1, Ordering::SeqCst);
         }
         match &self.work {
-            Work::Claim => Ok(claim()),
             Work::WriteThenClaim => {
                 if self.executor_calls() % 2 == 1 {
                     Ok(write_call("call_write"))
@@ -443,6 +444,10 @@ impl Model for Scripted {
                 gate.block();
                 Ok(claim())
             }
+            Work::EscalateThenClaim if self.executor_calls() == 1 => Ok(ask()),
+            // After the question the model finishes, which is what a run that is not blocked
+            // does: the escalation is a side record, not a stop.
+            Work::Claim | Work::EscalateThenClaim => Ok(claim()),
             Work::WriteThenFail => {
                 // The first executor turn writes; the next one reports the backend gone. The
                 // attempt is then abandoned, which is the state `start --task` has to resume.
@@ -461,6 +466,15 @@ const BRIEF_MARKER: &str = "# Subtask: delegated brief";
 
 fn claim() -> Reply {
     Reply::call("call_finish", FINISH_SUBTASK, r#"{"summary":"the check passes"}"#)
+}
+
+/// The one `escalate` call in this file: a question that neither the plan nor the model answers.
+fn ask() -> Reply {
+    Reply::call(
+        "call_escalate",
+        "escalate",
+        r#"{"key":"network:example.com","question":"May I fetch the docs?","kind":"external_action"}"#,
+    )
 }
 
 fn write_call(id: &str) -> Reply {
@@ -697,6 +711,89 @@ fn a_delegated_brief_gets_its_own_journal_and_cannot_delegate_onward() {
                 && record.event.payload["call"] == json!("call_brief_write")
         }),
         "the sub-agent's calls leaked into the task journal"
+    );
+}
+
+#[test]
+fn a_question_asked_by_the_model_reaches_the_journal_it_is_read_from() {
+    // The 0.3 criterion is read out of the journal as `escalations_total`, and before this the
+    // production toolset wrote the question to the queue file and told the journal *nothing*: the
+    // number was zero not because nobody asked, but because the record was never written.
+    //
+    // Three things have to hold at once for the question to be real, and the test asserts each:
+    //
+    // 1. the record is in the task's journal, so `immortality metrics` can count it;
+    // 2. it is there *once*, and after `tool_call_completed` rather than before the call that
+    //    asked — a record written from the tool would be a second writer on the segment the
+    //    runner holds open, which duplicates `seq` and breaks the chain (D-117);
+    // 3. the question is durably in the queue, so a human can actually answer it.
+    let fixture = Fixture::new();
+    fixture.write_plan(SubtaskState::Pending);
+    let model = Scripted::new(Work::EscalateThenClaim);
+    let state = fixture.state(model);
+
+    let answer = start_now(&state, &json!({ "project": fixture.repo, "goal": GOAL }))
+        .expect("the task must be admitted");
+    let task = answer["task"].as_str().expect("a task id").to_string();
+    let project = answer["project"].as_str().expect("a project id").to_string();
+    fixture.wait_for(&task, TaskState::ReadyForReview);
+    Fixture::wait_until_idle(&state);
+
+    let records = fixture.records(&task);
+    // The journal is not corrupt: a second writer would have made the reader say so.
+    let opened: Vec<&JournalRecord> = records
+        .iter()
+        .filter(|record| record.fields.kind == Kind::EscalationOpened)
+        .collect();
+    assert_eq!(
+        opened.len(),
+        1,
+        "the question must be in the journal exactly once; kinds: {:?}",
+        records
+            .iter()
+            .map(|record| record.fields.kind)
+            .collect::<Vec<_>>()
+    );
+    let opened_at = records
+        .iter()
+        .position(|record| record.fields.kind == Kind::EscalationOpened)
+        .expect("the opened record");
+    let completed_at = records
+        .iter()
+        .position(|record| {
+            record.fields.kind == Kind::ToolCallCompleted
+                && record.event.payload["call"] == json!("call_escalate")
+        })
+        .expect("the escalate call completed");
+    assert!(
+        opened_at > completed_at,
+        "the record is written by the journal's owner after the call, not by the tool: \
+         opened at {opened_at}, completed at {completed_at}"
+    );
+    assert_eq!(opened[0].event.payload["key"], json!("network:example.com"));
+
+    // The metrics a reader of the criterion sees.
+    let report = immortality_core::metrics::compute(&task, &records);
+    assert_eq!(
+        report.escalations_total, 1,
+        "`escalations_total` is the number the milestone is read from: {report:?}"
+    );
+
+    // And the human can answer it, because the queue file is the working set.
+    let task_id = immortality_core::ids::TaskId::parse(&task).expect("task id");
+    let store = immortality_core::escalation::EscalationStore::open(
+        &fixture
+            .state_root
+            .join("state")
+            .join(&project)
+            .join(task_id.as_str()),
+        task_id,
+    )
+    .expect("the queue directory");
+    assert_eq!(
+        store.open_entries().count(),
+        1,
+        "the question is not in the queue, so it cannot be answered"
     );
 }
 
