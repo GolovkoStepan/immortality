@@ -277,9 +277,14 @@ impl immortality_core::journal::Sink for Events {
 /// fails. The permissions are set to `0600` immediately after binding: between `bind` and
 /// `chmod` the socket has the umask's permissions, and a world-writable socket for a few
 /// microseconds is still a window worth closing before anything can connect.
+///
+/// A parent this call *creates* is `0700` for the same reason the state root is: the socket is
+/// useless without the token beside it, and a directory any local account can traverse is a
+/// directory whose contents are one `ls` away.
 pub fn bind(path: &Path) -> immortality_core::Result<UnixListener> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| immortality_core::Error::io(parent, error))?;
+        immortality_core::paths::create_private_dir(parent)
+            .map_err(|error| immortality_core::Error::io(parent, error))?;
     }
     match std::fs::remove_file(path) {
         Ok(()) => {}

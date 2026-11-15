@@ -259,6 +259,21 @@ async fn the_socket_is_created_with_mode_0600() {
 }
 
 #[tokio::test]
+async fn a_socket_directory_this_call_creates_is_owner_only() {
+    // The socket is useless without the token beside it, and the token is in the same directory.
+    // A parent created with the umask (`0755`) hands both to every local account, so the mode has
+    // to be set here rather than inherited — the socket's own `0600` is the second lock.
+    let fixture = Fixture::new();
+    let nested = fixture.state_root.join("nested").join("run");
+    let socket = nested.join("daemon.sock");
+    assert!(!nested.exists(), "the fixture must not have created this");
+    let listener = server::bind(&socket).unwrap();
+    let mode = std::fs::metadata(&nested).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o700, "socket directory mode was {mode:o}");
+    drop(listener);
+}
+
+#[tokio::test]
 async fn binding_twice_replaces_the_stale_socket() {
     // A daemon that was `kill -9`'d leaves its socket file behind, and the next start must not
     // fail with "address already in use" — which is what happens without the removal.

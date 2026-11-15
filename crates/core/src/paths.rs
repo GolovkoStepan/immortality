@@ -80,6 +80,57 @@ pub struct StatePaths {
     root: PathBuf,
 }
 
+/// Permissions on a state directory: owner only.
+///
+/// The state root holds the daemon token, the journals' artefacts and the registry, none of which
+/// another local account has any business reading. `0o700` rather than `0o600` because this is a
+/// directory: the execute bit is what lets the owner traverse it at all.
+pub const STATE_DIR_MODE: u32 = 0o700;
+
+/// Create `dir` and every missing parent, owner-only.
+///
+/// # Why this is not `create_dir_all`
+///
+/// `create_dir_all` creates with the process umask, and on a typical macOS or Linux box that is
+/// `0o755`: every local account can read the daemon token and every journal artefact. The mode
+/// therefore has to be set explicitly, and only for the directories this call creates — a mode
+/// applied to an *existing* directory would silently tighten something the user may have shared
+/// on purpose, and changing permissions on a directory the daemon did not create is a surprise,
+/// not a protection.
+///
+/// # Errors
+/// The directory cannot be created, or its permissions cannot be set on a platform where they
+/// matter.
+pub fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    if dir.is_dir() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(dir)?;
+    set_private_dir_mode(dir)
+}
+
+/// Set `0o700` on a directory this process owns.
+///
+/// Split from [`create_private_dir`] so a caller that created the directory by other means — the
+/// socket's parent in `bind`, which calls `create_dir_all` itself — can still apply the mode
+/// deliberately rather than by inheriting a umask.
+///
+/// A no-op off Unix, where the mode does not exist. The state root is documented as
+/// machine-local, and every supported platform today is Unix.
+///
+/// # Errors
+/// The permissions cannot be set, which leaves a directory readable that should not be.
+pub fn set_private_dir_mode(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(STATE_DIR_MODE))?;
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
+}
+
 impl StatePaths {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self { root: root.into() }
@@ -212,5 +263,53 @@ mod tests {
             paths.transcripts_dir("proj", "tsk_01"),
             PathBuf::from("/tmp/state/state/proj/tsk_01/transcripts")
         );
+    }
+
+    #[cfg(unix)]
+    fn mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::metadata(path).expect("metadata").permissions().mode() & 0o777
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_state_directory_this_call_creates_is_owner_only() {
+        // The measured hole: `create_dir_all` uses the umask, which is `0o755` on a default
+        // macOS account. The token, the registry and every artefact then sit in a directory any
+        // local user can traverse. The mode is asserted, not the umask, because the umask is the
+        // input and this is the answer.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("state");
+        create_private_dir(&root).expect("create");
+        assert_eq!(mode(&root), STATE_DIR_MODE);
+        assert_eq!(STATE_DIR_MODE, 0o700);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_existing_state_directory_keeps_the_mode_the_user_chose() {
+        // The other half of the decision: the daemon changes only what it creates. Silently
+        // tightening a directory the user may have shared on purpose is a surprise, and on a
+        // migration it would rewrite permissions on data the daemon did not make.
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("state");
+        std::fs::create_dir_all(&root).expect("create");
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o750)).expect("chmod");
+        create_private_dir(&root).expect("no-op");
+        assert_eq!(mode(&root), 0o750, "an existing directory was rewritten");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn creating_a_private_directory_also_creates_the_parents() {
+        // The state root is `~/Library/Application Support/immortality`, so on a machine where
+        // the application support directory does not exist yet this call is the one that makes
+        // it. Refusing because a parent is missing would break a first run.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("a").join("b").join("c");
+        create_private_dir(&root).expect("create");
+        assert!(root.is_dir());
+        assert_eq!(mode(&root), STATE_DIR_MODE);
     }
 }

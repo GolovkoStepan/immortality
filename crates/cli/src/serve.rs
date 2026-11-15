@@ -187,6 +187,12 @@ pub fn ensure_token(path: &Path) -> Result<()> {
 pub async fn run() -> Result<()> {
     let state = StatePaths::discover();
     let root = state.root().to_path_buf();
+    // Owner-only before anything is written into it: the token, the registry and the artefacts
+    // all live here, and `create_dir_all` alone would leave them readable by every local account.
+    // Only a directory this call creates is changed; an existing one keeps the mode the user
+    // chose, because silently tightening something they may have shared is a surprise.
+    immortality_core::paths::create_private_dir(&root)
+        .with_context(|| format!("cannot create {}", root.display()))?;
 
     let lock = InstanceLock::acquire(&state.daemon_lock())?;
     // The lock file records the pid for the "another daemon is running" message. Written after
