@@ -257,6 +257,8 @@ enum Work {
     WriteThenClaim,
     /// Write a file, then fail as an unreachable backend would.
     WriteThenFail,
+    /// Run a program no table knows, then claim. The judge decides whether it may run.
+    UnknownProgramThenClaim,
     /// Wait until the test releases it, then claim.
     Wait(Arc<Gate>),
 }
@@ -293,6 +295,7 @@ struct Scripted {
     planner_calls: AtomicUsize,
     reviewer_calls: AtomicUsize,
     executor_calls: AtomicUsize,
+    judge_calls: AtomicUsize,
 }
 
 impl Scripted {
@@ -302,6 +305,7 @@ impl Scripted {
             planner_calls: AtomicUsize::new(0),
             reviewer_calls: AtomicUsize::new(0),
             executor_calls: AtomicUsize::new(0),
+            judge_calls: AtomicUsize::new(0),
         })
     }
 
@@ -315,6 +319,10 @@ impl Scripted {
 
     fn executor_calls(&self) -> usize {
         self.executor_calls.load(Ordering::SeqCst)
+    }
+
+    fn judge_calls(&self) -> usize {
+        self.judge_calls.load(Ordering::SeqCst)
     }
 }
 
@@ -342,6 +350,10 @@ impl Model for Scripted {
             self.reviewer_calls.fetch_add(1, Ordering::SeqCst);
             return Ok(Reply::text(r#"{"verdict":"approve"}"#));
         }
+        if system == immortality_tools::judge::SYSTEM {
+            self.judge_calls.fetch_add(1, Ordering::SeqCst);
+            return Ok(Reply::text(r#"{"verdict":"allow"}"#));
+        }
 
         self.executor_calls.fetch_add(1, Ordering::SeqCst);
         match &self.work {
@@ -349,6 +361,17 @@ impl Model for Scripted {
             Work::WriteThenClaim => {
                 if self.executor_calls() % 2 == 1 {
                     Ok(write_call("call_write"))
+                } else {
+                    Ok(claim())
+                }
+            }
+            Work::UnknownProgramThenClaim => {
+                if self.executor_calls() == 1 {
+                    Ok(Reply::call(
+                        "call_unknown",
+                        "shell",
+                        r#"{"command":"frobnicate --all"}"#,
+                    ))
                 } else {
                     Ok(claim())
                 }
@@ -474,6 +497,40 @@ fn a_goal_becomes_a_task_that_reaches_ready_for_review() {
         String::from_utf8_lossy(&branch.stdout).trim(),
         format!("agent/{task}")
     );
+}
+
+#[test]
+fn an_unknown_program_is_decided_by_the_judge_on_the_production_path() {
+    // D-111's whole point, through `start::start`: a program in no table used to stop the attempt
+    // and wait for a human. Here the model is asked, answers `allow`, and the command runs — and
+    // the verdict it cost is in the journal, so a restart does not pay again.
+    let fixture = Fixture::new();
+    let model = Scripted::new(Work::UnknownProgramThenClaim);
+    let state = fixture.state(model.clone());
+    fixture.write_plan(SubtaskState::Pending);
+
+    let answer = start_now(&state, &json!({ "project": fixture.repo, "goal": GOAL }))
+        .expect("the task must be admitted");
+    let task = answer["task"].as_str().expect("a task id").to_string();
+    fixture.wait_for(&task, TaskState::ReadyForReview);
+    Fixture::wait_until_idle(&state);
+
+    assert_eq!(
+        model.judge_calls(),
+        1,
+        "the judge was not wired into the production gate, so the unknown program escalated"
+    );
+    let record = fixture
+        .records(&task)
+        .into_iter()
+        .find(|record| record.fields.kind == Kind::JudgeVerdict)
+        .expect("the verdict must be in the journal, or every restart pays again");
+    assert_eq!(
+        record.event.payload["command"],
+        json!("frobnicate --all"),
+        "the record has to name the command a human can check"
+    );
+    assert_eq!(record.event.payload["verdict"], json!("allow"));
 }
 
 #[test]

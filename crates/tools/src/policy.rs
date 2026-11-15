@@ -330,11 +330,30 @@ impl PolicyGate {
     /// The goal is what the judge is shown beside the command: without it the answer would be
     /// about the command in the abstract, and `bundle exec rspec` is reasonable or not depending
     /// on what the task is.
-    #[must_use]
-    pub fn with_judge(mut self, judge: Arc<dyn crate::judge::Judge>, goal: impl Into<String>) -> Self {
+    ///
+    /// # Why this is a setter and not a constructor argument
+    ///
+    /// The gate is built by the tool layer, which must not depend on the model, and the judge
+    /// needs the model, which the daemon builds after the tools. The slot is what breaks that
+    /// cycle: the daemon fills it in after both exist, and every clone of the gate after that
+    /// point shares the same `Arc`. A constructor argument would require the model first, which
+    /// would put the model behind the tool layer.
+    pub fn set_judge(&mut self, judge: Arc<dyn crate::judge::Judge>, goal: impl Into<String>) {
         self.judge = Some(judge);
         self.goal = goal.into();
+    }
+
+    /// The same gate, told who may answer for an unknown program.
+    #[must_use]
+    pub fn with_judge(mut self, judge: Arc<dyn crate::judge::Judge>, goal: impl Into<String>) -> Self {
+        self.set_judge(judge, goal);
         self
+    }
+
+    /// The judge, when one is wired.
+    #[must_use]
+    pub fn judge(&self) -> Option<&Arc<dyn crate::judge::Judge>> {
+        self.judge.as_ref()
     }
 
     /// The same gate, told where the project's `.agent/` is.

@@ -183,6 +183,7 @@ pub async fn start(state: &ServerState, params: &Value) -> Result<Value, RpcErro
             // A fresh admission has no outage behind it: the journal was just created.
             None,
         ),
+        goal: goal.clone().unwrap_or_default(),
         model: state.model.clone(),
         events: state.events.clone(),
     };
@@ -252,7 +253,8 @@ fn resume(state: &ServerState, task: &str) -> Result<Value, RpcError> {
         project: project.clone(),
         task: task.clone(),
         task_dir,
-        start: Start::resuming(current, goal, outage),
+        start: Start::resuming(current, goal.clone(), outage),
+        goal,
         model: state.model.clone(),
         events: state.events.clone(),
     };
@@ -329,6 +331,11 @@ struct Run {
     task: TaskId,
     task_dir: PathBuf,
     start: Start,
+    /// The task's goal, from `task_created` or the admission request.
+    ///
+    /// Separate from `start.strategy`, which is what makes *this pass* different: the judge is
+    /// asked whether a command fits the task, and the pass's strategy says nothing about that.
+    goal: String,
     /// The model a test injected, or `None` to build the real client on the thread.
     model: Option<Arc<dyn Model>>,
     /// Where the run announces its records, so `attach` sees a progressing task rather than only
@@ -418,6 +425,7 @@ fn execute(run: Run) -> Result<TaskState, String> {
         task,
         task_dir,
         start,
+        goal,
         model,
         events,
     } = run;
@@ -434,7 +442,6 @@ fn execute(run: Run) -> Result<TaskState, String> {
         task.clone(),
     )
     .map_err(|error| format!("cannot build the tool layer: {error}"))?;
-    let registry = toolset::build(&deps).map_err(|error| format!("cannot build the tools: {error}"))?;
 
     let model: Arc<dyn Model> = match model {
         Some(model) => model,
@@ -443,6 +450,10 @@ fn execute(run: Run) -> Result<TaskState, String> {
                 .map_err(|error| format!("cannot start the model client: {error}"))?,
         ),
     };
+    let judge = judged(&config, &project, &task, Arc::clone(&model))?;
+    let deps = deps.with_judge(judge, &goal);
+    let registry = toolset::build(&deps).map_err(|error| format!("cannot build the tools: {error}"))?;
+
     let gate = Arc::clone(&deps.gate);
     let runner = Runner {
         model: Arc::clone(&model),
@@ -514,6 +525,48 @@ fn execute(run: Run) -> Result<TaskState, String> {
     Ok(outcome.state)
 }
 
+/// The judge for one run: the model, the cache, and what the journal already remembers.
+///
+/// Wrapped in [`immortality_tools::judge::Recorded`] here rather than in the tool layer for the
+/// reason D-111 gives: the policy crate must not know what a model is, and the cache is a decision
+/// about paying twice, not about policy.
+fn judged(
+    config: &Config,
+    project: &Project,
+    task: &TaskId,
+    model: Arc<dyn Model>,
+) -> Result<Arc<dyn immortality_tools::judge::Judge>, String> {
+    Ok(Arc::new(immortality_tools::judge::Recorded::seeded(
+        Arc::new(crate::judge::ModelJudge::new(
+            model,
+            config.models.utility.clone(),
+        )),
+        immortality_tools::judge::policy_fingerprint(&config.policy),
+        recorded_verdicts(project, task)?,
+    )))
+}
+
+/// The judge verdicts a previous run of this task already paid for.
+///
+/// Read from the journal before it is opened for writing, so a restart does not ask the judge
+/// about every unknown program again. A record whose payload cannot be read back is skipped one
+/// at a time: the cost is a repeated judgement, and refusing the task over one damaged line would
+/// turn a model call into a dead end.
+fn recorded_verdicts(
+    project: &Project,
+    task: &TaskId,
+) -> Result<Vec<immortality_tools::judge::Verdict>, String> {
+    let outcome = JournalReader::open(project.agent_dir(), task)
+        .and_then(|reader| reader.read())
+        .map_err(|error| format!("cannot read the journal for the judge's cache: {error}"))?;
+    Ok(outcome
+        .records
+        .iter()
+        .filter(|record| record.fields.kind == Kind::JudgeVerdict)
+        .filter_map(|record| immortality_tools::judge::Verdict::from_payload(&record.event.payload))
+        .collect())
+}
+
 /// The backend client described by the configuration.
 fn backend(config: &Config) -> Result<Backend, String> {
     Backend::new(
@@ -537,4 +590,77 @@ fn system_prompt(goal: &str) -> String {
          Work the subtask you are given, using the tools available. Claim it finished with \
          `finish_subtask` only when the work is actually done; the gates decide whether it is."
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use immortality_core::domain::Timestamp;
+    use immortality_core::journal::Journal;
+    use std::path::Path;
+
+    fn project(dir: &Path) -> Project {
+        Project {
+            id: "prj_test".to_string(),
+            path: dir.to_path_buf(),
+            remote: None,
+        }
+    }
+
+    fn at(secs: i64) -> Timestamp {
+        chrono::DateTime::from_timestamp(secs, 0).expect("timestamp")
+    }
+
+    #[test]
+    fn recorded_verdicts_returns_only_what_the_judge_wrote() {
+        // The restart path: every `judge_verdict` record is a judgement already paid for, so it
+        // must come back into the cache. The filter is the thing that can silently break — a
+        // missing kind match reads as an empty cache, and an empty cache is not an error, it is
+        // just the model being asked again.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let task = TaskId::generate();
+        let allowed = immortality_tools::judge::Verdict {
+            signature: "frobnicate --all".to_string(),
+            policy: "p1".to_string(),
+            command: "frobnicate --all".to_string(),
+            judgement: immortality_tools::judge::Judgement::Allow,
+        };
+        let agent = dir.path().join(immortality_core::paths::AGENT_DIR);
+        let mut journal = Journal::open(&agent, task.clone()).expect("journal");
+        journal
+            .append_event(
+                at(1),
+                Kind::TaskCreated,
+                serde_json::json!({"title": "t", "goal": "g"}),
+            )
+            .expect("created");
+        journal
+            .append_event(at(2), Kind::JudgeVerdict, allowed.to_payload())
+            .expect("verdict");
+        // A record of another kind with a payload that happens to parse: it must not become a
+        // verdict, or the cache would fill with judgements nobody made.
+        journal
+            .append_event(at(3), Kind::GateResult, allowed.to_payload())
+            .expect("gate");
+        journal.close().expect("close");
+
+        let verdicts = recorded_verdicts(&project(dir.path()), &task).expect("read");
+        assert_eq!(verdicts, vec![allowed]);
+    }
+
+    #[test]
+    fn a_journal_with_no_verdicts_yields_an_empty_cache() {
+        // A first run, and the common case. Distinct from a read failure, which is an error and
+        // has to reach the caller: an empty cache would silently re-pay, a failure has to say why.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let task = TaskId::generate();
+        let agent = dir.path().join(immortality_core::paths::AGENT_DIR);
+        let mut journal = Journal::open(&agent, task.clone()).expect("journal");
+        journal
+            .append_event(at(1), Kind::TaskCreated, serde_json::json!({"title": "t"}))
+            .expect("created");
+        journal.close().expect("close");
+        let verdicts = recorded_verdicts(&project(dir.path()), &task).expect("read");
+        assert_eq!(verdicts, Vec::new(), "a journal with no verdicts must yield none");
+    }
 }

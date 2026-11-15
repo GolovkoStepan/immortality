@@ -1885,6 +1885,7 @@ impl<'a> StepLoop<'a> {
                 )
                 .map_err(|error| backend(&error))?;
                 drop(log);
+                self.flush_judgements(journal)?;
                 self.signals.record_call(
                     &call.name,
                     &call.arguments,
@@ -1904,6 +1905,7 @@ impl<'a> StepLoop<'a> {
                 log.failed(&intent.call, serde_json::json!({ "error": observation }))
                     .map_err(|error| backend(&error))?;
                 drop(log);
+                self.flush_judgements(journal)?;
                 // A refusal is a step that produced no evidence about the task, so it feeds the
                 // D1 run but not D2: the model is being told what was wrong, and that is neither
                 // progress nor a repeated experiment.
@@ -1919,6 +1921,32 @@ impl<'a> StepLoop<'a> {
                 Ok(ToolStep::NotRun)
             }
         }
+    }
+
+    /// Write the judge verdicts given during this tool call to the journal.
+    ///
+    /// The gate cannot write them itself: `run_tool` holds `&mut Journal` through `ToolCallLog` for
+    /// the whole call, and the journal is single-writer by construction. So the judge collects and
+    /// this drains, and it is called *after* the call's own records so a human reading the journal
+    /// sees the verdict beside the command it decided.
+    ///
+    /// A verdict that cannot be written is not fatal: the cache still holds it for this process,
+    /// and the only loss is that the next restart pays for the judgement again.
+    fn flush_judgements(&self, journal: &mut Journal) -> Result<(), Ending> {
+        let Some(judge) = self.runner.gate.judge() else {
+            return Ok(());
+        };
+        for verdict in judge.take_fresh() {
+            journal
+                .append_scoped(
+                    self.runner.clock.now(),
+                    Kind::JudgeVerdict,
+                    verdict.to_payload(),
+                    &self.scope,
+                )
+                .map_err(|error| backend(&error))?;
+        }
+        Ok(())
     }
 
     /// Tell the model its arguments were wrong, without inventing a call in the journal.
@@ -3510,6 +3538,161 @@ mod tests {
     }
 
     #[test]
+    fn a_judge_verdict_reaches_the_journal_beside_the_call_it_decided() {
+        // The gate cannot write: `run_tool` holds `&mut Journal` through `ToolCallLog` for the
+        // whole call. So the verdict has to be drained by the runner after the call's own
+        // records, and the ordering is the point — a verdict written before the intent would be
+        // a decision about a call the journal does not yet say was attempted.
+        let judge = immortality_tools::judge::Scripted::new(vec![Ok(r#"{"verdict":"allow"}"#.into())]);
+        // `Recorded`, the shape production installs: the plain double has no memory, and the
+        // drain that writes the journal is exactly what the cache exists to feed.
+        let judge = Arc::new(immortality_tools::judge::Recorded::new(
+            Arc::clone(&judge) as Arc<dyn immortality_tools::judge::Judge>,
+            "test-policy",
+        ));
+        let model = Scripted::new(vec![
+            Ok(Reply::call(
+                "call_1",
+                "shell",
+                r#"{"command":"frobnicate --all"}"#,
+            )),
+            Ok(finish()),
+        ]);
+        let (dir, runner) = runner(
+            model,
+            registry(vec![Arc::new(immortality_tools::Shell::new(
+                Arc::new(immortality_tools::ShellState::new()),
+                None,
+            ))]),
+        );
+        let runner = with_judge(
+            runner,
+            Arc::clone(&judge) as Arc<dyn immortality_tools::judge::Judge>,
+        );
+        let mut journal = journal(&dir);
+        runner.run(&subtask(), 1, "", &mut journal).expect("run");
+
+        let records = immortality_core::journal::JournalReader::open(
+            dir.path().join("journal"),
+            &TaskId::from_suffix("01ARZ3NDEKTSV4RRFFQ69G5FAJ"),
+        )
+        .expect("reader")
+        .read()
+        .expect("records")
+        .records;
+        let kinds: Vec<Kind> = records.iter().map(|record| record.fields.kind).collect();
+        let completed = kinds
+            .iter()
+            .position(|kind| *kind == Kind::ToolCallCompleted)
+            .unwrap_or_else(|| panic!("no completed record: {kinds:?}"));
+        let verdict = kinds
+            .iter()
+            .position(|kind| *kind == Kind::JudgeVerdict)
+            .unwrap_or_else(|| panic!("the judge's verdict never reached the journal: {kinds:?}"));
+        assert!(
+            completed < verdict,
+            "the verdict must follow the call it decided: {kinds:?}"
+        );
+        let payload = &records[verdict].event.payload;
+        assert_eq!(payload["command"], serde_json::json!("frobnicate --all"));
+        assert_eq!(payload["verdict"], serde_json::json!("allow"));
+        assert_eq!(payload["signature"], serde_json::json!("frobnicate --all"));
+        assert_eq!(
+            records[verdict].fields.subtask,
+            Some(subtask().id),
+            "a verdict belongs to the attempt, like every other record of it"
+        );
+    }
+
+    #[test]
+    fn a_denied_judgement_still_reaches_the_journal() {
+        // A cached `deny` is not stored, so the only trace of it is this record. Without it a
+        // human reading the run back sees a refused step with no reason it was refused.
+        let judge = immortality_tools::judge::Scripted::new(vec![Ok(
+            r#"{"verdict":"deny","why":"it rewrites the system gem directory"}"#.into(),
+        )]);
+        let judge = Arc::new(immortality_tools::judge::Recorded::new(
+            Arc::clone(&judge) as Arc<dyn immortality_tools::judge::Judge>,
+            "test-policy",
+        ));
+        let model = Scripted::new(vec![
+            Ok(Reply::call(
+                "call_1",
+                "shell",
+                r#"{"command":"frobnicate --all"}"#,
+            )),
+            Ok(finish()),
+        ]);
+        let (dir, runner) = runner(
+            model,
+            registry(vec![Arc::new(immortality_tools::Shell::new(
+                Arc::new(immortality_tools::ShellState::new()),
+                None,
+            ))]),
+        );
+        let runner = with_judge(
+            runner,
+            Arc::clone(&judge) as Arc<dyn immortality_tools::judge::Judge>,
+        );
+        let mut journal = journal(&dir);
+        runner.run(&subtask(), 1, "", &mut journal).expect("run");
+
+        let verdict = immortality_core::journal::JournalReader::open(
+            dir.path().join("journal"),
+            &TaskId::from_suffix("01ARZ3NDEKTSV4RRFFQ69G5FAJ"),
+        )
+        .expect("reader")
+        .read()
+        .expect("records")
+        .records
+        .into_iter()
+        .find(|record| record.fields.kind == Kind::JudgeVerdict)
+        .expect("a verdict record");
+        assert_eq!(verdict.event.payload["verdict"], serde_json::json!("deny"));
+        assert_eq!(
+            verdict.event.payload["why"],
+            serde_json::json!("it rewrites the system gem directory")
+        );
+    }
+
+    #[test]
+    fn a_runner_with_no_judge_writes_no_verdict_and_still_refuses() {
+        // The state every run was in before this was wired, kept as a test because the failure is
+        // silent: a missing slot would make the judge invisible and every unknown program a
+        // question again, with nothing in the journal saying why.
+        let model = Scripted::new(vec![
+            Ok(Reply::call(
+                "call_1",
+                "shell",
+                r#"{"command":"frobnicate --all"}"#,
+            )),
+            Ok(finish()),
+        ]);
+        let (dir, runner) = runner(
+            model,
+            registry(vec![Arc::new(immortality_tools::Shell::new(
+                Arc::new(immortality_tools::ShellState::new()),
+                None,
+            ))]),
+        );
+        let mut journal = journal(&dir);
+        runner.run(&subtask(), 1, "", &mut journal).expect("run");
+
+        let kinds: Vec<Kind> = immortality_core::journal::JournalReader::open(
+            dir.path().join("journal"),
+            &TaskId::from_suffix("01ARZ3NDEKTSV4RRFFQ69G5FAJ"),
+        )
+        .expect("reader")
+        .read()
+        .expect("records")
+        .records
+        .into_iter()
+        .map(|record| record.fields.kind)
+        .collect();
+        assert!(!kinds.contains(&Kind::JudgeVerdict), "{kinds:?}");
+    }
+
+    #[test]
     fn each_tool_call_is_journaled_intent_started_completed() {
         // The three-record protocol is what makes recovery possible; a runner that skipped a
         // record would leave a call that recovery cannot close.
@@ -4561,6 +4744,16 @@ mod tests {
 
     fn with_checkpoints(mut runner: Runner, fake: Arc<FakeCheckpoints>) -> Runner {
         runner.checkpoints = Some(fake);
+        runner
+    }
+
+    /// The same runner with a judge in its gate's slot.
+    ///
+    /// The gate is behind an `Arc` that `runner` owns alone in these fixtures, so `make_mut` is a
+    /// plain write and every later clone sees the judge — the same ordering `start.rs` relies on.
+    fn with_judge(mut runner: Runner, judge: Arc<dyn immortality_tools::judge::Judge>) -> Runner {
+        let gate = Arc::make_mut(&mut runner.gate);
+        gate.set_judge(judge, "parse trailing commas");
         runner
     }
 

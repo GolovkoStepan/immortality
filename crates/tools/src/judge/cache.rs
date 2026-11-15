@@ -227,6 +227,60 @@ impl Verdict {
     pub fn key(&self) -> String {
         key(&self.signature, &self.policy)
     }
+
+    /// The same verdict as the payload of a
+    /// [`Kind::JudgeVerdict`](immortality_core::journal::Kind::JudgeVerdict) record.
+    ///
+    /// Flat, like every other record's payload: the fields are read with `payload["verdict"]` by
+    /// a human and by [`Self::from_payload`], and a nested object would make the one query a
+    /// post-mortem asks — "what did the judge allow?" — a path expression.
+    #[must_use]
+    pub fn to_payload(&self) -> serde_json::Value {
+        let mut body = serde_json::Map::new();
+        body.insert(
+            "command".to_string(),
+            serde_json::Value::String(self.command.clone()),
+        );
+        body.insert(
+            "signature".to_string(),
+            serde_json::Value::String(self.signature.clone()),
+        );
+        body.insert(
+            "policy".to_string(),
+            serde_json::Value::String(self.policy.clone()),
+        );
+        body.insert(
+            "verdict".to_string(),
+            serde_json::Value::String(self.judgement.as_str().to_string()),
+        );
+        if let Some(why) = self.judgement.why() {
+            body.insert("why".to_string(), serde_json::Value::String(why.to_string()));
+        }
+        serde_json::Value::Object(body)
+    }
+
+    /// The verdict a journal payload describes, or `None` when it has been damaged.
+    ///
+    /// `None` rather than an error: a record that cannot be read back is one cached permission
+    /// that is not found, and re-judging the command is cheap and safe. Refusing the whole task
+    /// over it would trade a model call for a dead end.
+    #[must_use]
+    pub fn from_payload(payload: &serde_json::Value) -> Option<Self> {
+        let text = |field: &str| payload.get(field).and_then(serde_json::Value::as_str);
+        let why = || text("why").unwrap_or_default().to_string();
+        let judgement = match text("verdict")? {
+            "allow" => Judgement::Allow,
+            "deny" => Judgement::Deny(why()),
+            "escalate" => Judgement::Escalate(why()),
+            _ => return None,
+        };
+        Some(Self {
+            signature: text("signature")?.to_string(),
+            policy: text("policy")?.to_string(),
+            command: text("command")?.to_string(),
+            judgement,
+        })
+    }
 }
 
 /// Whether a command's structural reason is one a judge may answer at all.
@@ -390,6 +444,48 @@ mod tests {
             Some(Judgement::Allow)
         );
         assert!(cache.take_fresh().is_empty(), "a seeded verdict is not new");
+    }
+
+    #[test]
+    fn a_verdict_survives_the_round_trip_through_a_journal_payload() {
+        // The payload is the only channel between the run that paid for a judgement and the run
+        // that follows it. A field renamed on one side would make every restart re-ask, and the
+        // failure is silent — a miss is not an error.
+        for judgement in [
+            Judgement::Allow,
+            Judgement::Deny("it writes the system gem directory".into()),
+            Judgement::Escalate("the command is too broad to answer".into()),
+        ] {
+            let verdict = verdict("bundle exec rspec a.rb", judgement.clone());
+            let payload = verdict.to_payload();
+            assert_eq!(Verdict::from_payload(&payload), Some(verdict.clone()));
+            assert_eq!(
+                payload["command"].as_str(),
+                Some("bundle exec rspec a.rb"),
+                "a human reading the journal has to see the command, not only its shape"
+            );
+            assert_eq!(payload["verdict"].as_str(), Some(judgement.as_str()));
+        }
+        // `allow` carries no `why`: an absent reason is not an empty one.
+        let allowed = verdict("x", Judgement::Allow).to_payload();
+        assert!(allowed.get("why").is_none(), "{allowed}");
+        assert_eq!(
+            Verdict::from_payload(&allowed).expect("parse").judgement,
+            Judgement::Allow
+        );
+    }
+
+    #[test]
+    fn a_damaged_payload_is_not_found_rather_than_fatal() {
+        // A record written by a build that spelled a field differently, or a hand-edited journal,
+        // must cost one extra judgement and not the task.
+        for payload in [
+            serde_json::json!({}),
+            serde_json::json!({"verdict": "allow"}),
+            serde_json::json!({"verdict": "maybe", "signature": "s", "policy": "p", "command": "c"}),
+        ] {
+            assert_eq!(Verdict::from_payload(&payload), None, "{payload}");
+        }
     }
 
     #[test]

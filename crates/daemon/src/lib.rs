@@ -14,6 +14,7 @@ pub mod commands;
 pub mod cycle;
 pub mod doctor;
 pub mod gates;
+pub mod judge;
 pub mod planner;
 pub mod recovery;
 pub mod rpc;

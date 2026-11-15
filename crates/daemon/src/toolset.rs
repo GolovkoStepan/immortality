@@ -143,6 +143,27 @@ impl ToolsetDeps {
         self
     }
 
+    /// Install the judge in the policy gate, and tell it what the task is for.
+    ///
+    /// # Why this is a method and not a constructor argument
+    ///
+    /// The judge needs the model, the model is built by the daemon, and this crate must not
+    /// depend on the model at all — that is the whole reason [`crate::toolset`] exists as a
+    /// separate module. So the gate is built here without a judge and the slot is filled
+    /// afterwards, once both exist. The gate is behind an `Arc`, so this replaces the shared
+    /// value rather than mutating one somebody else may already hold: a caller that cloned the
+    /// gate *before* this call keeps the judge-less one, which is why every caller must install
+    /// the judge before handing the deps out.
+    #[must_use]
+    pub fn with_judge(
+        mut self,
+        judge: Arc<dyn immortality_tools::judge::Judge>,
+        goal: impl Into<String>,
+    ) -> Self {
+        Arc::make_mut(&mut self.gate).set_judge(judge, goal);
+        self
+    }
+
     /// The process registry, opened under the task's own directory.
     ///
     /// Handles are `proc_<n>` local to a task: two tasks both starting a server on port 3000 is a

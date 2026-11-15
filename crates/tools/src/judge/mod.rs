@@ -85,6 +85,16 @@ impl Judgement {
 pub trait Judge: Send + Sync + std::fmt::Debug {
     /// One reply, with no tools attached.
     fn judge(&self, prompt: &str) -> Result<String, String>;
+
+    /// The judgements given since the last call, for the journal to write.
+    ///
+    /// The gate cannot write them itself: `run_tool` holds `&mut Journal` for the whole tool call,
+    /// and the journal is single-writer by construction. So the judge collects and the caller
+    /// that holds the journal drains. A judge with no memory — the scripted double, a fresh
+    /// [`Recorded`] with nothing to say — returns nothing, which is why this has a default.
+    fn take_fresh(&self) -> Vec<cache::Verdict> {
+        Vec::new()
+    }
 }
 
 /// The system message. Fixed, so the test does not have to duplicate the wording.
@@ -298,6 +308,10 @@ impl Judge for Recorded {
             });
         }
         Ok(reply)
+    }
+
+    fn take_fresh(&self) -> Vec<Verdict> {
+        self.cache.take_fresh()
     }
 }
 
