@@ -37,6 +37,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Serialize;
 
+use crate::ids::SubtaskId;
 use crate::journal::{JournalRecord, Kind};
 
 /// One subtask's outcome, as the journal recorded it.
@@ -59,6 +60,49 @@ pub struct TaskMetrics {
     pub subtasks: Vec<SubtaskOutcome>,
     /// Subtasks a green gate closed.
     pub closed_green: usize,
+    /// Attempts whose gates returned `passed: true`.
+    ///
+    /// Not the same set as [`Self::closed_green`]: a subtask may take two attempts, and only one
+    /// of them ends green; a green attempt may also belong to a subtask that closed `done` on a
+    /// later attempt after this one was rolled back. The two numbers differ, and the difference is
+    /// where work gets lost.
+    pub green_attempts: usize,
+    /// Green attempts whose subtask did not end as `done`.
+    ///
+    /// The `0.2` exit criterion (D-114) is this number being **zero** together with
+    /// [`Self::step_exhaustions_without_gates`] being zero and
+    /// [`Self::settled_after_step_budget`] being non-zero: no work a gate certified went
+    /// uncounted, no steps were spent without asking, and the path the milestone added actually
+    /// ran.
+    ///
+    /// # What a non-zero value does and does not mean
+    ///
+    /// It means the pair `(green verdict, no closure)` exists in the journal, which is the thing
+    /// the milestone set out to eliminate. It does not by itself say the work was thrown away: a
+    /// subtask closed `done` and then reopened — by a retry, or by an operator — lands here too.
+    /// That is why the same struct carries the per-subtask list: the count says "look", the list
+    /// says "here".
+    pub green_attempts_not_closed: usize,
+    /// Attempts closed because the gates went green when the step budget ran out (D-115).
+    ///
+    /// Counted from the `settled_by: "gates_after_step_budget"` marker on the attempt record, which
+    /// exists precisely so this path is distinguishable from a claim in a journal read months
+    /// later. Zero here on a journal that predates D-115 is expected, not a good sign.
+    pub settled_after_step_budget: usize,
+    /// Attempts the step budget ended where no gate verdict was ever written.
+    ///
+    /// # Why this number exists
+    ///
+    /// It is the blind spot that made the first reading of D-114 vacuous. Before D-115 the gates
+    /// were consulted only from `settle_claim`, so an attempt that found the fix and then ran out
+    /// of steps wrote `attempt_failed { ending: "steps" }` and no `gate_result` at all: the
+    /// criterion "no attempt where the gate passed and the subtask did not close" held on the very
+    /// run that motivated the milestone.
+    ///
+    /// A non-zero value marks a journal written before D-115. Its green-attempt counts cannot be
+    /// read as evidence about lost work, because the gates simply were not asked on this path —
+    /// "the gates said no" and "the gates were never consulted" are the two things this separates.
+    pub step_exhaustions_without_gates: usize,
     /// How many of those closed while an escalation was open.
     pub closed_with_escalation: usize,
     /// The longest run of consecutive settled subtasks that were closed green with no escalation
@@ -84,51 +128,87 @@ pub struct TaskMetrics {
 /// repository, and counting another task's subtasks would inflate every number here.
 #[must_use]
 pub fn compute(task: &str, records: &[JournalRecord]) -> TaskMetrics {
-    // State per subtask, so a later record for the same id replaces the earlier one rather than
-    // being counted twice: `running` followed by `done` is one settled subtask, not two.
-    //
-    // The position is stored with the state because the order of settlements is not the order of
-    // ids. "Three subtasks in a row" is a claim about time, and a `BTreeMap` iterated by key would
-    // answer it in an order that a run never produced — `sub_9` sorting after `sub_10` is enough
-    // to turn a broken streak into a whole one.
-    let mut settled: BTreeMap<String, (String, bool, usize)> = BTreeMap::new();
-    let mut detectors: BTreeMap<String, usize> = BTreeMap::new();
-    // Open escalations by id, not by counter: a journal that has a resolution without its opening
-    // (the tail of a rotated segment can start mid-question) would leave a counter negative and
-    // every later attribution wrong. A set answers "was one open" and "how many are open" with the
-    // same truth.
-    let mut open_escalations: BTreeSet<String> = BTreeSet::new();
-    let mut total_escalations: usize = 0;
-    let mut restarts: usize = 0;
+    let scan = Scan::of(records);
+    let subtasks = scan.settled_subtasks();
 
-    for (position, record) in records.iter().enumerate() {
+    let closed_green = subtasks.iter().filter(|one| one.state == "done").count();
+    let closed_with_escalation = subtasks
+        .iter()
+        .filter(|one| one.state == "done" && one.closed_with_escalation)
+        .count();
+
+    TaskMetrics {
+        task: task.to_string(),
+        green_attempts: scan.green.len(),
+        green_attempts_not_closed: scan.lost_green_work(&subtasks),
+        step_exhaustions_without_gates: scan.step_exhaustions_without_gates(),
+        settled_after_step_budget: scan.settled_after_step_budget,
+        closed_with_escalation,
+        longest_green_streak: longest_green_streak(&subtasks),
+        subtasks,
+        closed_green,
+        detectors: scan.detectors,
+        escalations_pending: scan.open_escalations.len(),
+        escalations_total: scan.total_escalations,
+        restarts: scan.restarts,
+        records: records.len(),
+        corrupt: false,
+    }
+}
+
+/// One pass over a task's journal, kept apart from [`compute`] so each counter has room to say
+/// what it is for.
+///
+/// The fields are private: the numbers a reader sees are computed from them in [`compute`], and a
+/// counter that leaks its raw set would invite a caller to re-derive one of the totals differently.
+struct Scan {
+    /// Every settled subtask state, keyed by id, with the position of the record that said it.
+    ///
+    /// The position is stored because the order of settlements is not the order of ids. "Three
+    /// subtasks in a row" is a claim about time, and a `BTreeMap` iterated by key would answer it in
+    /// an order that a run never produced — `sub_9` sorting after `sub_10` is enough to turn a
+    /// broken streak into a whole one.
+    settled: BTreeMap<String, (String, bool, usize)>,
+    detectors: BTreeMap<String, usize>,
+    /// Open escalations by id, not by counter: a journal that has a resolution without its opening
+    /// (the tail of a rotated segment can start mid-question) would leave a counter negative and
+    /// every later attribution wrong. A set answers "was one open" and "how many are open" with the
+    /// same truth.
+    open_escalations: BTreeSet<String>,
+    total_escalations: usize,
+    restarts: usize,
+    /// Attempts whose `verdict` gate returned `passed: true`, and every attempt with *some*
+    /// verdict. Two sets rather than one plus a filter, because the two questions the `0.2`
+    /// criterion asks are "did a gate certify this attempt" and "was this attempt ever judged at
+    /// all" — and a red verdict must not read as "never consulted".
+    green: BTreeSet<(SubtaskId, u32)>,
+    judged: BTreeSet<(SubtaskId, u32)>,
+    step_exhaustions: Vec<(SubtaskId, u32)>,
+    settled_after_step_budget: usize,
+}
+
+impl Scan {
+    fn of(records: &[JournalRecord]) -> Self {
+        let mut scan = Self {
+            settled: BTreeMap::new(),
+            detectors: BTreeMap::new(),
+            open_escalations: BTreeSet::new(),
+            total_escalations: 0,
+            restarts: 0,
+            green: BTreeSet::new(),
+            judged: BTreeSet::new(),
+            step_exhaustions: Vec::new(),
+            settled_after_step_budget: 0,
+        };
+        for (position, record) in records.iter().enumerate() {
+            scan.read(record, position);
+        }
+        scan
+    }
+
+    fn read(&mut self, record: &JournalRecord, position: usize) {
         match record.fields.kind {
-            Kind::SubtaskState => {
-                let Some(id) = record
-                    .event
-                    .payload
-                    .get("subtask")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_string)
-                else {
-                    continue;
-                };
-                let Some(state) = record
-                    .event
-                    .payload
-                    .get("state")
-                    .and_then(serde_json::Value::as_str)
-                else {
-                    continue;
-                };
-                if matches!(state, "done" | "blocked" | "skipped") {
-                    let with_escalation = !open_escalations.is_empty();
-                    // A later settlement moves the subtask to its latest position: the last word
-                    // on a subtask is where it settled, and a repair that turned `blocked` into
-                    // `done` belongs at the end of the run, not where the first attempt died.
-                    settled.insert(id, (state.to_string(), with_escalation, position));
-                }
-            }
+            Kind::SubtaskState => self.read_settlement(record, position),
             Kind::DetectorFired => {
                 let detector = record
                     .event
@@ -142,59 +222,157 @@ pub fn compute(task: &str, records: &[JournalRecord]) -> TaskMetrics {
                     .get("level")
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("unknown");
-                *detectors.entry(format!("{detector}/{level}")).or_default() += 1;
+                *self.detectors.entry(format!("{detector}/{level}")).or_default() += 1;
             }
             Kind::EscalationOpened => {
-                total_escalations += 1;
+                self.total_escalations += 1;
                 if let Some(id) = record.event.payload.get("id").and_then(serde_json::Value::as_str) {
-                    open_escalations.insert(id.to_string());
+                    self.open_escalations.insert(id.to_string());
                 }
             }
             Kind::EscalationResolved => {
                 if let Some(id) = record.event.payload.get("id").and_then(serde_json::Value::as_str) {
-                    open_escalations.remove(id);
+                    self.open_escalations.remove(id);
                 }
             }
-            Kind::AttemptRestarted => restarts += 1,
+            Kind::AttemptRestarted => self.restarts += 1,
+            Kind::GateResult => self.read_gate(record),
+            Kind::AttemptFailed => self.read_attempt_failed(record),
             _ => {}
         }
     }
 
-    // Journal order, not id order: the reader of "in a row" is asking about the run, and the run
-    // happened in time.
-    let mut ordered: Vec<(String, String, bool, usize)> = settled
-        .into_iter()
-        .map(|(id, (state, with_escalation, position))| (id, state, with_escalation, position))
-        .collect();
-    ordered.sort_by_key(|(_, _, _, position)| *position);
-    let subtasks: Vec<SubtaskOutcome> = ordered
-        .into_iter()
-        .map(|(subtask, state, closed_with_escalation, _)| SubtaskOutcome {
-            subtask,
-            state,
-            closed_with_escalation,
-        })
-        .collect();
+    fn read_settlement(&mut self, record: &JournalRecord, position: usize) {
+        let Some(id) = record
+            .event
+            .payload
+            .get("subtask")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+        else {
+            return;
+        };
+        let Some(state) = record
+            .event
+            .payload
+            .get("state")
+            .and_then(serde_json::Value::as_str)
+        else {
+            return;
+        };
+        if !matches!(state, "done" | "blocked" | "skipped") {
+            return;
+        }
+        let with_escalation = !self.open_escalations.is_empty();
+        // A later settlement moves the subtask to its latest position: the last word on a subtask
+        // is where it settled, and a repair that turned `blocked` into `done` belongs at the end of
+        // the run, not where the first attempt died.
+        self.settled
+            .insert(id, (state.to_string(), with_escalation, position));
+    }
 
-    let closed_green = subtasks.iter().filter(|one| one.state == "done").count();
-    let closed_with_escalation = subtasks
-        .iter()
-        .filter(|one| one.state == "done" && one.closed_with_escalation)
-        .count();
-    let longest_green_streak = longest_green_streak(&subtasks);
+    fn read_gate(&mut self, record: &JournalRecord) {
+        // `passed: true` on the `verdict` gate is the only gate outcome that licenses a closure; a
+        // green individual check under a red verdict is still work the system rejected, and reading
+        // any green record as certification would report a pass for every run whose first required
+        // check happened to succeed.
+        let verdict_gate = record
+            .event
+            .payload
+            .get("gate")
+            .and_then(serde_json::Value::as_str)
+            == Some("verdict");
+        if !verdict_gate {
+            return;
+        }
+        // The attempt's identity comes from the record's own scope, which is what every other
+        // reader of this journal keys on.
+        let (Some(subtask), Some(attempt)) = (record.fields.subtask.clone(), record.fields.attempt) else {
+            return;
+        };
+        self.judged.insert((subtask.clone(), attempt));
+        if record
+            .event
+            .payload
+            .get("passed")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        {
+            self.green.insert((subtask, attempt));
+        }
+    }
 
-    TaskMetrics {
-        task: task.to_string(),
-        subtasks,
-        closed_green,
-        closed_with_escalation,
-        longest_green_streak,
-        detectors,
-        escalations_pending: open_escalations.len(),
-        escalations_total: total_escalations,
-        restarts,
-        records: records.len(),
-        corrupt: false,
+    fn read_attempt_failed(&mut self, record: &JournalRecord) {
+        // The attempt number is in the scope, not in the payload: the payload carries the attempt
+        // *id* (`att_…`), which no other record uses for the same purpose.
+        let (Some(subtask), Some(attempt)) = (record.fields.subtask.clone(), record.fields.attempt) else {
+            return;
+        };
+        let payload = &record.event.payload;
+        if payload.get("settled_by").and_then(serde_json::Value::as_str) == Some("gates_after_step_budget") {
+            self.settled_after_step_budget += 1;
+        }
+        if payload.get("ending").and_then(serde_json::Value::as_str) == Some("steps") {
+            self.step_exhaustions.push((subtask, attempt));
+        }
+    }
+
+    /// Step exhaustions the gates were never asked about.
+    ///
+    /// Resolved after the whole journal is read rather than inline, because a verdict and the
+    /// attempt record it belongs to may arrive in either order in a torn or hand-edited journal,
+    /// and asking the finished set is easier to trust than tracking which path wrote what first.
+    ///
+    /// This is the number that made the first reading of the `0.2` criterion vacuous: before the
+    /// gates were consulted on a spent step budget, an attempt that found the fix wrote
+    /// `attempt_failed { ending: "steps" }` and no `gate_result` at all.
+    fn step_exhaustions_without_gates(&self) -> usize {
+        self.step_exhaustions
+            .iter()
+            .filter(|key| !self.judged.contains(*key))
+            .count()
+    }
+
+    /// Green attempts whose subtask did not end as `done`.
+    ///
+    /// Includes the subtask that never settled at all: a gate certified work the run has no
+    /// closure for, which is the defect itself rather than a missing record.
+    ///
+    /// On a journal from a *live* run this can be non-zero for an honest reason — the gates went
+    /// green and the process has not yet written the closure — so the criterion is read on a
+    /// finished task and the number is not treated as a live health signal.
+    fn lost_green_work(&self, subtasks: &[SubtaskOutcome]) -> usize {
+        let final_state: BTreeMap<&str, &str> = subtasks
+            .iter()
+            .map(|one| (one.subtask.as_str(), one.state.as_str()))
+            .collect();
+        self.green
+            .iter()
+            .filter(|(subtask, _)| final_state.get(subtask.as_str()).copied() != Some("done"))
+            .count()
+    }
+
+    /// The settled subtasks in journal order.
+    ///
+    /// Journal order, not id order: the reader of "in a row" is asking about the run, and the run
+    /// happened in time.
+    fn settled_subtasks(&self) -> Vec<SubtaskOutcome> {
+        let mut ordered: Vec<(String, String, bool, usize)> = self
+            .settled
+            .iter()
+            .map(|(id, (state, with_escalation, position))| {
+                (id.clone(), state.clone(), *with_escalation, *position)
+            })
+            .collect();
+        ordered.sort_by_key(|(_, _, _, position)| *position);
+        ordered
+            .into_iter()
+            .map(|(subtask, state, closed_with_escalation, _)| SubtaskOutcome {
+                subtask,
+                state,
+                closed_with_escalation,
+            })
+            .collect()
     }
 }
 
@@ -252,6 +430,30 @@ mod tests {
             Kind::SubtaskState,
             serde_json::json!({ "subtask": id, "state": state }),
         )
+    }
+
+    /// A record scoped to one attempt, the way the runner writes `gate_result` and
+    /// `attempt_failed`. The scope is the only place the attempt number lives for these kinds.
+    fn scoped_attempt(kind: Kind, subtask: &str, attempt: u32, payload: serde_json::Value) -> JournalRecord {
+        let mut fields = RecordFields::new(0, at(), TaskId::from_suffix("01ARZ3NDEKTSV4RRFFQ69G5FAV"), kind);
+        fields.subtask = Some(SubtaskId::from_suffix(
+            subtask.strip_prefix("sub_").unwrap_or(subtask),
+        ));
+        fields.attempt = Some(attempt);
+        JournalRecord::new(fields, JournalEvent::with_payload(payload), None)
+    }
+
+    fn verdict(subtask: &str, attempt: u32, passed: bool) -> JournalRecord {
+        scoped_attempt(
+            Kind::GateResult,
+            subtask,
+            attempt,
+            serde_json::json!({ "gate": "verdict", "passed": passed, "reason": null, "why": null }),
+        )
+    }
+
+    fn attempt_failed(subtask: &str, attempt: u32, payload: serde_json::Value) -> JournalRecord {
+        scoped_attempt(Kind::AttemptFailed, subtask, attempt, payload)
     }
 
     #[test]
@@ -480,6 +682,186 @@ mod tests {
         let metrics = compute("tsk_01ARZ3NDEKTSV4RRFFQ69G5FAV", &records);
         assert!(metrics.subtasks.is_empty(), "{metrics:?}");
         assert_eq!(metrics.closed_green, 0);
+    }
+
+    #[test]
+    fn a_green_attempt_whose_subtask_closed_is_not_counted_as_lost() {
+        // The ordinary path: claim, gates agree, subtask closes. Every green attempt in the journal
+        // belongs to a subtask that ended `done`, so the 0.2 criterion sees nothing to report.
+        let records = vec![
+            verdict("sub_A", 1, true),
+            subtask_state("sub_A", "done"),
+            verdict("sub_B", 1, true),
+            subtask_state("sub_B", "done"),
+        ];
+        let metrics = compute("tsk_01ARZ3NDEKTSV4RRFFQ69G5FAV", &records);
+        assert_eq!(metrics.green_attempts, 2, "{metrics:?}");
+        assert_eq!(metrics.green_attempts_not_closed, 0, "{metrics:?}");
+        assert_eq!(metrics.step_exhaustions_without_gates, 0, "{metrics:?}");
+    }
+
+    #[test]
+    fn a_green_attempt_for_a_subtask_that_never_closed_is_counted_as_lost() {
+        // The defect 0.2 exists to eliminate, in its post-D-115 shape: the gates went green and the
+        // subtask then closed `blocked` (or not at all). A count of zero would say the run kept
+        // what the gate certified.
+        let records = vec![verdict("sub_A", 1, true), subtask_state("sub_A", "blocked")];
+        let metrics = compute("tsk_01ARZ3NDEKTSV4RRFFQ69G5FAV", &records);
+        assert_eq!(metrics.green_attempts, 1, "{metrics:?}");
+        assert_eq!(metrics.green_attempts_not_closed, 1, "{metrics:?}");
+    }
+
+    #[test]
+    fn a_green_attempt_with_no_settlement_at_all_is_counted_as_lost() {
+        // Not merely "closed badly": the run ended before writing any state. The gate certified
+        // work the journal has no closure for, and that is exactly what a reader must see.
+        let records = vec![verdict("sub_A", 1, true)];
+        let metrics = compute("tsk_01ARZ3NDEKTSV4RRFFQ69G5FAV", &records);
+        assert_eq!(metrics.green_attempts_not_closed, 1, "{metrics:?}");
+    }
+
+    #[test]
+    fn a_red_verdict_is_not_a_green_attempt_and_is_not_lost_work() {
+        // A rejected claim is the system working. Counting it would make every honest failure look
+        // like a defect and drown the number that matters.
+        let records = vec![verdict("sub_A", 1, false), subtask_state("sub_A", "done")];
+        let metrics = compute("tsk_01ARZ3NDEKTSV4RRFFQ69G5FAV", &records);
+        assert_eq!(metrics.green_attempts, 0, "{metrics:?}");
+        assert_eq!(metrics.green_attempts_not_closed, 0, "{metrics:?}");
+    }
+
+    #[test]
+    fn only_the_verdict_gate_counts_as_green_not_an_individual_check() {
+        // `DoD` writes one record per check plus a verdict. A green check under a red verdict is
+        // work the system rejected, and reading any green record as certification would report a
+        // pass for every run whose first required check happened to succeed.
+        let records = vec![
+            scoped_attempt(
+                Kind::GateResult,
+                "sub_A",
+                1,
+                serde_json::json!({ "gate": "check", "id": "ok", "passed": true }),
+            ),
+            verdict("sub_A", 1, false),
+            subtask_state("sub_A", "blocked"),
+        ];
+        let metrics = compute("tsk_01ARZ3NDEKTSV4RRFFQ69G5FAV", &records);
+        assert_eq!(metrics.green_attempts, 0, "{metrics:?}");
+        assert_eq!(metrics.green_attempts_not_closed, 0, "{metrics:?}");
+    }
+
+    #[test]
+    fn a_step_exhaustion_with_no_verdict_is_the_pre_d115_blind_spot() {
+        // The measurement that made the first reading of D-114 vacuous: the attempt ran out of
+        // steps, the gates were never consulted, and the journal therefore contains no green
+        // record — so "no green attempt was lost" held on the run that motivated the milestone.
+        let records = vec![
+            attempt_failed(
+                "sub_A",
+                1,
+                serde_json::json!({ "ending": "steps", "steps": 60, "tokens": 42264 }),
+            ),
+            subtask_state("sub_A", "blocked"),
+        ];
+        let metrics = compute("tsk_01ARZ3NDEKTSV4RRFFQ69G5FAV", &records);
+        assert_eq!(metrics.green_attempts, 0, "{metrics:?}");
+        assert_eq!(metrics.green_attempts_not_closed, 0, "{metrics:?}");
+        assert_eq!(
+            metrics.step_exhaustions_without_gates, 1,
+            "a step exhaustion the gates never saw has to be visible: {metrics:?}"
+        );
+    }
+
+    #[test]
+    fn a_step_exhaustion_whose_gates_spoke_is_not_the_blind_spot() {
+        // After D-115 the gates *are* asked when the step budget ends. The count must drop to zero
+        // even when the verdict is red: "the gates said no" is not "the gates were never asked".
+        let records = vec![
+            verdict("sub_A", 1, false),
+            attempt_failed("sub_A", 1, serde_json::json!({ "ending": "steps" })),
+            subtask_state("sub_A", "blocked"),
+        ];
+        let metrics = compute("tsk_01ARZ3NDEKTSV4RRFFQ69G5FAV", &records);
+        assert_eq!(metrics.step_exhaustions_without_gates, 0, "{metrics:?}");
+    }
+
+    #[test]
+    fn a_green_settlement_after_the_step_budget_is_counted_as_its_own_path() {
+        // `settled_by` exists so a reader months later can tell "the model claimed and the gates
+        // agreed" from "the budget ended the loop and the gates happened to agree". Without the
+        // count, D-115's whole contribution is invisible in `metrics`.
+        let records = vec![
+            verdict("sub_A", 1, true),
+            attempt_failed(
+                "sub_A",
+                1,
+                serde_json::json!({
+                    "ending": "gate",
+                    "state": "succeeded",
+                    "settled_by": "gates_after_step_budget",
+                }),
+            ),
+            subtask_state("sub_A", "done"),
+        ];
+        let metrics = compute("tsk_01ARZ3NDEKTSV4RRFFQ69G5FAV", &records);
+        assert_eq!(metrics.settled_after_step_budget, 1, "{metrics:?}");
+        assert_eq!(metrics.green_attempts_not_closed, 0, "{metrics:?}");
+    }
+
+    #[test]
+    fn a_subtask_reopened_after_a_green_closure_is_reported_rather_than_hidden() {
+        // A green attempt whose subtask later went back to `pending`/`running` is work the run
+        // walked away from. It may be justified (a retry, an operator) but the count must show it:
+        // this is the one honest reason a finished journal can be non-zero, and a reader needs the
+        // number rather than an explanation.
+        let records = vec![
+            verdict("sub_A", 1, true),
+            subtask_state("sub_A", "done"),
+            subtask_state("sub_A", "blocked"),
+        ];
+        let metrics = compute("tsk_01ARZ3NDEKTSV4RRFFQ69G5FAV", &records);
+        assert_eq!(metrics.closed_green, 0, "{metrics:?}");
+        assert_eq!(metrics.green_attempts_not_closed, 1, "{metrics:?}");
+    }
+
+    #[test]
+    fn the_run_that_motivated_the_milestone_cannot_pass_the_criterion() {
+        // The third live `black_jack` run, in the shape its journal actually has: five subtasks
+        // closed green, one blocked, and two step exhaustions on that one subtask with no verdict
+        // anywhere near them. Reading only "green attempts that did not close" says zero — and that
+        // reading is what made the first version of the criterion vacuous, because the gates were
+        // never asked and so no green record could exist.
+        //
+        // This test is the criterion's own regression: the run the milestone exists for must fail
+        // it, and it must fail for the reason the milestone names, not by accident.
+        let mut records = Vec::new();
+        for id in ["sub_A", "sub_B", "sub_C", "sub_D", "sub_E"] {
+            records.push(verdict(id, 1, true));
+            records.push(subtask_state(id, "done"));
+        }
+        // The sixth subtask is the one the plan cannot satisfy, and its two attempts spent their
+        // steps before any gate spoke.
+        for attempt in [1, 2] {
+            records.push(attempt_failed(
+                "sub_F",
+                attempt,
+                serde_json::json!({ "ending": "steps", "steps": 60, "tokens": 42264 }),
+            ));
+        }
+        records.push(subtask_state("sub_F", "blocked"));
+
+        let metrics = compute("tsk_01ARZ3NDEKTSV4RRFFQ69G5FAV", &records);
+        assert_eq!(metrics.closed_green, 5, "{metrics:?}");
+        assert_eq!(metrics.green_attempts, 5, "{metrics:?}");
+        assert_eq!(metrics.green_attempts_not_closed, 0, "{metrics:?}");
+        assert_eq!(
+            metrics.step_exhaustions_without_gates, 2,
+            "the run's own defect has to be visible, or the criterion cannot see it: {metrics:?}"
+        );
+        assert_eq!(
+            metrics.settled_after_step_budget, 0,
+            "nothing settled on the code path the milestone added: {metrics:?}"
+        );
     }
 
     #[test]

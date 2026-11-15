@@ -409,6 +409,142 @@ pub fn log(result: &Value, style: Style) -> String {
 /// number against the document, so a report that meets the bar is painted green and one that does
 /// not is dim. The comparison is done here rather than left to the reader because the bar is the
 /// whole point of the command.
+/// One line per settled subtask.
+fn subtask_lines(task: &Value, style: Style) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let subtasks = task
+        .get("subtasks")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    for subtask in subtasks {
+        let state = text(subtask, "state");
+        let painted = if state == "done" {
+            style.green(&state)
+        } else {
+            style.yellow(&state)
+        };
+        let aid = subtask.get("closed_with_escalation").and_then(Value::as_bool);
+        let _ = writeln!(
+            out,
+            "  {} {}{}",
+            painted,
+            style.dim(&text(subtask, "subtask")),
+            if aid == Some(true) {
+                style.dim(" (escalation open)")
+            } else {
+                String::new()
+            }
+        );
+    }
+    out
+}
+
+/// Restarts and escalations, on one dim line.
+fn restarts_line(task: &Value, style: Style) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let restarts = task.get("restarts").and_then(Value::as_u64).unwrap_or(0);
+    let total = task.get("escalations_total").and_then(Value::as_u64).unwrap_or(0);
+    let pending = task
+        .get("escalations_pending")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let _ = writeln!(
+        out,
+        "  {}",
+        style.dim(&format!(
+            "restarts {restarts}, escalations {total} ({pending} still open)"
+        ))
+    );
+    out
+}
+
+/// Every detector firing, or one line saying none did.
+fn detector_lines(task: &Value, style: Style) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let detectors = task
+        .get("detectors")
+        .and_then(Value::as_object)
+        .map(|object| {
+            let mut pairs: Vec<(&String, u64)> = object
+                .iter()
+                .map(|(name, count)| (name, count.as_u64().unwrap_or(0)))
+                .collect();
+            pairs.sort();
+            pairs
+        })
+        .unwrap_or_default();
+    if detectors.is_empty() {
+        let _ = writeln!(out, "  {}", style.dim("no detector fired."));
+    } else {
+        for (name, count) in detectors {
+            let _ = writeln!(out, "  {name} {}", style.yellow(&count.to_string()));
+        }
+    }
+    out
+}
+
+/// The `0.2` exit criterion, said in words rather than left to four counters.
+///
+/// Printed for every task, not only when it fails: a reader comparing two runs needs the number in
+/// both, and a line that appears only on failure reads as a warning rather than as a measurement.
+fn lost_work_line(task: &Value, style: Style) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let green = task.get("green_attempts").and_then(Value::as_u64).unwrap_or(0);
+    let lost = task
+        .get("green_attempts_not_closed")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let blind = task
+        .get("step_exhaustions_without_gates")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let line =
+        format!("{green} attempt(s) closed by a green gate, {lost} of them on a subtask that did not close");
+    let _ = writeln!(
+        out,
+        "  {}",
+        if lost == 0 && blind == 0 {
+            style.green(&line)
+        } else {
+            style.red(&line)
+        }
+    );
+    if blind > 0 {
+        // Not a defect in this run: a sign the journal predates the step-budget settlement, so its
+        // green-attempt counts cannot speak about lost work at all. Saying that is more useful than
+        // a number a reader would otherwise compare with a run that has the fix.
+        let _ = writeln!(
+            out,
+            "  {}",
+            style.yellow(&format!(
+                "{blind} step exhaustion(s) the gates were never asked about — this journal \
+                 predates the step-budget settlement, so it cannot show lost work"
+            ))
+        );
+    }
+    let stepped = task
+        .get("settled_after_step_budget")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if stepped > 0 {
+        // D-115's contribution is invisible in `closed_green` alone: five closures look the same
+        // whether the model claimed them or the budget ran out and the gates happened to agree.
+        let _ = writeln!(
+            out,
+            "  {}",
+            style.dim(&format!(
+                "{stepped} of them settled after the step budget ran out, not on a claim"
+            ))
+        );
+    }
+    out
+}
+
 fn streak_line(streak: u64, style: Style) -> String {
     let text = format!("longest streak {streak} in a row — the v0.1 bar is three");
     if streak >= 3 {
@@ -457,66 +593,10 @@ pub fn metrics(result: &Value, style: Style) -> String {
             .unwrap_or(0);
         let _ = writeln!(out, "{}", streak_line(streak, style));
 
-        let subtasks = task
-            .get("subtasks")
-            .and_then(Value::as_array)
-            .map(Vec::as_slice)
-            .unwrap_or_default();
-        for subtask in subtasks {
-            let state = text(subtask, "state");
-            let painted = if state == "done" {
-                style.green(&state)
-            } else {
-                style.yellow(&state)
-            };
-            let aid = subtask.get("closed_with_escalation").and_then(Value::as_bool);
-            let _ = writeln!(
-                out,
-                "  {} {}{}",
-                painted,
-                style.dim(&text(subtask, "subtask")),
-                if aid == Some(true) {
-                    style.dim(" (escalation open)")
-                } else {
-                    String::new()
-                }
-            );
-        }
-
-        let restarts = task.get("restarts").and_then(Value::as_u64).unwrap_or(0);
-        let total = task.get("escalations_total").and_then(Value::as_u64).unwrap_or(0);
-        let pending = task
-            .get("escalations_pending")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        let _ = writeln!(
-            out,
-            "  {}",
-            style.dim(&format!(
-                "restarts {restarts}, escalations {total} ({pending} still open)"
-            ))
-        );
-
-        let detectors = task
-            .get("detectors")
-            .and_then(Value::as_object)
-            .map(|object| {
-                let mut pairs: Vec<(&String, u64)> = object
-                    .iter()
-                    .map(|(name, count)| (name, count.as_u64().unwrap_or(0)))
-                    .collect();
-                pairs.sort();
-                pairs
-            })
-            .unwrap_or_default();
-        if detectors.is_empty() {
-            let _ = writeln!(out, "  {}", style.dim("no detector fired."));
-        } else {
-            for (name, count) in detectors {
-                let _ = writeln!(out, "  {name} {}", style.yellow(&count.to_string()));
-            }
-        }
-
+        out.push_str(&lost_work_line(task, style));
+        out.push_str(&subtask_lines(task, style));
+        out.push_str(&restarts_line(task, style));
+        out.push_str(&detector_lines(task, style));
         if task.get("corrupt").and_then(Value::as_bool) == Some(true) {
             let _ = writeln!(
                 out,
@@ -1735,6 +1815,79 @@ mod tests {
         assert!(out.contains("restarts 2"), "{out}");
         assert!(out.contains("d1/l1"), "{out}");
         assert!(out.contains("d5/l3"), "{out}");
+    }
+
+    #[test]
+    fn metrics_state_the_zero_lost_work_criterion_in_words() {
+        // The 0.2 exit criterion is a sentence, and a reader should not have to reconstruct it from
+        // four counters. Present in both outcomes: a line that appears only when it fails reads as
+        // a warning rather than as the measurement that lets two runs be compared.
+        let report = |lost: u64, blind: u64| {
+            json!({"count": 1, "tasks": [{
+                "task": "tsk_01A", "closed_green": 5, "closed_with_escalation": 0,
+                "longest_green_streak": 3, "subtasks": [], "detectors": {},
+                "escalations_total": 0, "escalations_pending": 0, "restarts": 0,
+                "green_attempts": 5, "green_attempts_not_closed": lost,
+                "settled_after_step_budget": 0, "step_exhaustions_without_gates": blind,
+                "records": 5, "corrupt": false,
+            }]})
+        };
+        let clean = metrics(&report(0, 0), PLAIN);
+        assert!(clean.contains("attempt(s) closed by a green gate"), "{clean}");
+        assert!(
+            clean.contains("0 of them on a subtask that did not close"),
+            "{clean}"
+        );
+        assert!(!clean.contains("predates"), "{clean}");
+
+        let lost = metrics(&report(2, 0), PLAIN);
+        assert!(
+            lost.contains("2 of them on a subtask that did not close"),
+            "{lost}"
+        );
+    }
+
+    #[test]
+    fn a_journal_without_gate_checks_on_a_spent_budget_says_so() {
+        // The measurement that made the first reading of D-114 vacuous. A run whose gates were
+        // never asked on a step exhaustion shows zero lost work for a reason that has nothing to do
+        // with the fix, and a reader comparing it with a later run needs to be told which is which.
+        let out = metrics(
+            &json!({"count": 1, "tasks": [{
+                "task": "tsk_01A", "closed_green": 5, "closed_with_escalation": 0,
+                "longest_green_streak": 3, "subtasks": [], "detectors": {},
+                "escalations_total": 0, "escalations_pending": 0, "restarts": 0,
+                "green_attempts": 5, "green_attempts_not_closed": 0,
+                "settled_after_step_budget": 0, "step_exhaustions_without_gates": 2,
+                "records": 899, "corrupt": false,
+            }]}),
+            PLAIN,
+        );
+        assert!(out.contains("2 step exhaustion(s)"), "{out}");
+        assert!(out.contains("predates the step-budget settlement"), "{out}");
+        assert!(
+            out.contains("cannot show lost work"),
+            "the number must not be read as a clean bill: {out}"
+        );
+    }
+
+    #[test]
+    fn a_settlement_after_the_step_budget_is_named_apart_from_a_claim() {
+        // D-115's contribution is invisible in `closed_green` alone: five closures look the same
+        // whether the model claimed them or the budget ran out and the gates happened to agree.
+        let out = metrics(
+            &json!({"count": 1, "tasks": [{
+                "task": "tsk_01A", "closed_green": 5, "closed_with_escalation": 0,
+                "longest_green_streak": 3, "subtasks": [], "detectors": {},
+                "escalations_total": 0, "escalations_pending": 0, "restarts": 0,
+                "green_attempts": 5, "green_attempts_not_closed": 0,
+                "settled_after_step_budget": 3, "step_exhaustions_without_gates": 0,
+                "records": 899, "corrupt": false,
+            }]}),
+            PLAIN,
+        );
+        assert!(out.contains("3 of them settled after the step budget"), "{out}");
+        assert!(out.contains("not on a claim"), "{out}");
     }
 
     #[test]
