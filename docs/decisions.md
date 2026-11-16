@@ -4263,3 +4263,35 @@ the planner's answer is unusable: the planner's answer is unusable: the answer c
 форме это гонка, а не сломанный тест. Теперь `UnixListener::bind` + `set_nonblocking(true)`
 делаются синхронно до старта потока, а внутрь уходит `from_std`. Пять полных прогонов бинаря
 подряд — зелёные.
+
+## D-131. Путь, который команда только читает, судится по правилам чтения
+
+`Effect` — свойство **всей** командной строки, и `cd` делает её `Mutate`. Значит каждая строка вида
+`cd <куда-то> && …` уходила в `check_writes`, а тот судил **все** пути по `deny_write_globs` и по
+worktree-containment. Для путей, которые команда только читает, оба правила неверны.
+
+**Чем это стоило.** Живой прогон `qna_rails`, 2026-11-16. Модель писала `docs/contributing.md`;
+подзадача сожгла **три попытки по 60 шагов**, не записав ни байта. Два отказа:
+
+- 15:59 и 16:06 — `cd <worktree> && cat .env.sample; …; cat .env.test` → `denied_by_policy: the
+  path is protected by the deny list (matched **/.env*)`. `**/.env*` — это глоб **записи**,
+  который оператор поставил, чтобы нельзя было перезаписать env-файл. `.env.sample` лежит в
+  репозитории именно для чтения.
+- 16:03 — `cd app && … && cd ../lib && ls -R .` → `the path is outside the task worktree`
+  с субъектом `../lib`. `cd` ничего не пишет; `..` — это способ оболочки ходить по репозиторию.
+
+**Как теперь.** `check_writes` пропускает путь с `write == false` через `check_reads` и идёт
+дальше. Ничего не ослаблено: чтение и так ограничено `workspace_root` и и так чтит
+`deny_read_globs`; просто теперь к чтению применяются правила чтения. Флаг `PathUse::write` уже
+нёс это различие — `cd` пишется как `PathUse::read`, — и `check_writes` его игнорировал.
+
+Прецедент того же класса уже был в этом файле: комментарий к проверке пяти state-документов
+описывает, как `cat .agent/TASKS.json 2>/dev/null` трижды отказывали, потому что sink-redirect
+делал команду `Mutate`; тогда спаслись флагом `used.write`. Здесь тот же флаг, но правило общее.
+
+**Чем закреплено.** `a_read_inside_a_mutating_command_is_not_judged_as_a_write` (два чтения
+`.env.sample`/`.env.test` в мутирующей команде), `a_read_outside_the_worktree_inside_a_mutating_command_is_allowed`
+(`cd ../lib`), и обратный — `a_write_to_an_env_file_is_still_denied_inside_a_mutating_command`,
+чтобы исправление нельзя было свести к «перестать смотреть на deny-лист». Саботаж: убрать ветку —
+падают оба первых, дословно воспроизводя живые сообщения («matched `**/.env*`» на `.env.sample` и
+«the path is outside the task worktree» на `../lib`), третий остаётся зелёным, как и должен.
