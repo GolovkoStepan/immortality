@@ -863,13 +863,35 @@ pub fn expected_branch(task: &TaskId) -> String {
 
 /// Read a journal directory into the shape recovery plans over.
 ///
+/// # Why the records are filtered by task
+///
+/// A project's journal is one file, `<repo>/.agent/JOURNAL.jsonl`, shared by every task in that
+/// project. `JournalReader::open` takes a task and every record carries a `task` field, but the
+/// reader returns the whole file: the `task` argument only tags the reader, it does not filter.
+/// Planning over the unfiltered outcome is how a live run on `qna_rails` closed another task's
+/// running attempt — `attempt_restarted` under task `…7SRMP0` naming a subtask of `…8CRGFM` — and
+/// rewrote both caches from both histories, which sent the victim to attempt 4 against a limit of
+/// 3. Recovery owns one task; it may only see that task's records.
+///
+/// The problems are **not** filtered. A torn tail or a chain break describes the file, and a file
+/// whose bytes are unreliable is unreliable for every task in it; dropping a problem along with the
+/// foreign records would let a corrupt journal be reported clean to the task that reads it next.
+///
 /// # Errors
 /// The directory cannot be read.
 pub fn read_journal(journal_dir: &Path, task: &TaskId) -> std::result::Result<ReadOutcome, String> {
-    immortality_core::journal::JournalReader::open(journal_dir, task)
+    let outcome = immortality_core::journal::JournalReader::open(journal_dir, task)
         .map_err(|error| format!("cannot open the journal in {}: {error}", journal_dir.display()))?
         .read()
-        .map_err(|error| format!("cannot read the journal in {}: {error}", journal_dir.display()))
+        .map_err(|error| format!("cannot read the journal in {}: {error}", journal_dir.display()))?;
+    Ok(immortality_core::journal::ReadOutcome {
+        records: outcome
+            .records
+            .into_iter()
+            .filter(|record| &record.fields.task == task)
+            .collect(),
+        ..outcome
+    })
 }
 
 /// The gate verdict type, re-exported so a caller does not have to reach into core for it.

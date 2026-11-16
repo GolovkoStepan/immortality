@@ -265,9 +265,22 @@ pub fn collect_garbage(
                 )));
             }
         };
-        if crate::recovery::is_unfinished(&outcome.records) {
+        // A project's journal is shared by every task in it, so the records are narrowed to this
+        // task before either question below is asked. Without the filter `is_unfinished` reads the
+        // last `task_state` of *any* task: a project whose newest record belongs to a merged task
+        // reports each of its running ones as finished, their artifacts leave the protected set,
+        // and `gc` deletes the bodies of tool results a live task is about to replay. The live set
+        // has the same problem in the other direction — another task's artifacts would be kept
+        // against this task's records — and `referenced_artifacts` reads whatever it is handed.
+        let owned: Vec<JournalRecord> = outcome
+            .records
+            .iter()
+            .filter(|record| &record.fields.task == task)
+            .cloned()
+            .collect();
+        if crate::recovery::is_unfinished(&owned) {
             unfinished.push(task.clone());
-            protected.extend(gc::referenced_artifacts(&outcome.records));
+            protected.extend(gc::referenced_artifacts(&owned));
         }
     }
 

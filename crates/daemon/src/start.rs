@@ -513,10 +513,12 @@ fn execute(run: Run) -> Result<TaskState, String> {
             CheckRunner::new(worktree.path.clone()),
             gate_base(&worktree.path, &project.path, &task),
         ))),
-        reviewer: Some(Arc::new(ModelReviewer::new(
-            Arc::clone(&model),
-            config.models.utility.clone(),
-        ))),
+        reviewer: Some(Arc::new(
+            ModelReviewer::new(Arc::clone(&model), config.models.utility.clone())
+                // The operator's one completion budget, not a second number to tune. A reviewer
+                // that could not finish its answer is the defect `REVIEW_MAX_TOKENS` records.
+                .with_max_tokens(config.backend.max_completion_tokens),
+        )),
         max_subtask_depth: config.loop_.max_subtask_depth,
         // The top-level agent. Only a delegated brief is deeper, and it is the only runner
         // that sets this to anything else.
