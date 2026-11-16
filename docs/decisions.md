@@ -4295,3 +4295,41 @@ worktree-containment. Для путей, которые команда толь�
 чтобы исправление нельзя было свести к «перестать смотреть на deny-лист». Саботаж: убрать ветку —
 падают оба первых, дословно воспроизводя живые сообщения («matched `**/.env*`» на `.env.sample` и
 «the path is outside the task worktree» на `../lib`), третий остаётся зелёным, как и должен.
+
+## D-132. Транспортная ошибка несёт свою причину, а не только адрес
+
+`classify_transport` клал в `detail` результат `reqwest::Error::to_string()`, а тот печатает
+`error sending request for url (<url>)` — адрес и ничего больше. Причина (`connection refused`,
+`connection reset by peer`, отказ DNS, оборванное тело) живёт в цепочке `source()`, которую
+`to_string()` не обходит.
+
+**Чем это стоило.** Живой прогон `qna_rails`, 2026-11-16, 16:40 и 16:48. Две попытки закрылись
+`abandoned`, и обе попали в журнал одной и той же фразой:
+
+```
+retryable backend failure (BrokenStream): error sending request for url (http://llm-server:47832/v1/chat/completions)
+```
+
+Поле `detail` заведено именно под вопрос «почему кончилась попытка» (D-125) — чтобы «бэкенд умер»
+и «модель обрезалась» перестали читаться одинаково. Транспортная ошибка это поле заполняла, но
+причину теряла: по журналу нельзя было отличить флаки-сеть от упавшего соединения от дефекта в
+клиенте. Класс тот же, что D-125, только на другом конце провода.
+
+**Как теперь.** `transport_detail(&reqwest::Error)` идёт по `source()`, пока цепочка не кончится,
+и дописывает каждое звено через `: `, пропуская повторы. Выглядит так:
+
+```
+retryable backend failure (Connect): error sending request for url (http://127.0.0.1:65325/chat/completions): client error (Connect): tcp connect error: Connection refused (os error 61)
+```
+
+Длинно намеренно: `client error (Connect)` и `tcp connect error` — это звенья `reqwest`/`hyper`,
+и убирать их значило бы угадывать, какое звено информативно для следующей ошибки. Классификация
+не тронута: `is_timeout`/`is_connect`/`is_body` решают по-прежнему они, меняется только текст.
+
+**Чем закреплено.** `a_transport_error_keeps_the_reason_it_was_caused_by` поднимает настоящий
+`reqwest::Error` (connect на закрытый порт) и требует, чтобы причина была видна, а адрес не
+потерялся; `a_timeout_stays_a_timeout_and_still_names_its_cause` держит вторую половину — растущий
+`detail` не имеет права переставить классификацию, таймаут обязан остаться `Timeout`. Саботажи:
+вернуть `error.to_string()` — первый падает и воспроизводит живое сообщение дословно; переименовать
+`Timeout` в `Connect` — второй падает на `left: Connect, right: Timeout`. Оба собираются и падают
+по существу.
