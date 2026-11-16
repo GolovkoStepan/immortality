@@ -803,3 +803,48 @@ fn a_second_plan_goal_refuses_to_overwrite_without_force() {
     let replaced = std::fs::read_to_string(daemon.repo.join(".agent").join("PLAN.md")).unwrap();
     assert!(!replaced.contains("my own plan"), "{replaced}");
 }
+
+#[test]
+fn serve_reads_the_global_config_it_was_given() {
+    // `--global-config` is a global flag, so it must reach `serve` like it reaches every other
+    // command. It used to not: `serve::run` loaded `Overrides::default()` and silently served the
+    // built-in config, so a daemon started with an explicit file disagreed with the client that
+    // started it about policy and storage. That is the worst kind of disagreement — the client
+    // reports one retention policy and the daemon enforces another.
+    //
+    // `gc` is the observation, not the subject: it is the one command that echoes the config the
+    // *daemon* holds (`state.config.storage`), so the answer proves which file the daemon read
+    // without reaching into its internals.
+    let daemon = Daemon::new();
+    let mut global = std::fs::read_to_string(&daemon.global_config).unwrap();
+    global.push_str("\n[storage]\nartifact_ttl_days = 7\nlog_retention_months = 11\n");
+    std::fs::write(&daemon.global_config, global).unwrap();
+
+    let mut child = daemon
+        .cli()
+        .arg("serve")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !daemon.socket.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(daemon.socket.exists(), "the daemon never bound its socket");
+
+    let output = daemon.cli().args(["gc", "--dry-run", "--json"]).output().unwrap();
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert!(output.status.success(), "{output:?}");
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        value["storage"]["artifact_ttl_days"], 7,
+        "the daemon ignored --global-config and served its built-in defaults: {value}"
+    );
+    assert_eq!(
+        value["storage"]["log_retention_months"], 11,
+        "the daemon ignored --global-config and served its built-in defaults: {value}"
+    );
+}

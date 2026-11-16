@@ -203,7 +203,7 @@ async fn main() -> Result<()> {
         Command::Log { task } => log_command(task, cli.json).await,
         Command::Metrics { task } => metrics_command(task, cli.json).await,
         Command::Merge { task } => merge_command(&task, cli.json).await,
-        Command::Serve => serve::run().await,
+        Command::Serve => serve::run(&overrides).await,
         Command::Service { action } => service_command(&action, cli.json),
     }
 }

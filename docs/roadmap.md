@@ -606,6 +606,7 @@ macOS-машине), то есть токен и артефакты журнал
 | подзадача переоткрыта после зелёного закрытия | видно счётчиком, а не спрятано (`a_subtask_reopened_after_a_green_closure_is_reported_rather_than_hidden`) |
 | критерий `0.2` напечатан словами | читатель не восстанавливает предложение из четырёх чисел (`metrics_state_the_zero_lost_work_criterion_in_words`) |
 | журнал до D-115 в `metrics` | сказано, что о потере работы он молчит, а не что её нет (`a_journal_without_gate_checks_on_a_spent_budget_says_so`) |
+| `serve` игнорирует `--global-config` | демон и клиент применяют разные политики хранения и workspace; `gc` отчитывается чужой настройкой (`serve_reads_the_global_config_it_was_given`, D-118) |
 
 ---
 

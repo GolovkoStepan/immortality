@@ -181,10 +181,16 @@ pub fn ensure_token(path: &Path) -> Result<()> {
 
 /// Run the daemon until the process is killed.
 ///
+/// `overrides` is the same value every other command loads the config from, and passing it
+/// matters: `--global-config` is a global flag, so `immortality --global-config /tmp/x.toml serve`
+/// must read `/tmp/x.toml` and not the discovered default. Loading `Overrides::default()` here
+/// ignored the flag and silently served the built-in policy — measured, not assumed: a daemon
+/// started that way reported `artifact_ttl_days = 30` while the file said `7`.
+///
 /// # Errors
 /// Another daemon holds the lock, the token cannot be created or read, or the socket cannot be
 /// bound.
-pub async fn run() -> Result<()> {
+pub async fn run(overrides: &Overrides) -> Result<()> {
     let state = StatePaths::discover();
     let root = state.root().to_path_buf();
     // Owner-only before anything is written into it: the token, the registry and the artefacts
@@ -208,7 +214,7 @@ pub async fn run() -> Result<()> {
     // The loaded config, not the built-in defaults: the plan depth limit is a user setting, and a
     // `status` that read plans against a different limit than the scheduler would disagree with it
     // about whether a tree is valid.
-    let loaded = config::load(&Overrides::default())?;
+    let loaded = config::load(overrides)?;
     for warning in &loaded.warnings {
         tracing::warn!("{warning}");
     }
