@@ -361,6 +361,20 @@ impl Checkpoints for FakeCheckpoints {
             .push(sha.to_string());
         Ok(())
     }
+
+    /// A commit to the task branch, with a SHA generated the same way a snapshot's is.
+    ///
+    /// The simulator is about the cycle's decisions, so the message is all a golden can assert;
+    /// the SHA exists because a caller may journal it.
+    fn commit(&self, message: &str) -> std::result::Result<Option<String>, String> {
+        let number = {
+            let mut next = self.next.lock().map_err(|error| error.to_string())?;
+            *next += 1;
+            *next
+        };
+        let _ = message;
+        Ok(Some(format!("{number:040x}")))
+    }
 }
 
 // ── the cycle ────────────────────────────────────────────────────────────────────────────

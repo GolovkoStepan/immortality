@@ -23,6 +23,7 @@ fn candidate(suffix: &str, created: i64) -> Candidate {
         hold: None,
         created_at: at(created),
         has_work: true,
+        in_flight: false,
     }
 }
 

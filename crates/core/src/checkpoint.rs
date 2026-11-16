@@ -199,6 +199,64 @@ impl GitRepo {
         }))
     }
 
+    /// Commit the working tree to `task_branch` without moving `HEAD` or touching the tree.
+    ///
+    /// The same sequence a hidden checkpoint uses — `add --all`, `write-tree`, `commit-tree`,
+    /// `update-ref` — pointed at the task branch instead of `agent-ckpt/<task>`. That is the
+    /// point: `commit_with_trailers` starts with `git checkout --force <branch>`, and a forced
+    /// checkout of the branch the worktree is already on **reverts every tracked modification**.
+    /// Measured: a worktree with `M src/count.rs` and `A PLAN.md` came back identical to its
+    /// `HEAD` after `git checkout --force agent/<task>`, so the work a subtask had just passed its
+    /// gates with was thrown away before it could be committed.
+    ///
+    /// `Ok(None)` when the tree is identical to the branch's tip — a subtask whose `DoD` was
+    /// already satisfied by earlier work. A commit with no change would be noise in a history a
+    /// human reviews before merging.
+    ///
+    /// # Errors
+    /// Git failed. The caller must not close the subtask.
+    pub fn commit_to_branch(&self, task_branch: &str, message: &str) -> Result<Option<Checkpoint>, GitError> {
+        let branch = ensure_agent_prefix(task_branch);
+        self.git(&["add", "--all"])?;
+        let tree = self.git(&["write-tree"])?.trim().to_string();
+        // The parent is the branch's tip when it exists, `HEAD` otherwise: a task branch that
+        // nobody has created yet starts where the worktree is, which is the commit the worktree
+        // was built from.
+        let parent = if self.branch_exists(&branch) {
+            Some(self.git(&["rev-parse", &branch])?.trim().to_string())
+        } else {
+            self.head()?
+        };
+        if let Some(parent) = &parent {
+            let parent_tree = self
+                .git(&["rev-parse", &format!("{parent}^{{tree}}")])?
+                .trim()
+                .to_string();
+            if parent_tree == tree {
+                return Ok(None);
+            }
+        }
+
+        let identity = identity_args();
+        let mut args: Vec<&str> = vec!["-c", &identity[0], "-c", &identity[1], "commit-tree", &tree];
+        if let Some(parent) = &parent {
+            args.extend(["-p", parent]);
+        }
+        args.extend(["-m", message]);
+        let sha = self.git(&args)?.trim().to_string();
+        // The ref moves; when `HEAD` is a symref to it the worktree's view follows, and the index
+        // already holds this tree, so the tree reads clean afterwards. When `HEAD` is elsewhere
+        // the worktree keeps its changes, which is what the untracked-file branch of the gate diff
+        // expects.
+        self.force_branch(&branch, &sha)?;
+        Ok(Some(Checkpoint {
+            sha,
+            kind: CheckpointKind::Meaningful,
+            branch,
+            reason: message.to_string(),
+        }))
+    }
+
     /// Commit the current tree to the task branch with a Conventional Commit message.
     ///
     /// `nonce` is appended as a trailer so that a crash-time probe can find this commit by
@@ -758,6 +816,53 @@ mod tests {
             .unwrap_err();
         assert!(error.message.contains("does not exist"), "{error}");
         assert_eq!(fixture.read("work.txt"), "keep me");
+    }
+
+    #[test]
+    fn committing_to_the_branch_keeps_the_tree_it_committed() {
+        // The failure this replaces was measured on the dogfood rehearsal: `git checkout --force`
+        // of the branch the worktree was already on reverted every tracked modification, so the
+        // work a subtask had just passed its gates with disappeared, and the task-level gate then
+        // read an empty diff and went red. A commit is supposed to preserve work, not destroy it.
+        let fixture = Fixture::new();
+        fixture.repo.ensure_branch("agent/tsk_keep", "main").unwrap();
+        fixture.write("README.md", "# changed by the subtask\n");
+        fixture.write("src/new.rs", "pub fn new() {}\n");
+
+        let checkpoint = fixture
+            .repo
+            .commit_to_branch("agent/tsk_keep", "chore: keep the work")
+            .unwrap()
+            .expect("a commit");
+        assert_eq!(checkpoint.kind, CheckpointKind::Meaningful);
+
+        // Both files are still there, with their contents: the tracked edit was not reverted, and
+        // the untracked file was committed rather than left behind.
+        assert_eq!(fixture.read("README.md"), "# changed by the subtask\n");
+        assert_eq!(fixture.read("src/new.rs"), "pub fn new() {}\n");
+        // And the branch carries them, which is what a human merges.
+        let branch = fixture.repo.git(&["rev-parse", "agent/tsk_keep"]).unwrap();
+        assert_eq!(branch.trim(), checkpoint.sha);
+        let on_branch = fixture
+            .repo
+            .git(&["show", "--name-only", "--format=", &checkpoint.sha])
+            .unwrap();
+        assert!(on_branch.contains("README.md"), "{on_branch}");
+        assert!(on_branch.contains("src/new.rs"), "{on_branch}");
+    }
+
+    #[test]
+    fn committing_an_unchanged_tree_reports_nothing_to_commit() {
+        // A subtask can close without touching a file — its `DoD` may be satisfied by work an
+        // earlier subtask landed. An empty commit in a history a human reviews before merging is
+        // noise, and `Ok(None)` is the honest answer.
+        let fixture = Fixture::new();
+        fixture.repo.ensure_branch("agent/tsk_same", "main").unwrap();
+        let first = fixture
+            .repo
+            .commit_to_branch("agent/tsk_same", "chore: nothing new")
+            .unwrap();
+        assert!(first.is_none(), "an unchanged tree has nothing to commit");
     }
 
     #[test]

@@ -236,11 +236,17 @@ src/parser.rs», «run `cargo test`»), а не описание инструм�
    `daemon::recovery` (`preserved`, `discarded` и `recovery` при старте). «Перед каждым
    рискованным действием» — это цель дизайна, а не сегодняшнее поведение: гейт рискованного
    вызова снимок не берёт.
-2. **Содержательные** — коммиты в `agent/<task-id>`. `GitRepo::meaningful_commit` (Conventional
-   Commit + трейлер `Attempt: <nonce>`) реализован и покрыт тестами, но в проде его не зовёт
-   никто: коммит на закрытии подзадачи делает **модель** через инструмент `git`
-   (`subcommand: "commit"`), и трейлер у такого коммита — `Immortality-Call: <call-id>`, а не
-   nonce попытки. Именно поэтому probe для `git commit` ищет call-id (D-063).
+2. **Содержательные** — коммиты в `agent/<task-id>`. Их два производителя.
+   **Петля**: `Pass::commit` в `daemon::cycle` зовёт `Checkpoints::commit` на `Stop::Done` **до**
+   записи `done`, и `GitCheckpoints::commit` кладёт дерево на ветку через
+   `GitRepo::commit_to_branch` (`add --all` → `write-tree` → `commit-tree` → `update-ref`, без
+   чекаута) с одним Conventional Commit на подзадачу (D-122). Ветку без этих коммитов нечего
+   сливать, и `merge` теперь отказывает на ней, а не отчитывается `merged` (D-121).
+   **Модель**: инструмент `git` (`subcommand: "commit"`) с трейлером
+   `Immortality-Call: <call-id>` — именно поэтому probe для `git commit` ищет call-id (D-063).
+   `GitRepo::meaningful_commit` (Conventional Commit + трейлер `Attempt: <nonce>`) реализован и
+   покрыт тестами, но в проде его по-прежнему не зовёт никто: probe нужен коммиту, который может
+   быть потерян крахом внутри попытки, а коммит петли делается после вердикта.
 
 Откат (L3) = `git reset --hard <ckpt-sha>` в worktree задачи + восстановление состояния
 подзадачи к последнему консистентному снимку. Мгновенно и без мусора в истории.

@@ -68,6 +68,7 @@ pub fn candidates(
                 hold: facts.hold,
                 created_at: facts.created_at,
                 has_work: facts.has_work,
+                in_flight: facts.in_flight,
             },
             project,
             task_dir,
@@ -83,6 +84,7 @@ struct Facts {
     hold: Option<Hold>,
     created_at: immortality_core::domain::Timestamp,
     has_work: bool,
+    in_flight: bool,
 }
 
 fn facts_for(project: &Project, task: &immortality_core::ids::TaskId, config: &Config) -> Facts {
@@ -96,6 +98,7 @@ fn facts_for(project: &Project, task: &immortality_core::ids::TaskId, config: &C
             hold: None,
             created_at: now,
             has_work: false,
+            in_flight: false,
         };
     };
     let records: Vec<&immortality_core::journal::JournalRecord> = outcome
@@ -124,14 +127,27 @@ fn facts_for(project: &Project, task: &immortality_core::ids::TaskId, config: &C
     // A plan that cannot be read is not "work available": starting an attempt against a tree
     // nobody could parse would fail on the first step, and the task would spend its attempts on a
     // planner bug. It is left to `status`/`plan` to say why.
-    let has_work = Plan::load(&project.path, config.loop_.max_subtask_depth)
-        .is_ok_and(|plan| plan.next_ready().is_some());
+    //
+    // `has_work` and `in_flight` are asked of the same loaded plan because only the tree knows
+    // both: "a subtask may start" is `next_ready`, and "a subtask is already being worked on" is
+    // a `running` subtask, which `next_ready` skips by construction. Deriving only the first is
+    // what made `status` describe a live run as an idle task.
+    let (has_work, in_flight) =
+        Plan::load(&project.path, config.loop_.max_subtask_depth).map_or((false, false), |plan| {
+            (
+                plan.next_ready().is_some(),
+                plan.open_subtasks()
+                    .iter()
+                    .any(|subtask| subtask.state == immortality_core::domain::SubtaskState::Running),
+            )
+        });
 
     Facts {
         state,
         hold,
         created_at,
         has_work,
+        in_flight,
     }
 }
 

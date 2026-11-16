@@ -251,6 +251,27 @@ fn the_outage_survives_a_kill_and_a_restart() {
 }
 
 #[test]
+fn a_task_whose_subtask_is_running_says_so_instead_of_claiming_there_is_no_work() {
+    // Measured on `tsk_01M7HJEFXD7YDHGM59Y4X57FTZ`: while the first attempt was in its middle,
+    // `status` said "1 with no subtask left to run" and `scheduling.next` was null. The daemon was
+    // working; the *report* said it had nothing to do, which is the one sentence this project
+    // exists to never say wrongly.
+    //
+    // The cause: `has_work` is `next_ready`, and `next_ready` offers only `pending` subtasks, so a
+    // tree with one `running` subtask reads as empty. The fix keeps `has_work` false — a second
+    // attempt would fork the journal — and adds the missing fact the renderer needs.
+    let fixture = Fixture::with_plan(&plan_body(SubtaskState::Running));
+    let candidate = fixture.only();
+    assert!(!candidate.has_work, "a running subtask is not a second attempt");
+    assert!(candidate.in_flight, "but it is work in progress");
+    assert_eq!(
+        candidate.ineligible_for_inference(),
+        Some(Ineligible::InFlight),
+        "and the reason must say so, not `NoWork`"
+    );
+}
+
+#[test]
 fn a_plan_with_every_subtask_settled_offers_no_work() {
     let fixture = Fixture::with_plan(&plan_body(SubtaskState::Done));
     let candidate = fixture.only();

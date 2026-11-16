@@ -21,6 +21,11 @@
 //! diff is against `HEAD`, which is a correct — if broader — answer. Broadening is the safe
 //! direction: an over-wide diff costs a reviewer some reading, an under-wide one approves unseen
 //! work.
+//!
+//! The task-level verdict has the opposite problem and so the opposite base. Every closed subtask
+//! is committed to `agent/<task>` (D-122), which means the work is *in* `HEAD` and the diff against
+//! it is empty. [`task_base`] gives the fork point instead, so the reviewer reads what the task
+//! actually added rather than nothing at all (D-123).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -213,6 +218,29 @@ impl Reviewer for ModelReviewer {
     }
 }
 
+/// The commit a task's work forked from, used as the task-level gate's diff base.
+///
+/// The task-level review used to diff against `HEAD` and see the whole task's work, because the
+/// work was uncommitted. Committing each closed subtask to `agent/<task>` moved that work into
+/// `HEAD`, and the same diff became empty — measured on a live `word-count` run: every subtask
+/// closed green, `agent/<task>` carried three commits, and the task verdict was
+/// `review_rejected: the diff is empty`. A reviewer that approves an empty diff approves nothing,
+/// so the task-level gate needs the fork point instead.
+///
+/// `None` when either endpoint is unknown — a repository with no commits, or a branch git cannot
+/// resolve. The caller then keeps `HEAD`, which is what the gate did before and is never wider
+/// than safe.
+#[must_use]
+pub fn task_base(worktree: &GitRepo, repository: &Path, branch: &str) -> Option<String> {
+    let fork = GitRepo::new(repository).head().ok().flatten()?;
+    let merged = worktree
+        .git(&["merge-base", &fork, branch])
+        .ok()?
+        .trim()
+        .to_string();
+    (!merged.is_empty()).then_some(merged)
+}
+
 /// Read the base commit of an attempt, if the journal knows one.
 ///
 /// Kept as a separate function so the caller decides what "no base" means. `None` here makes the
@@ -266,6 +294,22 @@ mod tests {
             .expect("git commit");
         assert!(status.success());
         (dir, repo)
+    }
+
+    /// Run git in `dir`, failing the test with git's own words if it refuses.
+    fn git(dir: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .expect("git");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     fn gates(worktree: &Path) -> RealGates {
@@ -349,6 +393,57 @@ mod tests {
         let mut scoped = gates(dir.path());
         scoped.base = Some(base);
         assert_eq!(scoped.diff(None).expect("diff").files.len(), 1);
+    }
+
+    #[test]
+    fn the_task_base_shows_a_reviewer_the_work_that_was_committed() {
+        // Measured on a live `word-count` run: every subtask closed green, `agent/<task>` carried
+        // three commits, and the task-level verdict was `review_rejected` because the diff against
+        // `HEAD` was empty — the work was *in* `HEAD`. A reviewer approving an empty diff approves
+        // nothing, so the task gate has to diff from the fork point.
+        //
+        // Two checkouts, as in production: the repository a human merges into, and the task's
+        // worktree. One directory would put both `HEAD`s on the same branch and answer the wrong
+        // question.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repository = dir.path().join("repo");
+        let worktree = dir.path().join("wt");
+        std::fs::create_dir_all(&repository).expect("repo dir");
+        git(&repository, &["init", "-q", "-b", "main"]);
+        git(&repository, &["config", "user.email", "test@example.com"]);
+        git(&repository, &["config", "user.name", "test"]);
+        std::fs::write(repository.join("a.txt"), "one\n").expect("write");
+        git(&repository, &["add", "-A"]);
+        git(&repository, &["commit", "-q", "-m", "chore: base"]);
+        git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                worktree.to_str().expect("utf-8"),
+                "-b",
+                "agent/tsk_base",
+            ],
+        );
+        std::fs::write(worktree.join("a.txt"), "one\ntwo\n").expect("write");
+        git(&worktree, &["add", "-A"]);
+        git(&worktree, &["commit", "-q", "-m", "chore: the task's work"]);
+
+        // Against `HEAD` there is nothing to review, which is the bug.
+        assert!(
+            gates(&worktree).diff(None).expect("diff").is_empty(),
+            "the work is committed, so `HEAD` alone shows nothing"
+        );
+
+        // The fork point is where the task forked from, so the committed work is the diff.
+        let base = task_base(&GitRepo::new(&worktree), &repository, "agent/tsk_base").expect("a fork point");
+        let mut scoped = gates(&worktree);
+        scoped.base = Some(base);
+        let diff = scoped.diff(None).expect("diff");
+        assert_eq!(diff.files.len(), 1, "{diff:?}");
+        assert_eq!(diff.files[0].path, PathBuf::from("a.txt"));
+        assert!(diff.files[0].added_lines.iter().any(|line| line == "two"));
     }
 
     #[test]

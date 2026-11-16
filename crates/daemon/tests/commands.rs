@@ -116,6 +116,18 @@ impl Fixture {
     fn temp(&self) -> &Path {
         self.dir.path()
     }
+
+    /// Make `.agent/` visible to git, as a repository that never ignored it.
+    ///
+    /// The fixture ignores `.agent/` so that its own bookkeeping does not follow every test into
+    /// git. That convenience hid a real defect: `merge` counted the daemon's own files as a dirty
+    /// checkout and refused after any successful run, and no test could see it while the directory
+    /// was ignored. Tests about that guard call this first.
+    fn stop_ignoring_agent_dir(&self) {
+        std::fs::write(self.repo.join(".gitignore"), "target/\n").expect("gitignore");
+        git(&self.repo, &["add", "-A"]);
+        git(&self.repo, &["commit", "-q", "-m", "stop ignoring the state dir"]);
+    }
 }
 
 fn git(repo: &Path, args: &[&str]) {
@@ -421,6 +433,95 @@ fn merge_lands_the_branch_and_journals_merged() {
         .expect("git log");
     let text = String::from_utf8_lossy(&log.stdout);
     assert!(text.contains(&format!("merge {}", task().as_str())), "{text}");
+}
+
+#[test]
+fn merge_lands_a_run_that_left_its_own_bookkeeping_modified() {
+    // Measured on the `word-count` fixture after a run that closed three subtasks green: the main
+    // checkout was dirty with ` M .agent/PLAN.md`, ` M .agent/TASKS.json` and
+    // `?? .agent/JOURNAL.jsonl` — all of them written by the daemon. The clean-checkout guard
+    // counted those, so `merge` refused the normal outcome of a successful task, and `merge` is
+    // the one git action D-011 leaves to the human. The old fixture hid this by ignoring
+    // `.agent/`, so this test un-ignores it: the bookkeeping a run produces is exactly what the
+    // guard has to tolerate.
+    let fixture = Fixture::new();
+    fixture.stop_ignoring_agent_dir();
+    fixture.agent_commit("work.txt");
+    // The run's own bookkeeping, written *after* the work: `agent_commit` checks branches out in
+    // the main checkout, so a journal written before it would be rolled back by the checkout —
+    // and in a real run the daemon writes to the project checkout while the agent works in a
+    // separate worktree.
+    fixture.record_merged_ready();
+    std::fs::write(
+        fixture.repo.join(".agent").join("PLAN.md"),
+        "# the advanced plan\n",
+    )
+    .expect("plan");
+
+    let result = commands::merge(
+        &fixture.state(),
+        &params(serde_json::json!({"task": task().as_str()})),
+    )
+    .expect("a run's own bookkeeping must not block the merge");
+    assert_eq!(result["state"], "merged");
+    assert!(fixture.repo.join("work.txt").exists(), "the branch must land");
+}
+
+#[test]
+fn merge_refuses_a_human_edit_and_names_the_file() {
+    // The other half of the same rule: excluding `.agent/` must not turn the guard off. A file the
+    // human was editing mixes into a commit that belongs to neither of them, and a refusal that
+    // does not say *which* file leaves them guessing.
+    let fixture = Fixture::new();
+    fixture.record_merged_ready();
+    fixture.agent_commit("work.txt");
+    std::fs::write(fixture.repo.join("notes.txt"), "my own half-done edit\n").expect("write");
+
+    let error = commands::merge(
+        &fixture.state(),
+        &params(serde_json::json!({"task": task().as_str()})),
+    )
+    .expect_err("must refuse");
+    assert_eq!(error.code, ErrorCode::BadParams);
+    assert!(
+        error.message.contains("notes.txt"),
+        "the refusal must name the offending file: {}",
+        error.message
+    );
+    assert!(
+        !fixture.repo.join("work.txt").exists(),
+        "a refused merge must not land anything"
+    );
+}
+
+#[test]
+fn merge_refuses_a_branch_with_nothing_ahead_of_main() {
+    // Git answers a merge of an already-contained branch with a successful no-op ("Already up to
+    // date"), so the old code journalled `merged` for a task whose work had never been committed.
+    // Measured: `word-count` closed three subtasks green, `agent/<task>` sat on `main`'s commit,
+    // and `immortality merge` reported `merged` while the work existed only in the worktree and in
+    // `agent-ckpt/<task>`. A human told "merged" has no reason to go looking.
+    let fixture = Fixture::new();
+    fixture.record_merged_ready();
+    // The branch exists — the task's worktree was created on it — but no commit was ever made.
+    git(&fixture.repo, &["branch", &format!("agent/{}", task().as_str())]);
+
+    let error = commands::merge(
+        &fixture.state(),
+        &params(serde_json::json!({"task": task().as_str()})),
+    )
+    .expect_err("must refuse");
+    assert_eq!(error.code, ErrorCode::BadParams);
+    assert!(
+        error.message.contains("nothing to merge"),
+        "the refusal must say the branch is empty: {}",
+        error.message
+    );
+    assert!(
+        error.message.contains("agent-ckpt/"),
+        "and must point at where the work actually is: {}",
+        error.message
+    );
 }
 
 #[test]

@@ -560,6 +560,24 @@ pub trait Checkpoints {
     /// Git failed, and the tree may be part-way through the reset. The caller stops rather than
     /// continuing on a tree whose state nobody knows.
     fn restore(&self, sha: &str) -> Result<(), String>;
+
+    /// Commit the tree to the task branch, as the work of one closed subtask.
+    ///
+    /// This is the other half of why checkpoints exist: `snapshot` is the rollback that makes a
+    /// lost attempt cheap, and this is the commit a human merges. Without it `agent/<task>` never
+    /// moves past its base, `immortality merge` has nothing to bring into `main`, and a run that
+    /// closed every subtask green leaves its work in a worktree nobody is told about. Measured on
+    /// three runs (`word-count`, `word-count-fresh`, `kill-test`): `agent/<task>` pointed at the
+    /// same commit as `main` in all three, with the work present only as uncommitted changes and
+    /// in `agent-ckpt/<task>`.
+    ///
+    /// `Ok(None)` means the tree had nothing to commit — a subtask that closed without touching a
+    /// file. That is a normal answer for a `DoD` whose work was already on the branch.
+    ///
+    /// # Errors
+    /// Git failed. The caller must not close the subtask: a closure that is not in the branch is
+    /// exactly the loss this method exists to prevent.
+    fn commit(&self, message: &str) -> Result<Option<String>, String>;
 }
 
 #[cfg(test)]

@@ -298,6 +298,13 @@ impl Gate {
 /// One model for all three roles, scripted by the system prompt it is given.
 struct Scripted {
     work: Work,
+    /// Refuse an empty diff the way the real gate does.
+    ///
+    /// Off by default: most fixtures in this file never produce work at all (`Work::Claim` closes
+    /// a subtask without touching a file), so a reviewer that refused every empty diff would fail
+    /// them for a reason they are not about. The production test that *does* produce work turns
+    /// this on, and that is the case where "approved an empty diff" is the bug.
+    refuse_empty_diff: bool,
     planner_calls: AtomicUsize,
     reviewer_calls: AtomicUsize,
     executor_calls: AtomicUsize,
@@ -311,6 +318,20 @@ impl Scripted {
     fn new(work: Work) -> Arc<Self> {
         Arc::new(Self {
             work,
+            refuse_empty_diff: false,
+            planner_calls: AtomicUsize::new(0),
+            reviewer_calls: AtomicUsize::new(0),
+            executor_calls: AtomicUsize::new(0),
+            judge_calls: AtomicUsize::new(0),
+            brief_calls: AtomicUsize::new(0),
+        })
+    }
+
+    /// The same script, refusing an empty diff.
+    fn strict(work: Work) -> Arc<Self> {
+        Arc::new(Self {
+            work,
+            refuse_empty_diff: true,
             planner_calls: AtomicUsize::new(0),
             reviewer_calls: AtomicUsize::new(0),
             executor_calls: AtomicUsize::new(0),
@@ -346,6 +367,27 @@ impl std::fmt::Debug for Scripted {
     }
 }
 
+/// The reviewer's answer, optionally refusing an empty diff the way the real gate does.
+///
+/// A reviewer that approves anything passes even when there is nothing to review, and "nothing to
+/// review" is exactly what a missing commit looks like: the work sits in `HEAD`, the diff against
+/// it is empty, and the task closes having merged nothing. `strict` makes the production test fail
+/// for the same reason a live run did.
+fn review(request: &ModelRequest, refuse_empty_diff: bool) -> Reply {
+    if refuse_empty_diff {
+        let prompt = request
+            .messages
+            .iter()
+            .filter_map(|message| message.content.as_deref())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if prompt.contains("the diff is empty") {
+            return Reply::text(r#"{"verdict":"request_changes","issues":["the diff is empty"]}"#);
+        }
+    }
+    Reply::text(r#"{"verdict":"approve"}"#)
+}
+
 impl Model for Scripted {
     fn complete(&self, request: &ModelRequest) -> Result<Reply, String> {
         // The first message is the system prompt by construction: the runner and the planner both
@@ -362,7 +404,7 @@ impl Model for Scripted {
         }
         if system == immortality_core::gate::REVIEW_SYSTEM {
             self.reviewer_calls.fetch_add(1, Ordering::SeqCst);
-            return Ok(Reply::text(r#"{"verdict":"approve"}"#));
+            return Ok(review(request, self.refuse_empty_diff));
         }
         if system == immortality_tools::judge::SYSTEM {
             self.judge_calls.fetch_add(1, Ordering::SeqCst);
@@ -518,7 +560,7 @@ fn a_goal_becomes_a_task_that_reaches_ready_for_review() {
     // The milestone's exit criterion, on the production path: one RPC call, a real worktree, the
     // cycle's own verdict. Nothing here fakes the journal, git or the gates.
     let fixture = Fixture::new();
-    let model = Scripted::new(Work::WriteThenClaim);
+    let model = Scripted::strict(Work::WriteThenClaim);
     let state = fixture.state(model.clone());
 
     let answer = start_now(&state, &json!({ "project": fixture.repo, "goal": GOAL }))
@@ -576,6 +618,24 @@ fn a_goal_becomes_a_task_that_reaches_ready_for_review() {
     assert_eq!(
         String::from_utf8_lossy(&branch.stdout).trim(),
         format!("agent/{task}")
+    );
+
+    // And the work is *on* that branch, not merely in the worktree. This is the half that was
+    // missing: the cycle closed subtasks without committing them, so `agent/<task>` stayed on its
+    // base commit. Every run measured — `word-count`, `word-count-fresh`, `kill-test` — had the
+    // work present only as uncommitted changes and in `agent-ckpt/<task>`, which made
+    // `immortality merge` report success having merged nothing.
+    let ahead = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&fixture.repo)
+        .args(["rev-list", "--count", &format!("HEAD..agent/{task}")])
+        .output()
+        .expect("git");
+    let ahead = String::from_utf8_lossy(&ahead.stdout).trim().to_string();
+    assert!(
+        ahead != "0",
+        "the closed subtask's work must be committed to `agent/{task}`; without it `merge` has \
+         nothing to land and says so wrongly"
     );
 }
 

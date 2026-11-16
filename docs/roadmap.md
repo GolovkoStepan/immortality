@@ -396,12 +396,16 @@ S1 ── M0 ── M1 ── M2 ── M3 ── M4 ── M5 ── M6
 
 ## 0.2 — петля не теряет найденное
 
-**Сделано, когда:** `immortality metrics --json` для прогона `black_jack` даёт одновременно
+**Сделано, когда:** `immortality metrics --json` на живом прогоне даёт одновременно
 `green_attempts_not_closed == 0`, `step_exhaustions_without_gates == 0` и `closed_green >= 5`, а
 `settled_after_step_budget > 0` — то есть хотя бы одна подзадача закрылась гейтами после
 исчерпанного бюджета шагов, а не заявкой. Три числа, а не одно: они отвечают на три разных
 вопроса, и «ноль потерянного» без «ноль непроверенного» и без «путь D-115 хотя бы раз исполнился»
 берётся прогоном, который ничего не нашёл.
+
+Числа берутся с прогона, где модель действительно работает; планка `closed_green >= 5` — с
+`black_jack`, потому что это записанный прогон, ради которого веха заведена. Позже она проверяется
+тем же `metrics` на любом живом прогоне с достаточным числом подзадач.
 
 **Почему формулировка изменилась.** Исходная — «нет попытки, где `gate_result` с
 `gate: "verdict"`, `passed: true`, а подзадача закрылась не как `done`» — на записанных журналах
@@ -557,8 +561,70 @@ macOS-машине), то есть токен и артефакты журнал
 здесь то же соображение), и молчаливое ужесточение прав на каталоге, который пользователь мог
 сделать общим, — сюрприз, а не защита.
 
+**8. Работа закрытой подзадачи попадает в ветку задачи. ✅ (D-122).** Замыкание цикла не
+коммитило ничего: `agent/<task>` оставался на базовом коммите, работа лежала только в worktree, а
+`merge` отчитывался `merged` (см. пункт 9). Замер по трём прогонам: `agent/<task>` совпадает с
+`main`, работа существует как незакоммиченные изменения и в `agent-ckpt/<task>`. Теперь
+`Pass::commit` на `Stop::Done` (до записи `done`) кладёт дерево на ветку через
+`commit_to_branch` — `add --all` → `write-tree` → `commit-tree` → `update-ref`, без чекаута, —
+одним Conventional Commit на подзадачу. Первая попытка использовала `commit_with_trailers`, и
+`git checkout --force` ветки, на которой worktree уже стоит, **откатывал все tracked-правки**:
+измерено, и это стирало работу подзадачи прямо перед task-level гейтом.
+
+**9. `merge` приземляет работу и не врёт об этом. ✅ (D-121).** Два дефекта одного стража.
+Первый: «главный чекаут чист» считал грязью `.agent/PLAN.md`, `.agent/TASKS.json` и
+`.agent/JOURNAL.jsonl`, которые пишет сам демон, поэтому `merge` отказывал на нормальном исходе
+успешной задачи; фикстура прятала это, держа `.agent/` в `.gitignore`. Второй: ветка без коммитов
+впереди `HEAD` сливается успешным no-op («Already up to date»), и старый код писал `merged` для
+работы, которой в ветке нет. Теперь `.agent` исключён из стража (`:(exclude).agent`, отказ
+называет конкретные файлы), а `rev-list --count HEAD..agent/<task> == "0"` — отказ, называющий
+`agent-ckpt/<task>`.
+
+**10. Task-level гейт диффит от точки ветвления задачи. ✅ (D-123).** Регрессия, которую породил
+пункт 8: ревью диффило против `HEAD` и видел всю работу, пока та была незакоммичена; коммит
+перенёс её в `HEAD`, и дифф стал пустым. Замерено на живом `word-count`: три подзадачи зелёные,
+`agent/<task>` несёт три коммита, вердикт задачи — `review_rejected: the diff is empty`. Теперь
+`gates::task_base` даёт `merge-base` между `HEAD` репозитория и `agent/<task>`, и он же — база
+`RealGates::base` на прод-пути. Ревьюер, одобряющий пустой дифф, не одобряет ничего.
+
+**11. `status` не называет идущую задачу пустой. ✅ (D-120).** Во время первой попытки
+`tsk_01M7HJEFXD7YDHGM59Y4X57FTZ` `status` печатал «1 with no subtask left to run», а
+`scheduling.next` был `null`. `has_work` — это `next_ready`, а тот предлагает только `pending`
+подзадачи, поэтому дерево с одной `running` подзадачей читалось как пустое. Добавлены
+`Candidate::in_flight` и `Ineligible::InFlight`: `has_work` остаётся `false` (второй попытке на
+том же дереве нельзя начинаться), но причина называет работу, а не её отсутствие.
+
+**Вне критерия, найдено и закрыто по ходу: проектный конфиг (D-119).** `serve` читает конфиг один
+раз и ищет проектный слой от cwd процесса, а под launchd это `/` — поэтому
+`<repo>/.agent/config.toml` не применялся никогда, и трёхслойный порядок из `docs/design.md` §3
+выполнялся только у клиента внутри репозитория. Это не про потерю работы, поэтому в критерий вехи
+не входит, но без этого живой прогон шёл бы по чужой политике хранения.
+
+**Живые прогоны, на которых веха проверена.**
+
+| Прогон | Что дал |
+| --- | --- |
+| `live4` (`line-count`, 1 подзадача) | `ready_for_review`, `agent/<task>` = `a3ea6cc`, `merge` → `merged`, `main` содержит правку, `cargo test` в главном чекауте зелёный |
+| `live5` (`line-count`, `max_steps_per_attempt = 5`) | `attempt_failed { ending: "gate", settled_by: "gates_after_step_budget", steps: 5 }`; `metrics`: `settled_after_step_budget = 1`, `step_exhaustions_without_gates = 0`, `green_attempts_not_closed = 0`, `closed_green = 1`; `merge` → `merged` |
+| `live3` (`word-count`, 3 подзадачи) | три подзадачи `done`, `agent/<task>` = `1dafd97` (три коммита), task-level ревью видит **непустой** дифф и отказывает по существу: `src/main.rs` не печатает `once_words_sorted`; `failed_gates` |
+
+Третий прогон — не дефект демона: модель действительно не дописала вывод в `main.rs`, и ревьюер
+прав. Это и есть проверка, ради которой веха заведена: работа доехала до ветки, ревьюер её увидел,
+и вердикт описывает работу, а не отсутствие наблюдения.
+
 | Регрессия | Что ловит |
 | --- | --- |
+| коммит подзадачи стирает её работу | `git checkout --force` на своей же ветке откатывает tracked-правки: `# changed by the subtask` вернулся к `# fixture` (`committing_to_the_branch_keeps_the_tree_it_committed`, D-122) |
+| коммит неизменённого дерева | пустой коммит в истории, которую человек читает перед merge (`committing_an_unchanged_tree_reports_nothing_to_commit`) |
+| закрытая подзадача не попала в `agent/<task>` | `merge` нечего приземлять, и он говорит об этом неправильно (`a_goal_becomes_a_task_that_reaches_ready_for_review` + `rev-list --count HEAD..agent/<task>`) |
+| task-level дифф пуст после коммитов | ревьюер одобряет ничего (`the_task_base_shows_a_reviewer_the_work_that_was_committed`, D-123) |
+| `task_base` не передан в прод-гейт | `failed_gates` вместо `ready_for_review` — регрессия, измеренная живьём (`Scripted::strict` в `tests/start.rs`) |
+| бухгалтерия `.agent/` считается грязью | `merge` отказывает на нормальном исходе успешной задачи (`merge_lands_a_run_that_left_its_own_bookkeeping_modified`) |
+| исключение `.agent/` выключает страж целиком | правка человека проезжает в merge-коммит (`merge_refuses_a_human_edit_and_names_the_file`) |
+| ветка без коммитов впереди `HEAD` | `merged` для работы, которой в ветке нет (`merge_refuses_a_branch_with_nothing_ahead_of_main`) |
+| `running` подзадача читается как пустая задача | `status` зовёт человека чинить то, что работает (`a_task_whose_subtask_is_running_says_so_instead_of_claiming_there_is_no_work`) |
+| `[policy]` из проектного файла | агент расширяет себе права правкой файла в своём worktree (`a_project_file_cannot_grant_policy_even_when_merged_per_task`) |
+| проектный слой не применяется к демону | живой прогон идёт по чужой политике хранения (`the_project_file_is_applied_to_a_config_loaded_without_one`) |
 | бюджет кончается сразу после зелёного гейта | найденная правка засчитана, а не откачена (`a_green_gate_settles_the_attempt_when_the_step_budget_ends_the_loop`) |
 | красный гейт после исчерпания бюджета | попытка падает, подзадача не закрывается (`a_red_gate_after_the_step_budget_does_not_close_anything`) |
 | пустой дифф после исчерпания бюджета | ничего не закрыто — иначе `DoD` с одним ревью закрывал бы нетронутую подзадачу (`an_empty_diff_after_the_step_budget_settles_nothing`) |

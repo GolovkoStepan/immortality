@@ -56,13 +56,18 @@ impl Priority {
 ///
 /// A refusal with a reason rather than a silently shorter list: "nothing is running" is the failure
 /// mode this daemon exists to avoid, and a human staring at an idle daemon needs to know which of
-/// the four reasons applies. Rendered by `status` and `doctor`.
+/// the reasons applies. Rendered by `status` and `doctor`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ineligible {
     /// `merged` or `cancelled`: the work ended.
     Finished,
-    /// Every subtask is settled; the task is waiting for its gates to be run or for a human.
+    /// Nothing can be started: every subtask is settled, or one is already running and the rest
+    /// wait on it. The task is waiting for its gates, for a dependant, or for a human.
     NoWork,
+    /// A subtask is already `running`: the task is mid-attempt, and a second attempt would fork
+    /// its journal. Distinct from [`Ineligible::NoWork`] because the two read as opposite facts
+    /// to a person: one is "this is working", the other is "this is stuck".
+    InFlight,
     /// `Hold::PausedDisk`: the disk guard fired, and everything about this task stops.
     Disk,
     /// `Hold::WaitingBackend`, in answer to the *inference* question. The task is still eligible
@@ -82,10 +87,21 @@ pub struct Candidate {
     pub hold: Option<Hold>,
     /// When the task was created, for the FIFO part of the order.
     pub created_at: Timestamp,
-    /// Whether any subtask is not settled. A `false` here is the difference between "ready to
-    /// think" and "waiting for a gate run", and treating the second as the first is how a daemon
-    /// spins.
+    /// Whether some subtask may be started right now.
+    ///
+    /// This is "ready to think", not "any subtask is open": a `false` here is the difference
+    /// between an attempt worth starting and one that would begin with nothing to do, and
+    /// treating the second as the first is how a daemon spins.
     pub has_work: bool,
+    /// Whether subtasks are open but none may be started.
+    ///
+    /// Two different situations produce `has_work == false`, and a human reads them differently:
+    /// every subtask is settled (waiting for gates or for a person), or one is already `running`
+    /// and its dependents are waiting on it. Reporting both as "no subtask left to run" told a
+    /// person watching a live run that the task had nothing to do — measured on
+    /// `tsk_01M7HJEFXD7YDHGM59Y4X57FTZ`, where `status` said "1 with no subtask left to run"
+    /// while the run was in the middle of its first attempt.
+    pub in_flight: bool,
 }
 
 impl Candidate {
@@ -101,7 +117,13 @@ impl Candidate {
             None => {}
         }
         if !self.has_work {
-            return Some(Ineligible::NoWork);
+            // Order matters: "already running" is the stronger, more specific fact, and a person
+            // who sees "no subtask left to run" during a live run is looking at a bug.
+            return Some(if self.in_flight {
+                Ineligible::InFlight
+            } else {
+                Ineligible::NoWork
+            });
         }
         None
     }
@@ -119,7 +141,13 @@ impl Candidate {
             return Some(Ineligible::Disk);
         }
         if !self.has_work {
-            return Some(Ineligible::NoWork);
+            // Offline work is not attempted mid-attempt either: a subtask that is `running` has a
+            // worker, and a second pass over the tree would be a second writer of one plan.
+            return Some(if self.in_flight {
+                Ineligible::InFlight
+            } else {
+                Ineligible::NoWork
+            });
         }
         None
     }
@@ -229,12 +257,14 @@ pub fn summarise(rejected: &[(&TaskId, Ineligible)]) -> String {
     let mut paused_disk = 0_usize;
     let mut finished = 0_usize;
     let mut waiting_gates = 0_usize;
+    let mut in_flight = 0_usize;
     for (_, reason) in rejected {
         match reason {
             Ineligible::Backend => waiting_backend += 1,
             Ineligible::Disk => paused_disk += 1,
             Ineligible::Finished => finished += 1,
             Ineligible::NoWork => waiting_gates += 1,
+            Ineligible::InFlight => in_flight += 1,
         }
     }
     let mut parts: Vec<String> = Vec::new();
@@ -243,6 +273,9 @@ pub fn summarise(rejected: &[(&TaskId, Ineligible)]) -> String {
     }
     if paused_disk > 0 {
         parts.push(format!("{paused_disk} paused on free disk space"));
+    }
+    if in_flight > 0 {
+        parts.push(format!("{in_flight} running now"));
     }
     if waiting_gates > 0 {
         parts.push(format!("{waiting_gates} with no subtask left to run"));

@@ -45,10 +45,11 @@
 //! lose the plan, the worktree and the checkpoint with it. `start --task` (or a later admission)
 //! picks it up when the backend returns.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use immortality_core::checkpoint::GitRepo;
 use immortality_core::config::Config;
 use immortality_core::context::{Budget, CharsCounter, TokenCounter};
 use immortality_core::domain::{TaskId, TaskState};
@@ -61,7 +62,7 @@ use immortality_llm::Backend;
 use serde_json::Value;
 
 use crate::cycle::{self, Limits, Start};
-use crate::gates::{CheckRunner, ModelReviewer, RealGates};
+use crate::gates::{CheckRunner, ModelReviewer, RealGates, task_base};
 use crate::rpc::{ErrorCode, RpcError};
 use crate::runner::{AttemptLimits, LlmModel, Model, Runner};
 use crate::server::{Events, ServerState};
@@ -172,7 +173,7 @@ pub async fn start(state: &ServerState, params: &Value) -> Result<Value, RpcErro
         .map_err(|error| internal(format!("cannot journal the start: {error}")))?;
 
     let run = Run {
-        config: state.config.clone(),
+        config: task_config(state, &project)?,
         state_root: state.state_root.clone(),
         project: project.clone(),
         task: task.clone(),
@@ -248,7 +249,7 @@ fn resume(state: &ServerState, task: &str) -> Result<Value, RpcError> {
         .map_err(|error| internal(format!("cannot create {}: {error}", task_dir.display())))?;
 
     let run = Run {
-        config: state.config.clone(),
+        config: task_config(state, &project)?,
         state_root: state.state_root.clone(),
         project: project.clone(),
         task: task.clone(),
@@ -321,6 +322,27 @@ fn history(
     // clock, or the escalation re-arms on every process start.
     let outage = backend::since_from_journal(&records);
     Ok((state, goal, outage))
+}
+
+/// The daemon's config with this repository's project file laid over it.
+///
+/// Applied here, at the only place a project is in hand, because `serve` has no project when it
+/// loads: `config::load` finds the project layer by walking up from the process's working
+/// directory, and under launchd that directory is `/`. The result is one config per run, built
+/// from the same global file for every task, which is what makes the documented three-layer order
+/// (global → project → flags) true for the daemon rather than only for a client run inside the
+/// repository.
+fn task_config(state: &ServerState, project: &Project) -> Result<Config, RpcError> {
+    immortality_core::config::with_project_file(&state.config, &project.path).map_err(|error| {
+        internal(format!(
+            "the project config in {} cannot be read: {error}",
+            project
+                .path
+                .join(immortality_core::paths::AGENT_DIR)
+                .join("config.toml")
+                .display()
+        ))
+    })
 }
 
 /// Everything a run needs, owned so it can move to the thread that runs it.
@@ -413,6 +435,14 @@ impl Drop for RunSlot {
     }
 }
 
+/// The fork point of `task`'s branch, as the task-level gate's diff base.
+///
+/// Separated from [`execute`] only to keep that function inside the line budget; the reasoning is
+/// in [`crate::gates::task_base`].
+fn gate_base(worktree: &Path, repository: &Path, task: &TaskId) -> Option<String> {
+    task_base(&GitRepo::new(worktree), repository, &format!("agent/{task}"))
+}
+
 /// Everything the cycle needs, built on the run's own thread.
 ///
 /// Every error here is the daemon's own wiring — a missing worktree, an unreadable plan — not the
@@ -487,7 +517,7 @@ fn execute(run: Run) -> Result<TaskState, String> {
             worktree.path.clone(),
             Arc::clone(&gate),
             CheckRunner::new(worktree.path.clone()),
-            None,
+            gate_base(&worktree.path, &project.path, &task),
         ))),
         reviewer: Some(Arc::new(ModelReviewer::new(
             Arc::clone(&model),

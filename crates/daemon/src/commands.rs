@@ -310,6 +310,45 @@ pub fn collect_garbage(
     }))
 }
 
+/// The human's uncommitted work in the main checkout.
+///
+/// `.agent/` is excluded on purpose. It is the daemon's own bookkeeping — the plan the scheduler
+/// rewrites, the tree it marks `done`, the journal it appends — and a finished run always leaves
+/// it modified. Measured on the `word-count` fixture after a run that closed three subtasks green:
+///
+/// ```text
+///  M .agent/PLAN.md
+///  M .agent/TASKS.json
+/// ?? .agent/JOURNAL.jsonl
+/// ```
+///
+/// A clean-checkout guard that counted those would refuse `merge` for the normal outcome of a
+/// successful task, and `merge` is the one git action D-011 leaves to the human. The guard is
+/// about *their* edits: a file they changed by hand mixes into a commit that belongs to neither of
+/// them. A plan the scheduler advanced is not that.
+///
+/// # Errors
+/// Git could not report the status.
+fn uncommitted_human_work(repo: &GitRepo) -> Result<Vec<String>, String> {
+    let exclude = format!(":(exclude){}", immortality_core::paths::AGENT_DIR);
+    let out = repo
+        .git(&[
+            "status",
+            "--porcelain",
+            "--untracked-files=all",
+            "--",
+            ".",
+            &exclude,
+        ])
+        .map_err(|error| error.to_string())?;
+    Ok(out
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
 /// `merge`: the human's one git action.
 ///
 /// # The guards, and why each exists
@@ -317,10 +356,15 @@ pub fn collect_garbage(
 /// * the task must be `ready_for_review`: merging a running task would publish work the gates
 ///   have not seen, and D-011 gives the merge to a human precisely because the gates are not the
 ///   whole judgement;
-/// * the main checkout must be clean: merging into a dirty tree mixes the agent's work with
-///   whatever a human was editing, and the result is a commit neither of them wrote;
+/// * the main checkout must be free of the human's own uncommitted work: merging into a tree they
+///   were editing mixes the agent's work with theirs, and the result is a commit neither of them
+///   wrote. The daemon's `.agent/` bookkeeping is not that, or `merge` could never follow a run
+///   ([`uncommitted_human_work`]);
 /// * the branch must exist: a missing branch means the task never committed, and git's own
-///   message ("not something we can merge") says that less clearly than naming the task.
+///   message ("not something we can merge") says that less clearly than naming the task;
+/// * the branch must be ahead of `HEAD`: `git merge` of an already-contained branch is a
+///   successful no-op, and reporting `merged` for it tells a human the work landed when there was
+///   no work to land (D-121).
 pub fn merge(state: &ServerState, params: &serde_json::Value) -> Result<serde_json::Value, RpcError> {
     let task = params
         .get("task")
@@ -353,14 +397,16 @@ pub fn merge(state: &ServerState, params: &serde_json::Value) -> Result<serde_js
     }
 
     let repo = GitRepo::new(&project.path);
-    if repo
-        .is_dirty()
-        .map_err(|error| internal(format!("cannot read the main checkout: {error}")))?
-    {
+    let dirty = uncommitted_human_work(&repo)
+        .map_err(|error| internal(format!("cannot read the main checkout: {error}")))?;
+    if !dirty.is_empty() {
         return Err(bad_params(format!(
-            "{} has uncommitted changes; commit or stash them before merging, so the merge \
-             commit contains only the task's work",
-            project.path.display()
+            "{} has uncommitted changes:\n  {}\n\
+             commit or stash them before merging, so the merge commit contains only the task's \
+             work. Files under `{}` are the daemon's own bookkeeping and do not count.",
+            project.path.display(),
+            dirty.join("\n  "),
+            immortality_core::paths::AGENT_DIR
         )));
     }
     let branch = format!("agent/{}", task.as_str());
@@ -368,6 +414,25 @@ pub fn merge(state: &ServerState, params: &serde_json::Value) -> Result<serde_js
         return Err(not_found(format!(
             "branch `{branch}` does not exist in {}; the task never committed",
             project.path.display()
+        )));
+    }
+    // A branch with nothing ahead of `main` has no work to merge, and git answers that with a
+    // successful no-op: "Already up to date." Reporting `merged` for it is the worst kind of
+    // wrong answer, because the human asked for the work to land and was told it had. Measured on
+    // the `word-count` fixture, where the run closed three subtasks green while `agent/<task>` sat
+    // on the same commit as `main`: `merge` said `merged`, and the work existed only in the
+    // worktree and in `agent-ckpt/<task>`.
+    let ahead = repo
+        .git(&["rev-list", "--count", &format!("HEAD..{branch}")])
+        .map_err(|error| internal(format!("cannot compare `{branch}` with HEAD: {error}")))?;
+    if ahead.trim() == "0" {
+        return Err(bad_params(format!(
+            "`{branch}` has no commits ahead of HEAD in {}: there is nothing to merge. The run \
+             closed its subtasks without committing them, so the work is in the task's worktree \
+             and in `{}{}` — inspect them before recording the task as merged.",
+            project.path.display(),
+            immortality_core::checkpoint::CKPT_BRANCH_PREFIX,
+            task.as_str()
         )));
     }
 

@@ -4799,6 +4799,19 @@ mod tests {
             }
             Ok(())
         }
+
+        /// The commit side of the trait, recorded so a test can assert what landed.
+        ///
+        /// `committed` rather than a no-op: the whole point of the method is that a closed subtask
+        /// reaches the branch, so a fake that silently accepted would let the wiring regress
+        /// without a test noticing.
+        fn commit(&self, message: &str) -> Result<Option<String>, String> {
+            if let Ok(mut calls) = self.calls.lock() {
+                calls.push(format!("commit:{message}"));
+            }
+            let n = self.calls.lock().map_or(0, |calls| calls.len());
+            Ok(Some(format!("commit-{n}")))
+        }
     }
 
     fn with_checkpoints(mut runner: Runner, fake: Arc<FakeCheckpoints>) -> Runner {

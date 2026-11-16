@@ -99,6 +99,24 @@ impl Checkpoints for GitCheckpoints {
         }
         self.repo.reset_hard(sha).map_err(|error| error.to_string())
     }
+
+    /// Commit the tree to the task branch, as one closed subtask's work.
+    ///
+    /// `commit_to_branch` rather than `commit_with_trailers`: the latter starts with
+    /// `git checkout --force <branch>`, which reverts every tracked modification when the worktree
+    /// is already on that branch. Measured — `M src/count.rs` plus an untracked `PLAN.md` came
+    /// back identical to `HEAD` — and it is why the dogfood rehearsal went from green to
+    /// `failed_gates`: the commit that was supposed to preserve the work destroyed it before the
+    /// task-level gate read the diff.
+    ///
+    /// `Ok(None)` means the tree matched the branch's tip; a subtask can close without touching a
+    /// file when an earlier one already landed the change.
+    fn commit(&self, message: &str) -> Result<Option<String>, String> {
+        self.repo
+            .commit_to_branch(&self.branch, message)
+            .map(|checkpoint| checkpoint.map(|checkpoint| checkpoint.sha))
+            .map_err(|error| error.to_string())
+    }
 }
 
 #[cfg(test)]

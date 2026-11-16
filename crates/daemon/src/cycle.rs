@@ -350,6 +350,30 @@ struct Pass<'a> {
 }
 
 impl Pass<'_> {
+    /// Land this subtask's work on the task branch, as one Conventional Commit.
+    ///
+    /// `None` when the runner has no checkpoint world: a caller that wired none (a test without a
+    /// repository) has no branch to commit to, and refusing to close there would make `gates: None`
+    /// the only thing a test could exercise.
+    ///
+    /// # Errors
+    /// Git failed. The caller must not close the subtask: a closure recorded in the tree but not
+    /// in the branch is the loss D-011's branch exists to prevent.
+    fn commit(&self, title: &str) -> Result<(), CycleError> {
+        let Some(checkpoints) = self.runner.checkpoints.as_deref() else {
+            return Ok(());
+        };
+        // Conventional Commits because D-011 makes the branch's history the thing a human reads:
+        // one `feat:`/`fix:` per subtask says what landed without opening the plan. `chore:` when
+        // the title's own prefix is not one of the types, which keeps a planner-written title from
+        // producing a commit message no tool can parse.
+        let message = conventional(&subtitle(title));
+        checkpoints
+            .commit(&message)
+            .map(|_| ())
+            .map_err(|error| CycleError::Store(format!("cannot commit `{title}`: {error}")))
+    }
+
     /// Run subtasks until none may run.
     fn drive(&mut self, strategy: &str) -> Result<(), CycleError> {
         for _ in 0..MAX_SUBTASK_PASSES {
@@ -407,6 +431,20 @@ impl Pass<'_> {
 
         match &end.stop {
             Stop::Done => {
+                // The commit comes first, and it is what makes the closure mean something: the
+                // tree records `done`, but `agent/<task>` is what a human merges, and a `done`
+                // subtask whose work never reached that branch is the loss this whole milestone is
+                // about. Measured on three runs — `word-count`, `word-count-fresh`, `kill-test` —
+                // where `agent/<task>` sat on `main`'s commit with the work only in the worktree
+                // and in `agent-ckpt/<task>`; `immortality merge` then reported `merged` having
+                // merged nothing.
+                //
+                // Before the tree write, so a crash between them leaves work committed under a
+                // subtask the tree still lists as open: replaying the subtask commits again (an
+                // empty second commit that `commit` answers with `Ok(None)`), which is harmless.
+                // The other order would leave a `done` whose work is nowhere, which nothing can
+                // repair.
+                self.commit(&subtask.title)?;
                 // Tree first, then journal. A crash between the two leaves a settled tree with a
                 // missing audit line, which reads as "nothing to say"; the other order announces a
                 // closure the tree never received.
@@ -565,6 +603,36 @@ fn acceptance(plan: &Plan) -> Dod {
         statement: "every required check the plan declared passes".to_string(),
         checks,
         review: true,
+    }
+}
+
+/// A subtask title as a one-line Conventional Commit subject.
+///
+/// D-011 makes `agent/<task>` the history a human reviews before merging, so one commit per
+/// subtask has to read as what happened. The planner writes titles as short imperatives
+/// ("parse the input") and the commit type is not in them, so `chore:` is the honest default: it
+/// says "the loop did this", not that the work was a feature. A title that already starts with a
+/// type the repository uses keeps it — a planner that wrote `fix: …` said more than `chore:` can.
+fn conventional(title: &str) -> String {
+    const TYPES: [&str; 11] = [
+        "feat", "fix", "docs", "style", "refactor", "perf", "test", "build", "ci", "chore", "revert",
+    ];
+    let looks_typed = title
+        .split_once(':')
+        .is_some_and(|(head, _)| TYPES.contains(&head.trim()));
+    if looks_typed {
+        return title.to_string();
+    }
+    format!("chore: {title}")
+}
+
+/// A single line: a commit subject with a newline in it silently truncates at git's hands.
+fn subtitle(title: &str) -> String {
+    let one_line = title.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one_line.is_empty() {
+        "close a subtask".to_string()
+    } else {
+        one_line
     }
 }
 

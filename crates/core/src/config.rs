@@ -538,6 +538,39 @@ pub fn load(overrides: &Overrides) -> Result<Loaded> {
     })
 }
 
+/// Read one repository's project file over an already-loaded config.
+///
+/// The daemon loads its config once, at `serve`, with no project in hand: `load` discovers the
+/// project file by walking up from the *process's* working directory, which under launchd is `/`.
+/// A layer that only applies when the daemon happens to have been started inside the repository is
+/// not a layer — measured: with the project file saying `artifact_ttl_days = 3`, a daemon started
+/// from `/` answered `gc --dry-run` with `30`.
+///
+/// So the project layer is applied where the project is known: per task, in `start`, over the
+/// daemon's config and under the CLI flags (which were already folded into `config`). Policy is
+/// not read here for the same reason `load` refuses it from a project file: the file sits in a
+/// repository the agent can edit, so it must never widen its own rights.
+///
+/// A missing file is not an error — a repository that never ran `init` simply has no layer.
+///
+/// # Errors
+/// The file exists and is not valid TOML, or a value fails validation.
+pub fn with_project_file(config: &Config, repository: &Path) -> Result<Config> {
+    let path = repository.join(crate::paths::AGENT_DIR).join("config.toml");
+    let mut merged = config.clone();
+    if !path.exists() {
+        return Ok(merged);
+    }
+    let mut raw = read_file(&path)?;
+    // Dropped rather than warned about: the warning would fire once per task rather than once per
+    // command, and `load` already made this same refusal visible at the one place a human reads it.
+    raw.policy = None;
+    apply_non_policy(&mut merged, raw);
+    merged.logging.dir = expand_tilde(&merged.logging.dir);
+    validate(&merged)?;
+    Ok(merged)
+}
+
 fn default_global_path() -> PathBuf {
     crate::paths::StatePaths::discover().global_config()
 }
@@ -940,6 +973,76 @@ mod tests {
         assert_eq!(storage.log_retention_months, 12);
         assert_eq!(storage.disk_warn_bytes, 1024 * 1024 * 1024);
         assert_eq!(storage.disk_pause_bytes, 256 * 1024 * 1024);
+    }
+
+    #[test]
+    fn the_project_file_is_applied_to_a_config_loaded_without_one() {
+        // The daemon's case: `serve` loads with no project in hand, and `load` finds the project
+        // layer by walking up from the process's working directory — `/` under launchd. Measured
+        // before this existed: a daemon started from `/` with a project file saying 3 answered
+        // `gc --dry-run` with 30.
+        let fx = fixture();
+        std::fs::write(&fx.global, "").unwrap();
+        let repository = fx.project.parent().unwrap().parent().unwrap();
+        std::fs::write(&fx.project, "[storage]\nartifact_ttl_days = 3\n").unwrap();
+
+        let base = load(&Overrides {
+            global_config: Some(fx.global.clone()),
+            project_config: None,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            base.config.storage.artifact_ttl_days, 30,
+            "the premise: loading without a project must not see the file"
+        );
+
+        let merged = with_project_file(&base.config, repository).unwrap();
+        assert_eq!(merged.storage.artifact_ttl_days, 3);
+        assert_eq!(
+            merged.storage.log_retention_months, 12,
+            "an unset key in the project file keeps the global value"
+        );
+    }
+
+    #[test]
+    fn a_project_file_cannot_grant_policy_even_when_merged_per_task() {
+        // The refusal `load` makes must survive the second path into the same file. A project file
+        // sits inside a repository the agent can edit; letting it set `yolo` there would be the
+        // privilege escalation `docs/design.md` §3 exists to prevent, and per-task merging is a
+        // new way to reach it.
+        let fx = fixture();
+        std::fs::write(&fx.global, "").unwrap();
+        let repository = fx.project.parent().unwrap().parent().unwrap();
+        std::fs::write(
+            &fx.project,
+            "[policy]\nyolo = true\nworkspace_root = \"/\"\n[storage]\nartifact_ttl_days = 4\n",
+        )
+        .unwrap();
+
+        let base = load(&Overrides {
+            global_config: Some(fx.global.clone()),
+            project_config: None,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(!base.config.policy.yolo, "the premise: policy starts closed");
+
+        let merged = with_project_file(&base.config, repository).unwrap();
+        assert!(!merged.policy.yolo, "`[policy]` in a project file is ignored");
+        assert_eq!(
+            merged.storage.artifact_ttl_days, 4,
+            "but the tuning knobs beside it still apply"
+        );
+    }
+
+    #[test]
+    fn a_repository_without_a_project_file_is_not_an_error() {
+        // A repository that never ran `init` has no project layer. Failing here would make every
+        // task in such a repository unstartable, which is worse than the defaults.
+        let dir = tempfile::tempdir().unwrap();
+        let merged = with_project_file(&Config::default(), dir.path()).unwrap();
+        assert_eq!(merged.storage.artifact_ttl_days, 30);
     }
 
     #[test]
