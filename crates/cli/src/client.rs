@@ -699,16 +699,24 @@ mod tests {
     }
 
     /// A daemon that answers `hello`, then answers the next request after `delay`.
+    ///
+    /// The listener is bound **before** the thread starts. Binding inside it raced the client:
+    /// under a full parallel test run `Client::connect` reached a socket that did not exist yet and
+    /// failed with "the daemon closed the connection" — seen once in three whole-binary runs and
+    /// never in isolation, which is the shape of a race and not of a broken test.
     fn slow_request_daemon(dir: &Path, delay: Duration) -> std::path::PathBuf {
         let socket = dir.join("daemon.sock");
-        let path = socket.clone();
+        let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind");
+        listener
+            .set_nonblocking(true)
+            .expect("the listener is handed to tokio");
         std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .expect("runtime");
             runtime.block_on(async move {
-                let listener = tokio::net::UnixListener::bind(&path).expect("bind");
+                let listener = tokio::net::UnixListener::from_std(listener).expect("a non-blocking listener");
                 let (stream, _) = listener.accept().await.expect("accept");
                 let (read, mut write) = stream.into_split();
                 let mut lines = tokio::io::BufReader::new(read).lines();
