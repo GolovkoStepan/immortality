@@ -291,6 +291,24 @@ fn a_real_value_after_a_parameter_list_is_still_a_finding() {
 }
 
 #[test]
+fn a_namespaced_class_named_password_is_not_a_secret() {
+    // `::` is Ruby's scope operator. `OneTimePassword::Client` read as `password:` plus a value,
+    // and the value `::client.new` cleared the twelve-character bar. Measured on `qna_rails`: five
+    // findings in one `docs/services.md`, every one a namespaced class, and the attempt spent its
+    // last steps editing blindly because the finding names the file and not the line.
+    for line in [
+        "- `otp_service` memoises `Services::OneTimePassword::Client.new`",
+        "`rescue Services::OneTimePassword::Errors::TooManyPerHour`",
+        "`rescue Services::OneTimePassword::Errors::CodeExpired`",
+        "- `OneTimePassword::Client.new`",
+        "`Services::SmsSender::Errors::AuthError`",
+    ] {
+        let changed = file("docs/services.md", FileStatus::Modified, &[line]);
+        assert_clean(&diff(vec![changed]), line);
+    }
+}
+
+#[test]
 fn a_comment_after_a_parameter_is_not_part_of_its_value() {
     // `#` terminates the value with no whitespace in between, which is valid Ruby (`x = nil#note`)
     // and the only case where the terminator changes the answer. With a space before the comment

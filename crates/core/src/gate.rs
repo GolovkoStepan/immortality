@@ -311,6 +311,14 @@ fn credential_assignment(line: &str) -> Option<&'static str> {
             let at = from + offset;
             from = at + needle.len();
             let rest = &lower[from..];
+            // `::` is Ruby's scope operator, not an assignment: `OneTimePassword::Client` and
+            // `Errors::TooManyPerHour` are class names, and reading the second colon as the start
+            // of a value made `::Client.new` a credential. Measured on `qna_rails`: five findings
+            // in `docs/services.md`, every one of them a namespaced class. Checked before the
+            // assignment prefix so the `:` is never consumed twice.
+            if rest.starts_with("::") {
+                continue;
+            }
             let Some(rest) = rest.trim_start().strip_prefix(['=', ':']) else {
                 continue;
             };
