@@ -27,6 +27,24 @@ use crate::stream::{StreamDecoder, StreamEnd, StreamError};
 use crate::turn::AssistantTurn;
 use crate::wire::{ChatRequest, ChatResponse, Message};
 
+/// The `reqwest` client, with the pool lifetime this backend requires.
+///
+/// Split out so a test can build the same client with a different idle window: the setting is
+/// what the regression is about, and a test that could only use the production value would have
+/// to wait three seconds to observe the difference. `pool_idle_timeout` is the one knob here that
+/// is not merely a timeout — see [`DEFAULT_POOL_IDLE_TIMEOUT`].
+fn build_http(
+    connect_timeout: Duration,
+    request_timeout: Duration,
+    pool_idle_timeout: Duration,
+) -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder()
+        .connect_timeout(connect_timeout)
+        .timeout(request_timeout)
+        .pool_idle_timeout(pool_idle_timeout)
+        .build()
+}
+
 /// An `OpenAI`-compatible backend.
 ///
 /// Cloned freely: `reqwest::Client` is an `Arc` inside, so a clone shares the connection pool.
@@ -49,6 +67,28 @@ pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 /// is reported before the first step's patience runs out.
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long an idle socket may sit in the pool before the client stops trusting it.
+///
+/// `reqwest`'s default is 90 seconds, and that default assumes the server keeps a silent
+/// connection open at least that long. This backend does not: it answers every response with
+/// `Keep-Alive: timeout=5`, so it closes an idle socket after five seconds while the pool goes on
+/// handing it out for another eighty-five.
+///
+/// The consequence is not a slow request, it is a failed one. A pooled socket the server has
+/// already closed is only discovered when the next request is written into it, and the client
+/// reports `connection closed before message completed` from `.send()` — before a single byte of
+/// the prompt is sent. Retrying is the daemon's job (D-046), so each of those ends an attempt.
+///
+/// Measured against the live backend on 2026-11-16 with a six-second gap between requests: 9 of
+/// 25 requests failed with exactly that message under the default pool, and 0 of 25 once this
+/// setting was below the server's five-second window. On `qna_rails` the same failure abandoned
+/// three attempts at 16:40, 16:48 and 17:05, each 6.2-6.5 s after the previous response.
+///
+/// Three seconds, not five: the client and the server would otherwise be counting down the same
+/// five seconds from different starting points, and a socket the server closes a moment before
+/// the pool discards it is exactly the race this constant exists to remove.
+pub const DEFAULT_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(3);
+
 impl Backend {
     /// Build a client from configuration.
     ///
@@ -60,10 +100,7 @@ impl Backend {
         connect_timeout: Duration,
         request_timeout: Duration,
     ) -> Result<Self, reqwest::Error> {
-        let http = reqwest::Client::builder()
-            .connect_timeout(connect_timeout)
-            .timeout(request_timeout)
-            .build()?;
+        let http = build_http(connect_timeout, request_timeout, DEFAULT_POOL_IDLE_TIMEOUT)?;
         Ok(Self {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             http,
@@ -419,6 +456,37 @@ mod tests {
         // server it fronts would have accepted it — a bug that only appears behind a proxy.
         let backend = Backend::with_defaults("http://host:1/v1/").unwrap();
         assert_eq!(backend.base_url(), "http://host:1/v1");
+    }
+
+    #[test]
+    fn a_pooled_socket_is_never_trusted_past_the_servers_keep_alive() {
+        // Live `qna_rails`, 2026-11-16. Three attempts were abandoned at 16:40, 16:48 and 17:05,
+        // each 6.2-6.5 s after the previous response, all with the same sentence:
+        //
+        //   retryable backend failure (BrokenStream): error sending request for url (…):
+        //   client error (SendRequest): connection closed before message completed
+        //
+        // The backend answers every response with `Keep-Alive: timeout=5`, so it drops an idle
+        // socket after five seconds while `reqwest` keeps it for ninety. `.send()` then finds the
+        // connection dead before one byte of the prompt is written — which is what made this a
+        // failed attempt rather than a slow one, since retrying belongs to the daemon (D-046).
+        //
+        // Measured against the live backend, six seconds apart: 9 of 25 requests failed with that
+        // message under the default pool, 0 of 25 with the pool below the server's window.
+        //
+        // # Why this is a constant and not a socket test
+        //
+        // A local fake cannot reproduce it. On loopback the server's FIN reaches the client at
+        // once, and `hyper` marks the connection closed before it returns to the pool — the
+        // failing case never occurs, so a test built on a fake server passes with the fix
+        // removed. The live failure needs the FIN to be late or absent, which is what a real
+        // network path does and a loopback does not. The honest test is therefore the rule
+        // itself: the pool must let go strictly before the server says it will.
+        assert!(
+            DEFAULT_POOL_IDLE_TIMEOUT < Duration::from_secs(5),
+            "the pool must let go before the server's five-second keep-alive, or it hands out \
+             sockets the server has already closed: {DEFAULT_POOL_IDLE_TIMEOUT:?}"
+        );
     }
 
     #[test]
