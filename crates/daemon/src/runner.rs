@@ -1067,27 +1067,7 @@ impl<'a> AttemptSession<'a> {
         allowance: Allowance,
         journal: &mut Journal,
     ) -> immortality_core::Result<SessionEnd> {
-        // The base is the state the subtask *started* from, so it has to be taken before the
-        // first attempt touches the tree. Taking it inside the rollback — which is what this did
-        // — snapshots a tree that already contains the failed attempt's work, journals that as
-        // "base", and then resets the branch onto it: the rollback discards nothing, and the
-        // attempt's own work becomes the commit its gates are reviewing, so `git diff HEAD` is
-        // empty and the reviewer rejects work that is on disk. Measured in a live run: the three
-        // checkpoint records of one restart all named the same SHA.
-        if self.base.is_none() && self.base_error.is_none() {
-            match self.capture_base(journal) {
-                Ok(Some(base)) => self.base = Some(base),
-                // Nothing to roll back to. Kept as a reason rather than a stop of its own: a
-                // session that never restarts does not need a base, and refusing to start it
-                // would turn a missing commit into a task that cannot run at all.
-                Ok(None) => {
-                    self.base_error = Some(
-                        "the worktree has no commits, so a restart has nothing to roll back to".to_string(),
-                    );
-                }
-                Err(why) => self.base_error = Some(why),
-            }
-        }
+        self.take_base(journal)?;
         let mut left = allowance;
         loop {
             let number = self.next;
@@ -1184,11 +1164,75 @@ impl<'a> AttemptSession<'a> {
         }
     }
 
+    /// Make sure the session has the base a restart would roll back to.
+    ///
+    /// The base belongs to the **subtask**, not to the session, and that distinction is the whole
+    /// function. A session used to take it whenever its own `self.base` was empty, which is the
+    /// same sentence as "before the first attempt" only while a subtask fits into one session. It
+    /// does not: an abandoned attempt ends the session and leaves the worktree holding whatever
+    /// the attempt wrote, so the resume starts a second session over a tree that is no longer the
+    /// one the subtask found. Its "base" then names the interrupted attempt's work, the gate diff
+    /// against it is empty, and the reviewer rejects correct work as "nothing changed" — measured
+    /// on a live run, where attempts 1 and 2 were outages and attempt 3 was rejected on an empty
+    /// diff (D-124).
+    ///
+    /// So the journal is asked first: the first `checkpoint_created {role:"base"}` a previous
+    /// session wrote is the base this session must use, because only the first snapshot of a
+    /// subtask can be of the tree the subtask started from. A snapshot is taken only when the
+    /// journal has none, which is exactly the first session — and then journalled before any
+    /// attempt touches the tree, or the record would name work the attempt had already done.
+    ///
+    /// Nothing to take — a repository with no commits — is kept as `base_error` rather than a
+    /// stop: a session that never restarts does not need a base, and refusing to start would turn
+    /// a missing commit into a task that cannot run at all. A recorded base leaves `base_error`
+    /// `None`, because a resumed session can roll back even though its own snapshot never
+    /// happened.
+    fn take_base(&mut self, journal: &mut Journal) -> immortality_core::Result<()> {
+        if self.base.is_some() {
+            return Ok(());
+        }
+        // Read before writing: the records on disk are the previous sessions' account, and this
+        // session's own writes would make its own late snapshot look like an earlier one.
+        let records = immortality_core::journal::JournalReader::open(journal.dir(), journal.task())
+            .and_then(|reader| reader.read())
+            .map(|outcome| outcome.records)?;
+        if let Some(base) = restart::base_of(&records, journal.task(), &self.subtask.id) {
+            self.base = Some(base);
+            self.base_error = None;
+            return Ok(());
+        }
+        if self.base_error.is_some() {
+            return Ok(());
+        }
+        // No base record. A snapshot is only the subtask's *starting* tree while nothing has run:
+        // once the journal holds an attempt, whatever is on disk may be that attempt's work, and a
+        // failure to snapshot earlier is not a licence to snapshot later. This is the same defect
+        // one layer down — a session whose first `capture_base` failed would otherwise retry on
+        // the resume and name the interrupted attempt's tree as the base, silently.
+        if attempts_started(&records, journal.task(), &self.subtask.id) {
+            self.base_error = Some(
+                "no base checkpoint was recorded before this subtask's first attempt, so a restart \
+                 has nothing it can prove the tree came from"
+                    .to_string(),
+            );
+            return Ok(());
+        }
+        match self.capture_base(journal) {
+            Ok(Some(base)) => self.base = Some(base),
+            Ok(None) => {
+                self.base_error =
+                    Some("the worktree has no commits, so a restart has nothing to roll back to".to_string());
+            }
+            Err(why) => self.base_error = Some(why),
+        }
+        Ok(())
+    }
+
     /// Take the checkpoint a restart would roll back to.
     ///
-    /// Called once, before the first attempt, so the base is the tree the subtask *started* from.
-    /// `Ok(None)` is a repository with no commits: there is nothing to return to, which is a fact
-    /// about the repository rather than an error.
+    /// Called once per subtask, before the first attempt, so the base is the tree the subtask
+    /// *started* from. `Ok(None)` is a repository with no commits: there is nothing to return to,
+    /// which is a fact about the repository rather than an error.
     fn capture_base(&self, journal: &mut Journal) -> Result<Option<restart::Snapshot>, String> {
         let Some(checkpoints) = self.runner.checkpoints.as_deref() else {
             return Err("a restart needs a checkpoint world, and none is wired".to_string());
@@ -1327,6 +1371,23 @@ fn checkpoint_snapshot(
     reason: &str,
 ) -> Result<Option<restart::Snapshot>, String> {
     checkpoints.snapshot(reason)
+}
+
+/// Whether this subtask of this task has ever started an attempt.
+///
+/// The question `take_base` has to ask before it is allowed to snapshot: a base can only be taken
+/// while the tree is still the one the subtask found, and an `attempt_started` record is the
+/// journal's proof that it no longer necessarily is.
+fn attempts_started(
+    records: &[immortality_core::journal::JournalRecord],
+    task: &TaskId,
+    subtask: &SubtaskId,
+) -> bool {
+    records.iter().any(|record| {
+        &record.fields.task == task
+            && record.fields.subtask.as_ref() == Some(subtask)
+            && record.fields.kind == Kind::AttemptStarted
+    })
 }
 
 /// Append a `checkpoint_created` record for one attempt's tree state.
@@ -2586,6 +2647,12 @@ mod tests {
         refused: Mutex<Vec<String>>,
         runs: Mutex<Vec<String>>,
         failing: Mutex<Vec<String>>,
+        /// Every base a diff was asked for, in order.
+        ///
+        /// The base is the whole subject of D-124: an attempt reviewed against its own work sees
+        /// an empty diff. Asserting on which base the gate asked for is the only way to see the
+        /// bug from inside the runner, because a fake diff cannot be empty by accident.
+        bases: Mutex<Vec<Option<String>>>,
     }
 
     impl FakeGates {
@@ -2615,10 +2682,18 @@ mod tests {
         fn ran(&self) -> Vec<String> {
             self.runs.lock().map(|runs| runs.clone()).unwrap_or_default()
         }
+
+        /// Every base a diff was asked for, in order.
+        fn bases(&self) -> Vec<Option<String>> {
+            self.bases.lock().map(|bases| bases.clone()).unwrap_or_default()
+        }
     }
 
     impl Gates for FakeGates {
-        fn diff(&self, _base: Option<&str>) -> Result<immortality_core::gate::Diff, String> {
+        fn diff(&self, base: Option<&str>) -> Result<immortality_core::gate::Diff, String> {
+            if let Ok(mut bases) = self.bases.lock() {
+                bases.push(base.map(str::to_string));
+            }
             Ok(self.diff.lock().map(|diff| diff.clone()).unwrap_or_default())
         }
 
@@ -4698,6 +4773,11 @@ mod tests {
         calls: Mutex<Vec<String>>,
         /// When set, `restore` fails with this reason.
         refuse: Mutex<Option<String>>,
+        /// When set, `snapshot` fails with this reason.
+        ///
+        /// A base that could not be taken is the case D-124's guard exists for: the tree moves on
+        /// regardless, so the resume must not quietly take the snapshot its own session could not.
+        refuse_snapshot: Mutex<Option<String>>,
         /// When true, `snapshot` reports a clean tree (no SHA to record).
         clean: Mutex<bool>,
         /// Journal directory to read at `restore` time, when the test is about durability.
@@ -4731,6 +4811,13 @@ mod tests {
             fake
         }
 
+        /// Every snapshot is refused, as a git failure would be.
+        fn refuse_snapshots(&self, reason: &str) {
+            if let Ok(mut refuse) = self.refuse_snapshot.lock() {
+                *refuse = Some(reason.to_string());
+            }
+        }
+
         fn watching(journal_dir: impl Into<std::path::PathBuf>) -> Arc<Self> {
             let fake = Self::new();
             if let Ok(mut watching) = fake.watching.lock() {
@@ -4755,6 +4842,11 @@ mod tests {
             let clean = self.clean.lock().is_ok_and(|clean| *clean);
             if let Ok(mut calls) = self.calls.lock() {
                 calls.push(format!("snapshot:{reason}"));
+            }
+            if let Ok(refuse) = self.refuse_snapshot.lock()
+                && let Some(reason) = refuse.as_ref()
+            {
+                return Err(reason.clone());
             }
             if clean {
                 return Ok(None);
@@ -5282,6 +5374,144 @@ mod tests {
             base_at_first_step.lock().ok().and_then(|slot| *slot),
             Some(true),
             "the base record must be in the journal before the first model step"
+        );
+    }
+
+    #[test]
+    fn a_resumed_session_keeps_the_base_the_previous_session_recorded() {
+        // The live bug (D-124). An abandoned attempt ends the session *without* rolling back, so
+        // the resumed session starts over a tree that already holds the first attempt's work. A
+        // base taken "at the start of the session" is then a snapshot of that work: the gate diff
+        // against it is empty, and a reviewer rejects a correct change as "nothing changed".
+        //
+        // Measured on `qna_rails`: the base of attempts 1, 2 and 3 were three different SHAs, each
+        // containing the previous attempt's work, and attempt 3's review came back `the diff is
+        // empty` with both checks green.
+        let checkpoints = FakeCheckpoints::new();
+        // Attempt 1 writes nothing and reports the backend gone; attempt 2 writes and claims, so
+        // it is the attempt whose gates run — and the one whose base this test is about.
+        let model = Scripted::new(vec![
+            Err("connection refused".to_string()),
+            Ok(Reply::call("call_1", "touch", r#"{"path":"src/parser.rs"}"#)),
+            Ok(finish()),
+        ]);
+        let gates = Arc::new(FakeGates::green());
+        let (dir, mut runner) = runner(model, registry(vec![Arc::new(Touch)]));
+        runner.gates = Some(Arc::clone(&gates) as Arc<dyn Gates + Send + Sync>);
+        runner = with_checkpoints(runner, Arc::clone(&checkpoints));
+        let mut journal = journal(&dir);
+
+        let first = runner
+            .session(&subtask(), 1)
+            .drive(allowance(3, 2), &mut journal)
+            .expect("the first session");
+        assert_eq!(
+            first.stop,
+            Stop::Abandoned,
+            "the fixture is only about the bug if the first session ends on an outage"
+        );
+
+        // The resume the daemon performs on the next start.
+        let second = runner
+            .session(&subtask(), 2)
+            .drive(allowance(3, 2), &mut journal)
+            .expect("the resumed session");
+
+        assert_eq!(
+            checkpoints.snapshot_count(),
+            1,
+            "a resumed session must reuse the base the first one recorded, not take a second one \
+             of a tree that already holds the interrupted attempt's work"
+        );
+        let bases: Vec<String> = gates.bases().into_iter().flatten().collect();
+        assert_eq!(
+            bases,
+            vec!["ckpt-0".to_string()],
+            "the gate must diff the resumed attempt against the subtask's base; diffing against \
+             the resumed session's own late snapshot is the empty diff of D-124"
+        );
+        assert!(
+            second.outcome.verified(),
+            "the work is on the tree and the gates are green, so the attempt must be verified: {:?}",
+            second.outcome
+        );
+    }
+
+    #[test]
+    fn a_session_does_not_snapshot_a_base_the_first_one_failed_to_take() {
+        // The same defect one layer down. If the first session could not snapshot — git failed,
+        // the seam was not wired — the journal holds an attempt and no base. A resume that took a
+        // snapshot now would name a tree the interrupted attempt wrote: not a missing base, a
+        // wrong one, and the reviewer would again be shown an empty diff.
+        let checkpoints = FakeCheckpoints::new();
+        checkpoints.refuse_snapshots("git is gone");
+        let model = Scripted::new(vec![
+            Ok(Reply::call("call_1", "touch", r#"{"path":"src/parser.rs"}"#)),
+            Err("connection refused".to_string()),
+            Ok(Reply::call("call_2", "touch", r#"{"path":"src/other.rs"}"#)),
+        ]);
+        let (dir, mut runner) = runner(model, registry(vec![Arc::new(Touch)]));
+        runner = with_checkpoints(runner, Arc::clone(&checkpoints));
+        let mut journal = journal(&dir);
+
+        runner
+            .session(&subtask(), 1)
+            .drive(allowance(3, 2), &mut journal)
+            .expect("the first session");
+        assert_eq!(
+            checkpoints.snapshot_count(),
+            1,
+            "the first session asked for a base and was refused"
+        );
+
+        let second = runner
+            .session(&subtask(), 2)
+            .drive(allowance(3, 2), &mut journal)
+            .expect("the resumed session");
+        assert_eq!(
+            checkpoints.snapshot_count(),
+            1,
+            "the resume may not take the base its own session failed to take: the tree has moved"
+        );
+        assert_eq!(
+            second.stop,
+            Stop::Abandoned,
+            "the fixture only says something if the first session really was an outage"
+        );
+    }
+
+    #[test]
+    fn an_attempt_on_record_forbids_a_late_base_snapshot() {
+        // The predicate the guard reads, on its own: it is a question about the journal, and the
+        // caller must not be able to answer it from memory.
+        let task = TaskId::from_suffix("01ARZ3NDEKTSV4RRFFQ69G5FAA");
+        let started = vec![immortality_core::journal::JournalRecord::new(
+            immortality_core::journal::RecordFields {
+                seq: 0,
+                at: immortality_core::time::now(),
+                task: task.clone(),
+                subtask: Some(subtask().id),
+                attempt: Some(1),
+                kind: Kind::AttemptStarted,
+            },
+            immortality_core::journal::JournalEvent::with_payload(serde_json::json!({})),
+            None,
+        )];
+        assert!(
+            attempts_started(&started, &task, &subtask().id),
+            "an attempt on record is what forbids a late snapshot"
+        );
+        assert!(
+            !attempts_started(
+                &started,
+                &task,
+                &SubtaskId::from_suffix("01ARZ3NDEKTSV4RRFFQ69G5FAB")
+            ),
+            "another subtask's attempt says nothing about this one's tree"
+        );
+        assert!(
+            !attempts_started(&[], &task, &subtask().id),
+            "a subtask nothing ran for is the one case where a fresh base is the right answer"
         );
     }
 

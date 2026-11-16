@@ -190,8 +190,22 @@ impl Fixture {
 
     /// Write `TASKS.json` with one subtask in `state`, and the acceptance file it needs.
     fn write_plan(&self, state: SubtaskState) -> Subtask {
+        self.write_plan_with(state, false)
+    }
+
+    /// The same plan, with the model's review switched on.
+    ///
+    /// The attempt-level diff only exists when a reviewer reads one, and "the reviewer was shown
+    /// an empty diff" is the defect a run without a review cannot see: every check can be green
+    /// while the change is invisible to the only gate that reads it.
+    fn write_reviewed_plan(&self, state: SubtaskState) -> Subtask {
+        self.write_plan_with(state, true)
+    }
+
+    fn write_plan_with(&self, state: SubtaskState, review: bool) -> Subtask {
         let mut subtask = notes_subtask(SystemClock.now());
         subtask.state = state;
+        subtask.dod.review = review;
         std::fs::create_dir_all(self.agent()).expect("agent dir");
         std::fs::write(
             self.agent().join("ACCEPTANCE.md"),
@@ -1129,6 +1143,83 @@ fn an_outage_leaves_the_task_running_and_a_later_start_finishes_it() {
         "the resumed attempt lost the goal: {strategies:?}"
     );
     assert_eq!(second_model.executor_calls(), 1);
+}
+
+#[test]
+fn a_resumed_attempt_is_reviewed_against_the_base_the_outage_did_not_move() {
+    // The live defect (D-124), on the production path. An outage ends the attempt without rolling
+    // the tree back, so the resumed run starts over a tree that already holds the first attempt's
+    // work. A base taken at the start of *that* session is a snapshot of the work, and the only
+    // gate that reads the change — the reviewer — is shown an empty diff and rejects it. Measured
+    // on `qna_rails`: attempt 1's base `ae14937`, attempt 2's `104434ea` (containing attempt 1's
+    // work), attempt 3's `589732b` (containing attempt 2's) — and a correct fix rejected with
+    // "The diff is empty" while both checks were green.
+    //
+    // The reviewer is `strict` here, and it has to be: a reviewer that approves anything approves
+    // the empty diff too, and the regression would be invisible.
+    let fixture = Fixture::new();
+    // The reviewed plan is what makes the attempt-level diff exist at all: without a reviewer the
+    // only readers of the change are the `DoD` checks, and both are green either way.
+    fixture.write_reviewed_plan(SubtaskState::Pending);
+    let first = Scripted::new(Work::WriteThenFail);
+    let state = fixture.state(first);
+    let answer = start_now(&state, &json!({ "project": fixture.repo, "goal": GOAL }))
+        .expect("the first admission must succeed");
+    let task = answer["task"].as_str().expect("a task id").to_string();
+    Fixture::wait_until_idle(&state);
+
+    // A new process resumes the task. The work the interrupted attempt wrote is still there, so
+    // the resumed attempt only has to claim it.
+    let second_model = Scripted::strict(Work::Claim);
+    let second = fixture.state(second_model);
+    let resumed = start_now(&second, &json!({ "task": task })).expect("the resume must be admitted");
+    assert_eq!(resumed["resumed"], true);
+    fixture.wait_for(&task, TaskState::ReadyForReview);
+    Fixture::wait_until_idle(&second);
+
+    // One base for the subtask, not one per session: the second session reuses the checkpoint the
+    // first one recorded before the tree was touched.
+    let bases: Vec<String> = fixture
+        .records(&task)
+        .iter()
+        .filter(|record| record.fields.kind == Kind::CheckpointCreated)
+        .filter(|record| record.event.payload["role"] == json!("base"))
+        .filter_map(|record| {
+            record
+                .event
+                .payload
+                .get("sha")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .collect();
+    assert_eq!(
+        bases.len(),
+        1,
+        "the resumed session took its own base, so the reviewer diffed against the interrupted \
+         attempt's work: {bases:?}"
+    );
+
+    // And the reviewer saw the change rather than an empty diff. Both reviews count: the
+    // attempt-level one, which is the one the bug emptied, and the task-level one that follows it.
+    let reviewed: Vec<bool> = fixture
+        .records(&task)
+        .iter()
+        .filter(|record| record.fields.kind == Kind::GateResult)
+        .filter(|record| record.event.payload["gate"] == json!("review"))
+        .filter_map(|record| {
+            record
+                .event
+                .payload
+                .get("approved")
+                .and_then(serde_json::Value::as_bool)
+        })
+        .collect();
+    assert!(
+        !reviewed.is_empty() && reviewed.iter().all(|approved| *approved),
+        "every review must approve the work it was shown; a `false` is the empty-diff rejection \
+         of an attempt diffed against its own work: {reviewed:?}"
+    );
 }
 
 #[test]

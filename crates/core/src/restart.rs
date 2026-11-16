@@ -535,6 +535,53 @@ pub struct Snapshot {
     pub branch: String,
 }
 
+/// The checkpoint a subtask's tree started from, as the journal recorded it.
+///
+/// The **first** `checkpoint_created {role: "base"}` of this subtask, not the newest. The base is
+/// what the subtask changed *from*, so it can only be taken while the tree is still the one the
+/// subtask found: once an attempt has written anything, a snapshot is a picture of that work, and
+/// a diff against it is the empty diff a reviewer rejects as "nothing changed".
+///
+/// That matters because a session does not live as long as a subtask. A backend outage ends one
+/// session and the resume builds another over the tree the outage interrupted, so a base taken at
+/// "the start of the session" is taken *after* the first session's work. Measured on a live run:
+/// attempt 3's base contained the work of attempts 1 and 2, the gate diff was empty, and a
+/// correct change was rejected (D-124).
+///
+/// `branch` is allowed to be absent — a sha is enough to roll back to, and a record that names a
+/// sha must never fall through to a second, late snapshot for want of a ref.
+///
+/// The task is part of the key for the same reason [`Spent::read`] filters on it: one
+/// `.agent/JOURNAL.jsonl` is shared by every task of a repository, and a plan reuses subtask ids
+/// across runs.
+#[must_use]
+pub fn base_of(records: &[JournalRecord], task: &TaskId, subtask: &SubtaskId) -> Option<Snapshot> {
+    records.iter().find_map(|record| {
+        if &record.fields.task != task
+            || record.fields.subtask.as_ref() != Some(subtask)
+            || record.fields.kind != Kind::CheckpointCreated
+            || !payload_is(&record.event.payload, "role", "base")
+        {
+            return None;
+        }
+        let sha = record
+            .event
+            .payload
+            .get("sha")
+            .and_then(serde_json::Value::as_str)?;
+        let branch = record
+            .event
+            .payload
+            .get("branch")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        Some(Snapshot {
+            sha: sha.to_string(),
+            branch: branch.to_string(),
+        })
+    })
+}
+
 /// The tree operations a restart needs, behind a trait.
 ///
 /// Two methods, because those are the two halves of L3's tree work, and their order is the whole
