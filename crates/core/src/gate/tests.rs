@@ -291,6 +291,24 @@ fn a_real_value_after_a_parameter_list_is_still_a_finding() {
 }
 
 #[test]
+fn a_comment_after_a_parameter_is_not_part_of_its_value() {
+    // `#` terminates the value with no whitespace in between, which is valid Ruby (`x = nil#note`)
+    // and the only case where the terminator changes the answer. With a space before the comment
+    // the whitespace cut already ends the value, so a test written that way would pass without
+    // `#` in the list at all. Measured: each line below clears the twelve-character bar as a whole
+    // and falls under it once the comment is removed, so without the cut the gate reads
+    // `nil#defaults to ENV[...]` as a literal credential.
+    for line in [
+        r#"password = nil#defaults to ENV["PASSWORD"]"#,
+        "api_key = nil#read from .env.sample, never commit it",
+        "secret_key = blank#configured per environment by the operator",
+    ] {
+        let changed = file("lib/services/client.rb", FileStatus::Modified, &[line]);
+        assert_clean(&diff(vec![changed]), line);
+    }
+}
+
+#[test]
 fn a_token_with_no_secret_name_is_not_flagged() {
     // The heuristic is name-based, and being honest about that is better than a regex over
     // entropy that would flag every hash in every lock file.

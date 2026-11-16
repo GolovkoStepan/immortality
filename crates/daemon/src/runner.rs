@@ -3776,6 +3776,33 @@ mod tests {
     }
 
     #[test]
+    fn an_ending_that_is_not_a_backend_one_records_no_detail() {
+        // The other half of `the_reason_a_backend_ending_happened_reaches_the_journal`, and the
+        // reason the field is inserted rather than declared in the payload literal: a
+        // `"detail": null` on a `steps` ending is a field with nothing to say, and declaring it
+        // would have dated every golden journal for a fact none of them record.
+        let model = Scripted::new(vec![Ok(Reply::default())]);
+        let (dir, runner) = runner(model, registry(vec![Arc::new(Touch)]));
+        let mut journal = journal(&dir);
+        runner.run(&subtask(), 1, "", &mut journal).expect("run");
+
+        let records = immortality_core::journal::JournalReader::open(journal.dir(), journal.task())
+            .expect("reader")
+            .read()
+            .expect("records")
+            .records;
+        let failed = records
+            .iter()
+            .find(|record| record.fields.kind == Kind::AttemptFailed)
+            .expect("an attempt_failed record");
+        assert!(
+            failed.event.payload.get("detail").is_none(),
+            "an empty ending has no backend detail to report: {}",
+            failed.event.payload
+        );
+    }
+
+    #[test]
     fn a_judge_verdict_reaches_the_journal_beside_the_call_it_decided() {
         // The gate cannot write: `run_tool` holds `&mut Journal` through `ToolCallLog` for the
         // whole call. So the verdict has to be drained by the runner after the call's own
