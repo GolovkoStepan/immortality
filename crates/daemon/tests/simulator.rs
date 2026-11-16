@@ -175,6 +175,8 @@ impl Sim {
             gate: Arc::new(gate),
             system_prompt: "You are an agent.".to_string(),
             max_tool_output_bytes: 8192,
+            max_completion_tokens: 8192,
+            enable_thinking: false,
             budget: Budget {
                 soft: 32_000,
                 hard: 64_000,

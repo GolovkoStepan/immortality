@@ -497,19 +497,13 @@ fn execute(run: Run) -> Result<TaskState, String> {
         gate: Arc::clone(&gate),
         system_prompt: system_prompt(&start.strategy),
         max_tool_output_bytes: config.context.max_tool_output_bytes,
+        max_completion_tokens: config.backend.max_completion_tokens,
+        enable_thinking: config.backend.enable_thinking,
         budget: Budget {
             soft: config.context.soft_budget_tokens,
             hard: config.context.hard_budget_tokens,
         },
-        limits: AttemptLimits {
-            max_steps: config.loop_.max_steps_per_attempt,
-            max_tokens: config.loop_.max_tokens_per_attempt,
-            stall_steps: config.loop_.stall_steps,
-            // `AttemptLimits` has no wall-clock field in the config; the design's ~45 minutes is
-            // sixty per step at the default sixty steps, and deriving it keeps the two honest
-            // instead of introducing a second number nobody tunes.
-            max_wall_time: Duration::from_secs(u64::from(config.loop_.max_steps_per_attempt) * 60),
-        },
+        limits: attempt_limits(&config),
         counter: Arc::new(CharsCounter::default()) as Arc<dyn TokenCounter + Send + Sync>,
         task: task.clone(),
         detectors: config.detectors.clone(),
@@ -646,6 +640,23 @@ fn backend(config: &Config) -> Result<Backend, String> {
 ///
 /// The goal is quoted because a resumed task's fresh context has nothing else: the plan's subtask
 /// goals carry the work, but the *why* is only in the task's goal.
+/// Step, token and time limits for one attempt, from the project's config.
+///
+/// A named function rather than a struct literal inside `execute`, which is already at the
+/// project's line limit: the wall-clock rule below carries a comment worth keeping, and inlining
+/// it again would push that function over.
+fn attempt_limits(config: &Config) -> AttemptLimits {
+    AttemptLimits {
+        max_steps: config.loop_.max_steps_per_attempt,
+        max_tokens: config.loop_.max_tokens_per_attempt,
+        stall_steps: config.loop_.stall_steps,
+        // `AttemptLimits` has no wall-clock field in the config; the design's ~45 minutes is
+        // sixty per step at the default sixty steps, and deriving it keeps the two honest
+        // instead of introducing a second number nobody tunes.
+        max_wall_time: Duration::from_secs(u64::from(config.loop_.max_steps_per_attempt) * 60),
+    }
+}
+
 fn system_prompt(goal: &str) -> String {
     if goal.trim().is_empty() {
         return "You are an autonomous coding agent working one subtask at a time.".to_string();

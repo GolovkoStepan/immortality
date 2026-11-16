@@ -322,6 +322,37 @@ fn credential_assignment(line: &str) -> Option<&'static str> {
     None
 }
 
+/// The right-hand side of an assignment, cut where the value ends.
+///
+/// Not the rest of the line: in code, `password` is usually not alone. `nil, sign: nil)` after a
+/// signature's `password:` is the next parameter, not the value of this one, and judging the whole
+/// remaining line makes 22 characters with commas and a bracket — which the signature check reads
+/// as a credential. Measured on `qna_rails`: `initialize(username: nil, password: nil)` in a
+/// generated `docs/inventory.md` was refused as "a password", and three attempts of the same
+/// subtask failed because the document was telling the truth.
+///
+/// A quoted literal is taken whole, because `password = "correct horse"` has a space inside the
+/// value and cutting at the first space would hide it. Unquoted, the value ends at whitespace or
+/// at the syntax that closes it: `,` `)` `]` `}` `;` `#`.
+fn value_of(rest: &str) -> &str {
+    let rest = rest.trim_start_matches([' ', '\t']);
+    let quoted = rest
+        .chars()
+        .next()
+        .filter(|ch| matches!(ch, '"' | '\'' | '`'))
+        .and_then(|opening| {
+            let body = &rest[opening.len_utf8()..];
+            body.find(opening).map(|end| &body[..end])
+        });
+    if let Some(value) = quoted {
+        return value;
+    }
+    let end = rest
+        .find(|ch: char| ch.is_whitespace() || matches!(ch, ',' | ')' | ']' | '}' | ';' | '#'))
+        .unwrap_or(rest.len());
+    &rest[..end]
+}
+
 /// Whether the right-hand side of an assignment is a literal secret.
 ///
 /// Errs towards "not a secret": a false positive costs a blocked subtask and a human's attention,
@@ -329,10 +360,7 @@ fn credential_assignment(line: &str) -> Option<&'static str> {
 /// enough to clear the length bar. Interpolations and environment lookups are the common way to
 /// write a credential *reference*, and they are exactly what must not be flagged.
 fn looks_like_value(rest: &str) -> bool {
-    let value = rest
-        .trim_start_matches([' ', '\t'])
-        .trim_matches(['"', '\'', '`'])
-        .trim();
+    let value = value_of(rest).trim();
     if value.is_empty() {
         return false;
     }

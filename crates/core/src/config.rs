@@ -61,6 +61,29 @@ pub struct Backend {
     /// budget on it: at 400 tokens the answer came back empty with `finish_reason: length`.
     /// Disabling it removes reasoning entirely and cuts latency ~2.8x.
     pub enable_thinking: bool,
+    /// Completion budget for one step of the executor loop.
+    ///
+    /// Distinct from [`LoopLimits::max_tokens_per_attempt`], which bounds the whole attempt: this
+    /// bounds a single model turn. The two are not the same number and cannot be derived from one
+    /// another, because a turn's cost depends on what it is asked to write.
+    ///
+    /// # The defect this exists for
+    ///
+    /// Until this field existed the runner sent no `max_tokens` at all, so the client's
+    /// [`immortality_llm::wire::DEFAULT_MAX_TOKENS`] (1024) applied. That default is sized for a
+    /// tool call and is correct for `read_file` or a short `edit_file`; it is wrong for
+    /// `write_file`, whose whole point is a long argument. Measured on `qna_rails` (2026-11-16):
+    /// two attempts of a documentation subtask died at steps 19 and 23 with
+    /// `finish_reason: length`, zero content and zero tool calls — the model started writing
+    /// `docs/domain_models.md`, ran out of budget mid-argument, and the turn was discarded. Both
+    /// were recorded as `backend_unavailable`, because a discarded turn and a dead backend were
+    /// the same error. Reproduced in isolation: the same request with `max_tokens: 1024` returns
+    /// 1024 completion tokens and nothing usable.
+    ///
+    /// 8192 is the default rather than 1024 doubled: a document section with citations is
+    /// several thousand characters, and several thousand tokens leaves room for the argument to
+    /// close. It is still a cap, so a model that rambles is stopped rather than unbounded.
+    pub max_completion_tokens: u32,
 }
 
 /// Security policy. Global file only.
@@ -222,6 +245,7 @@ impl Default for Backend {
             health_interval_secs: 30,
             unavailable_escalate_after_secs: 900,
             enable_thinking: false,
+            max_completion_tokens: 8192,
         }
     }
 }
@@ -357,6 +381,7 @@ pub struct RawBackend {
     pub health_interval_secs: Option<u64>,
     pub unavailable_escalate_after_secs: Option<u64>,
     pub enable_thinking: Option<bool>,
+    pub max_completion_tokens: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -645,6 +670,7 @@ fn apply_non_policy(config: &mut Config, raw: RawConfig) {
             .unavailable_escalate_after_secs
             .unwrap_or(target.unavailable_escalate_after_secs);
         target.enable_thinking = raw.enable_thinking.unwrap_or(target.enable_thinking);
+        target.max_completion_tokens = raw.max_completion_tokens.unwrap_or(target.max_completion_tokens);
     }
     if let Some(raw) = raw.context {
         let target = &mut config.context;
@@ -789,6 +815,15 @@ fn validate(config: &Config) -> Result<()> {
     if config.backend.max_inference_concurrency == 0 {
         return Err(Error::ConfigInvalid(
             "backend.max_inference_concurrency must be at least 1".into(),
+        ));
+    }
+    // A completion budget of zero asks the backend for an empty answer and reports
+    // `finish_reason: length`, which is the failure this field exists to prevent.
+    if config.backend.max_completion_tokens == 0 {
+        return Err(Error::ConfigInvalid(
+            "backend.max_completion_tokens must be at least 1: a step that may not emit a token \
+             can only answer `finish_reason: length`"
+                .into(),
         ));
     }
     if config.loop_.max_subtask_depth > 3 {
@@ -1454,5 +1489,36 @@ mod tests {
         std::fs::write(&fx.project, "[detectors]\nreasoning_repeat_count = 1\n").unwrap();
         let error = load(&overrides_for(&fx)).unwrap_err().to_string();
         assert!(error.contains("reasoning_repeat_count"), "{error}");
+    }
+
+    #[test]
+    fn the_default_completion_budget_is_larger_than_one_tool_call() {
+        // The defect this guards: the runner sent no `max_tokens`, so the client's 1024 — sized
+        // for a tool call — was applied to `write_file` too, and a document died mid-argument.
+        let config = Config::default();
+        assert!(
+            config.backend.max_completion_tokens > 1024,
+            "a step that writes a file needs more than the tool-call default: {}",
+            config.backend.max_completion_tokens
+        );
+    }
+
+    #[test]
+    fn the_completion_budget_is_read_from_the_project_file() {
+        let fx = fixture();
+        std::fs::write(&fx.project, "[backend]\nmax_completion_tokens = 20000\n").unwrap();
+        let loaded = load(&overrides_for(&fx)).unwrap();
+        assert_eq!(loaded.config.backend.max_completion_tokens, 20000);
+    }
+
+    #[test]
+    fn a_zero_completion_budget_is_refused() {
+        // Zero asks for an empty answer and can only produce `finish_reason: length`, which is
+        // the failure the field exists to prevent.
+        let fx = fixture();
+        std::fs::write(&fx.project, "[backend]\nmax_completion_tokens = 0\n").unwrap();
+        let error = load(&overrides_for(&fx)).unwrap_err().to_string();
+        assert!(error.contains("max_completion_tokens"), "{error}");
+        assert!(error.contains("at least 1"), "{error}");
     }
 }

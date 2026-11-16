@@ -472,6 +472,16 @@ pub struct Runner {
     pub system_prompt: String,
     /// Bytes of one tool result that may enter the prompt.
     pub max_tool_output_bytes: usize,
+    /// Completion budget for one step: what a single `write_file` argument may cost.
+    pub max_completion_tokens: u32,
+    /// Whether the executor asks the backend to reason before answering.
+    ///
+    /// The planner already honoured `backend.enable_thinking`; the executor did not, so a
+    /// configuration file that turned reasoning off was obeyed for planning only. On
+    /// `swift-iq2_xs` that is not a style setting: reasoning is charged against the completion
+    /// budget, so with the default off a step spends its budget on `reasoning_content` and
+    /// returns `finish_reason: length` with nothing in `content`.
+    pub enable_thinking: bool,
     /// Soft and hard context budgets.
     pub budget: Budget,
     /// Step, token and time limits.
@@ -650,20 +660,34 @@ impl Runner {
             .finish(trigger, ending.failure_reason(), self.clock.now())
             .map_err(|error| immortality_core::Error::Protocol(error.to_string()))?;
 
+        let mut payload = serde_json::json!({
+            "attempt": attempt.id.to_string(),
+            "state": attempt.state.as_str(),
+            "ending": ending.as_str(),
+            "steps": attempt.steps_used,
+            "tokens": attempt.tokens_used,
+            // For `looped` this is the strategy the restart exists for; every other ending
+            // leaves the field out rather than writing `null`, which reads as "unknown".
+            "detector": state.stopped_by.map(|reaction| reaction.detector.as_str()),
+            "level": state.stopped_by.map(|reaction| reaction.level.as_str()),
+        });
+        // Only for `backend`: the backend's own words, which are the difference between "the
+        // connection was refused" and "the turn was truncated, so its work was discarded". Both
+        // end the attempt the same way (D-027), and without this field they also *read* the same,
+        // which cost an hour on `qna_rails`: two attempts labelled `backend_unavailable` had in
+        // fact died of `finish_reason: length` on a healthy backend.
+        //
+        // Inserted rather than declared in the literal so that every other ending keeps the
+        // record it had: a `"detail": null` on a `steps` ending is a field with nothing to say,
+        // and it would date every golden journal for a fact none of them record.
+        if let Ending::Backend { detail } = &ending {
+            payload["detail"] = serde_json::Value::String(detail.clone());
+        }
+
         journal.append_scoped(
             self.clock.now(),
             Kind::AttemptFailed,
-            serde_json::json!({
-                "attempt": attempt.id.to_string(),
-                "state": attempt.state.as_str(),
-                "ending": ending.as_str(),
-                "steps": attempt.steps_used,
-                "tokens": attempt.tokens_used,
-                // For `looped` this is the strategy the restart exists for; every other ending
-                // leaves the field out rather than writing `null`, which reads as "unknown".
-                "detector": state.stopped_by.map(|reaction| reaction.detector.as_str()),
-                "level": state.stopped_by.map(|reaction| reaction.level.as_str()),
-            }),
+            payload,
             &Scope::attempt(subtask.id.clone(), attempt_number),
         )?;
 
@@ -1727,6 +1751,12 @@ impl<'a> StepLoop<'a> {
         // execute here. A model cannot call what it was not offered.
         tools.push(split_def());
         request.tools = Some(tools);
+        // Without this the client sends `DEFAULT_MAX_TOKENS`, which is sized for a tool call and
+        // truncates the one tool whose argument is a whole file. See the field's doc comment.
+        request.max_tokens = Some(self.runner.max_completion_tokens);
+        // Applied here for the same reason: the client's default is `false`, and a project that
+        // turns reasoning on must get it in the executor too, not only in the planner.
+        request = request.with_thinking(self.runner.enable_thinking);
         request
     }
 
@@ -2598,6 +2628,8 @@ mod tests {
             gate: Arc::new(gate),
             system_prompt: "You are an agent.".to_string(),
             max_tool_output_bytes: 8192,
+            max_completion_tokens: 8192,
+            enable_thinking: false,
             budget: Budget {
                 soft: 32_000,
                 hard: 64_000,
@@ -3186,6 +3218,45 @@ mod tests {
     }
 
     #[test]
+    fn every_step_carries_the_configured_completion_budget() {
+        // The defect this pins: the runner set no `max_tokens`, so `ChatRequest`'s default (1024,
+        // sized for a tool call) applied to every step. A `write_file` whose argument is a whole
+        // document therefore ran out mid-argument and the turn was discarded — measured twice on
+        // `qna_rails`, at steps 19 and 23, both labelled `backend_unavailable`.
+        //
+        // The runner here is configured with a budget that is *not* the client default, so a
+        // request that silently omitted the field would still be caught.
+        let model = Scripted::new(vec![Ok(finish())]);
+        let (dir, mut runner) = runner(model.clone(), registry(vec![Arc::new(Touch)]));
+        runner.max_completion_tokens = 12_345;
+        let mut journal = journal(&dir);
+        runner.run(&subtask(), 1, "", &mut journal).expect("run");
+
+        let request = model.requests().pop().expect("a request");
+        assert_eq!(
+            request.max_tokens,
+            Some(12_345),
+            "the step must ask for the configured budget, not the client default"
+        );
+    }
+
+    #[test]
+    fn the_thinking_setting_reaches_the_executor() {
+        // The planner honoured `backend.enable_thinking` and the executor did not, so a project
+        // file that turned reasoning off was obeyed for planning only. On `swift-iq2_xs` that is
+        // not cosmetic: reasoning is charged against the completion budget.
+        let model = Scripted::new(vec![Ok(finish())]);
+        let (dir, mut runner) = runner(model.clone(), registry(vec![Arc::new(Touch)]));
+        runner.enable_thinking = true;
+        let mut journal = journal(&dir);
+        runner.run(&subtask(), 1, "", &mut journal).expect("run");
+
+        let request = model.requests().pop().expect("a request");
+        let kwargs = request.chat_template_kwargs.expect("template kwargs");
+        assert_eq!(kwargs["enable_thinking"], true, "{kwargs}");
+    }
+
+    #[test]
     fn a_split_proposal_ends_the_attempt_without_touching_the_tree() {
         // The runner has no tree to touch: it stops and reports, and the scheduler decides. An
         // attempt that kept going would keep spending steps on a subtask about to disappear.
@@ -3659,6 +3730,39 @@ mod tests {
 
         assert!(matches!(outcome.ending, Ending::Backend { .. }));
         assert_eq!(outcome.attempt.state, AttemptState::Abandoned);
+    }
+
+    #[test]
+    fn the_reason_a_backend_ending_happened_reaches_the_journal() {
+        // The defect this pins: `attempt_failed` recorded only `ending: backend`, so "the
+        // connection was refused" and "the turn was truncated and thrown away" read identically.
+        // On `qna_rails` that cost an hour: two attempts looked like a dead backend and had in
+        // fact died of `finish_reason: length` against a healthy one.
+        let model = Scripted::new(vec![Err(
+            "model failure (ThinkingTruncated): finish_reason=length, 0 chars of reasoning, \
+             empty content and no tool calls"
+                .to_string(),
+        )]);
+        let (dir, runner) = runner(model, registry(vec![Arc::new(Touch)]));
+        let mut journal = journal(&dir);
+        runner.run(&subtask(), 1, "", &mut journal).expect("run");
+
+        let records = immortality_core::journal::JournalReader::open(journal.dir(), journal.task())
+            .expect("reader")
+            .read()
+            .expect("records")
+            .records;
+        let failed = records
+            .iter()
+            .find(|record| record.fields.kind == Kind::AttemptFailed)
+            .expect("an attempt_failed record");
+        let detail = failed
+            .event
+            .payload
+            .get("detail")
+            .and_then(serde_json::Value::as_str)
+            .expect("the detail field");
+        assert!(detail.contains("finish_reason=length"), "{detail}");
     }
 
     #[test]

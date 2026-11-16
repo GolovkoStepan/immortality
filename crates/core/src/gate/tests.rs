@@ -252,6 +252,45 @@ fn a_short_bare_word_is_not_a_secret() {
 }
 
 #[test]
+fn a_parameter_named_password_is_not_a_secret() {
+    // The line is a Ruby method signature, and `password:` there is a parameter name. Judging the
+    // whole rest of the line made `nil, sign: nil)` — 22 characters with commas and a bracket —
+    // look like a value, and the gate refused a document that was telling the truth. Measured on
+    // `qna_rails`: three attempts of a documentation subtask died on exactly this string.
+    for line in [
+        "- `initialize(username: nil, password: nil, sign: nil)` — raises `AuthError` unless",
+        "    def initialize(password:, username: nil)",
+        "def create(password = nil, remember_me = false)",
+        "password: nil, sign: nil, expires_at: nil",
+        "  attr_reader :password, :username",
+        "if params[:password].blank? && params[:token].blank?",
+    ] {
+        let changed = file("docs/inventory.md", FileStatus::Modified, &[line]);
+        assert_clean(&diff(vec![changed]), line);
+    }
+}
+
+#[test]
+fn a_real_value_after_a_parameter_list_is_still_a_finding() {
+    // The other side of the cut: stopping at the delimiter must not make the rule blind. A
+    // credential followed by a comma is still a credential.
+    for line in [
+        r#"password: "hunter2hunter2", username: "admin""#,
+        "password=8f3a9c2b1d4e5f60,user=root",
+        "  password: 'sup3r-s3cret',",
+        // A quoted literal with a space inside it: the reason the value is taken to the closing
+        // quote rather than to the first space. Cutting at the space would read `correct` — seven
+        // letters, no digits — and let a real password through.
+        r#"password: "correct horse battery""#,
+    ] {
+        let changed = file("config/secrets.yml", FileStatus::Modified, &[line]);
+        let findings = sanity(&diff(vec![changed]));
+        assert_eq!(findings.len(), 1, "{line} was not flagged: {findings:?}");
+        assert!(matches!(findings[0], Finding::Secret { .. }), "{findings:?}");
+    }
+}
+
+#[test]
 fn a_token_with_no_secret_name_is_not_flagged() {
     // The heuristic is name-based, and being honest about that is better than a regex over
     // entropy that would flag every hash in every lock file.
