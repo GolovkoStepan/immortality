@@ -13,15 +13,37 @@
 > одновременно, и ни один из записанных прогонов не даёт всех трёх. Таблица прогонов и разбор —
 > [docs/roadmap.md](docs/roadmap.md) §`0.2`; это записано, а не подразумевается.
 >
-> Workspace собирается, 1960 тестов зелёные, живая модель для тестов не нужна: производственный
+> Workspace собирается, 1967 тестов зелёные, живая модель для тестов не нужна: производственный
 > путь `start` с настоящими гейтами проверяется репетицией в `tests/dogfood.rs`.
+
+## Установка
+
+```sh
+just install        # собрать release и положить `immortality` в ~/.local/bin
+immortality --version
+```
+
+Рецепт собирает `target/release/immortality`, копирует его в `bindir` (по умолчанию
+`~/.local/bin`, переопределяется `IMMORTALITY_BINDIR` или `just install bindir=/opt/homebrew/bin`)
+и **запускает установленный бинарь**, чтобы «успех» не оказался копией вне `PATH`. Если каталога
+нет в `PATH`, он печатает строку для `~/.zshrc` и не трогает ваш конфиг сам:
+
+```sh
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+`just uninstall` убирает только бинарь; состояние демона (`~/.local/share/immortality`, журналы,
+конфиг, `daemon.token`) остаётся — удалять его молча было бы потерей ваших прогонов.
+
+`cargo install --path crates/cli` тоже работает, но кладёт бинарь в `~/.cargo/bin`, которого на
+этой машине нет в `PATH`; рецепт выбран потому, что проверяет, где бинарь оказался.
 
 ## Быстрый старт
 
 ```bash
-cargo build --release            # бинарь target/release/immortality
-cargo test --workspace           # 1960 тестов, живая модель не нужна
-just ci                          # fmt + clippy + test, как в CI на Linux
+just install                     # release-бинарь в ~/.local/bin, доступный как `immortality`
+cargo test --workspace           # 1967 тестов, живая модель не нужна
+just ci                          # все четыре джоба CI локально
 
 # диагностика: конфиг, бэкенд, кэш префикса, место на диске, права на сокет
 immortality doctor

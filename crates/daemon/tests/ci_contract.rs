@@ -116,12 +116,15 @@ fn just_recipes(justfile: &str) -> BTreeMap<String, Recipe> {
         if line.is_empty() || line.starts_with('#') || !line.contains(':') {
             continue;
         }
-        // Settings (`set shell := [...]`) are not recipes, and `:=` would otherwise read as a
-        // recipe named `set shell`.
+        // Settings (`set shell := [...]`) and assignments (`bindir := ...`) are not recipes.
+        // An assignment's `:=` would otherwise read as a recipe whose dependency is the value.
         if line.starts_with("set ") || line.starts_with("export ") {
             continue;
         }
         let (header, tail) = line.split_once(':').expect("checked above");
+        if tail.starts_with('=') {
+            continue;
+        }
         let Some(name) = header.split_whitespace().next() else {
             continue;
         };
@@ -142,6 +145,37 @@ fn just_recipes(justfile: &str) -> BTreeMap<String, Recipe> {
         );
     }
     recipes
+}
+
+#[test]
+fn the_install_recipe_installs_into_bindir_and_runs_what_it_installed() {
+    // The point of the recipe is one command that leaves a working `immortality` on PATH. A
+    // copy that lands somewhere off PATH is discovered the next morning, so the recipe is
+    // required to *run* the installed binary — that is what proves the copy is executable —
+    // and to say so when the directory is not on PATH rather than editing a shell config.
+    let recipes = just_recipes(&read("justfile"));
+    let install = recipes
+        .get("install")
+        .expect("the justfile should define an `install` recipe");
+    let command = install.body.join("\n");
+
+    assert!(
+        command.contains("target/release/immortality"),
+        "`install` should install the release binary, found: {command}"
+    );
+    assert!(
+        command.contains("{{bindir}}"),
+        "`install` should install into the configurable `bindir`, not a hard-coded path"
+    );
+    assert!(
+        command.contains("--version"),
+        "`install` should run the binary it installed: a copy off PATH otherwise looks like \
+         success until the next shell"
+    );
+    assert!(
+        command.contains("PATH"),
+        "`install` should tell the operator when `bindir` is not on PATH"
+    );
 }
 
 #[test]
