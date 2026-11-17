@@ -12,6 +12,12 @@
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-11-18
+
+Патч после `v0.1.3`: Linux-джоб CI нашёл дефект сортировки сегментов журнала на уже
+запушенном дереве, и вместе с ним закрыт процессный дефект, который позволил тегу уйти
+при красном джобе. Новых возможностей нет.
+
 ### Исправлено
 
 - **Сегменты журнала читались в обратном порядке, когда два поворота попадали в одну
@@ -42,20 +48,6 @@
   добавить джоб в воркфлоу, сузить `audit`, убрать номер решения из комментария — каждый роняет
   тест по существу, с текстом причины.
 
-### Добавлено
-
-- **`just install` — одна команда от исходников до `immortality` в терминале.** Собирает
-  release-бинарь, копирует в `bindir` (`~/.local/bin` по умолчанию, переопределяется
-  `IMMORTALITY_BINDIR=/some/bin just install`) и **запускает установленный бинарь**, а не
-  пишет «готово»: копия вне `PATH` иначе обнаруживается на следующее утро. Если каталога нет в
-  `PATH`, печатается строка для `~/.zshrc` — рецепт не правит чужой конфиг молча.
-  `just uninstall` убирает только бинарь, состояние демона остаётся. Тест
-  `the_install_recipe_installs_into_bindir_and_runs_what_it_installed` требует всех трёх
-  свойств, саботаж (убрать запуск) падает. `cargo install --path crates/cli` тоже работает, но
-  кладёт бинарь в `~/.cargo/bin`, которого на этой машине нет в `PATH`.
-
-### Исправлено
-
 - **`just install` врал про `PATH` и предлагал переопределение, которого `just` не принимает.**
   Два дефекта в рецепте, добавленном в этой же ветке, найдены при проверке разницы `just` и
   `make` — оба тихие, оба выглядят как «работает»:
@@ -74,6 +66,18 @@
   Оба свойства закреплены тестами: `the_install_recipe_…` падает на `$$` в рецепте, новый
   `the_documented_way_to_override_bindir_is_one_that_works` — на `just install bindir=` в
   документации. Саботаж обоих падает по существу.
+
+### Добавлено
+
+- **`just install` — одна команда от исходников до `immortality` в терминале.** Собирает
+  release-бинарь, копирует в `bindir` (`~/.local/bin` по умолчанию, переопределяется
+  `IMMORTALITY_BINDIR=/some/bin just install`) и **запускает установленный бинарь**, а не
+  пишет «готово»: копия вне `PATH` иначе обнаруживается на следующее утро. Если каталога нет в
+  `PATH`, печатается строка для `~/.zshrc` — рецепт не правит чужой конфиг молча.
+  `just uninstall` убирает только бинарь, состояние демона остаётся. Тест
+  `the_install_recipe_installs_into_bindir_and_runs_what_it_installed` требует всех трёх
+  свойств, саботаж (убрать запуск) падает. `cargo install --path crates/cli` тоже работает, но
+  кладёт бинарь в `~/.cargo/bin`, которого на этой машине нет в `PATH`.
 
 ### Изменено
 
@@ -802,8 +806,9 @@
   аргументов tool-call по одному символу и политика ретраев проверены без бэкенда. Тест заодно
   фиксирует, что ревьюер идёт через `turn_blocking` (`stream: false`), а не потоком.
 
-[Unreleased]: https://github.com/OWNER/immortality/compare/v0.1.3...HEAD
-[0.1.3]: https://github.com/OWNER/immortality/compare/v0.1.2...v0.1.3
-[0.1.2]: https://github.com/OWNER/immortality/compare/v0.1.1...v0.1.2
-[0.1.1]: https://github.com/OWNER/immortality/compare/v0.1.0...v0.1.1
-[0.1.0]: https://github.com/OWNER/immortality/releases/tag/v0.1.0
+[Unreleased]: https://github.com/GolovkoStepan/immortality/compare/v0.1.4...HEAD
+[0.1.4]: https://github.com/GolovkoStepan/immortality/compare/v0.1.3...v0.1.4
+[0.1.3]: https://github.com/GolovkoStepan/immortality/compare/v0.1.2...v0.1.3
+[0.1.2]: https://github.com/GolovkoStepan/immortality/compare/v0.1.1...v0.1.2
+[0.1.1]: https://github.com/GolovkoStepan/immortality/compare/v0.1.0...v0.1.1
+[0.1.0]: https://github.com/GolovkoStepan/immortality/releases/tag/v0.1.0
