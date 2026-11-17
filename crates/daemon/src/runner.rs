@@ -1105,7 +1105,7 @@ impl<'a> AttemptSession<'a> {
             )?;
             self.absorb(&outcome.report);
             let cause = Self::cause_of(&outcome);
-            self.remember(number, &cause);
+            self.remember(number, &outcome, &cause);
             self.last = Some(cause);
 
             // The attempt just run has spent one of the budget, whichever way it ended: a stop is
@@ -1179,7 +1179,18 @@ impl<'a> AttemptSession<'a> {
     /// The gate path already records its own reason in `settle_claim`, so only the other endings
     /// are added here: it is the same sentence the cause prints, and a brief that listed it twice
     /// would look like two failures.
-    fn remember(&mut self, number: u32, cause: &Cause) {
+    ///
+    /// Only an outcome that actually failed is remembered. `cause_of` has to answer with some
+    /// `Cause` for every ending because its caller stores one, and it answers `Stalled` for the
+    /// endings that need no cause at all — `Verified`, `Split`, `Abandoned`. Recording that answer
+    /// wrote `attempt 1: it produced no tool call for the stall budget` into the report of every
+    /// subtask that closed green on its first try, which is the one sentence a resumed attempt
+    /// must not be told. The ending is therefore read directly rather than inferred from the
+    /// cause.
+    fn remember(&mut self, number: u32, outcome: &RunOutcome, cause: &Cause) {
+        if !matches!(outcome.ended(), Ended::Failed(_)) {
+            return;
+        }
         if matches!(cause, Cause::Gate { .. }) {
             return;
         }
@@ -5961,6 +5972,34 @@ mod tests {
         assert!(matches!(end.stop, Stop::Exhausted(_)), "{:?}", end.stop);
         // Two attempts ran, so the third step was never asked for.
         assert_eq!(model.requests().len(), 2, "{:?}", end.stop);
+    }
+
+    #[test]
+    fn a_verified_claim_names_no_rejected_idea() {
+        // Measured on the `roomly-bench` run: every one of four subtasks closed green on its
+        // first attempt, and every one of the four reports still carried
+        //
+        //   "attempt 1: it produced no tool call for the stall budget, so nothing happened on disk"
+        //
+        // `drive` calls `remember` for every outcome, and `cause_of` maps the endings that need
+        // no cause (`Verified`, `Split`, `Abandoned`) to `Cause::Stalled`, so a success was
+        // recorded as a failure. `rejected_ideas` is what a resumed attempt is told not to
+        // repeat (D-074, D-136) — a false entry there tells the next context that the work it
+        // just finished was a dead end.
+        let (dir, mut runner) = runner(Scripted::new(vec![Ok(finish())]), registry(vec![Arc::new(Touch)]));
+        runner.gates = Some(Arc::new(FakeGates::green()));
+        let mut journal = journal(&dir);
+        let end = runner
+            .session(&subtask(), 1)
+            .drive(allowance(3, 2), &mut journal)
+            .expect("session");
+
+        assert_eq!(end.stop, Stop::Done, "{:?}", end.stop);
+        assert!(
+            end.report.rejected_ideas.is_empty(),
+            "a subtask that closed green rejected nothing, but the report says {:?}",
+            end.report.rejected_ideas
+        );
     }
 
     #[test]
