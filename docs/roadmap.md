@@ -30,7 +30,11 @@
 Первые полезные точки: **7 дней** — можно позвать модель и посмотреть, как она вызывает
 инструменты; **47.5 дня** — инструменты и политика работают; **77.5 дня** — можно запустить
 прогон на живой модели; **85** — релиз v0.1.0. Патч `v0.1.1` вышел после догфудинга: в него
-вошли исправления, найденные живыми прогонами (D-100…D-108), без новых вех.
+вошли исправления, найденные живыми прогонами (D-100…D-108), без новых вех. `v0.1.3` — второй
+патч, и в нём только дефекты, найденные боевым прогоном по шести непроверенным путям
+(D-118…D-142): новой возможности нет ни одной, поэтому номер патчевый, хотя с `v0.1.2` в
+`master` успело войти шесть `feat`-коммитов из вехи `0.2` — сама веха при этом не доказана
+(§`0.2`).
 
 Распределение усилий: состояние и восстановление ~30%, агентная петля ~20%, инструменты
 ~19%, LLM-слой ~11%, демон ~16%, dogfooding ~9%, каркас ~6%.
@@ -394,6 +398,49 @@ S1 ── M0 ── M1 ── M2 ── M3 ── M4 ── M5 ── M6
 
 ---
 
+## 0.1.3 — боевой прогон по шести непроверенным путям (подготовлено)
+
+Патч, а не минор: в нём нет ни одной новой возможности, только дефекты, найденные живыми
+площадками, и документация к ним. Шесть путей, закрытых по очереди: крах в окне `tool_call`,
+эскалация по отказу политики, две задачи одного проекта, субагент, `metrics` на журнале
+`black_jack`, документация как рабочий материал. Решения D-118…D-142, каждое начинается с
+замера.
+
+Версия подготовлена и смержена в `master`; аннотированный тег `v0.1.3` ставит человек — по
+`AGENTS.md` push, теги и релизы не автоматизируются.
+
+| Что | Тест |
+| --- | --- |
+| `serve` читал обнаруженный конфиг вместо названного `--global-config` | `serve_reads_the_global_config_it_was_given` |
+| проектный конфиг не применялся к демону под launchd | `the_project_file_is_applied_to_a_config_loaded_without_one` |
+| `status` называл идущую задачу пустой | `a_task_whose_subtask_is_running_says_so_instead_of_claiming_there_is_no_work` |
+| `merge` отказывал на `.agent/` и отчитывался `merged` о пустой ветке | `merge_lands_a_run_that_left_its_own_bookkeeping_modified`, `merge_refuses_a_branch_with_nothing_ahead_of_main` |
+| работа закрытой подзадачи не попадала в ветку, а форс-чекаут её стирал | `committing_to_the_branch_keeps_the_tree_it_committed` |
+| task-level дифф стал пустым после коммитов | `the_task_base_shows_a_reviewer_the_work_that_was_committed` |
+| возобновлённая попытка судилась против собственной работы | `a_resumed_attempt_is_reviewed_against_the_base_the_outage_did_not_move` |
+| шаг не мог записать файл: бюджет 1024 токена | `every_step_carries_the_configured_completion_budget` |
+| правило `secret` ловило имя параметра и `::` | `a_parameter_named_password_is_not_a_secret`, `a_real_value_after_a_parameter_list_is_still_a_finding` |
+| восстановление и `gc` читали общий журнал целиком | `another_tasks_open_attempt_is_not_this_tasks_to_close`, `gc_reads_this_tasks_state_not_the_newest_in_the_journal` |
+| ревьюер был ограничен бюджетом вызова инструмента | `the_reviewers_budget_is_the_operators_not_a_tool_calls` |
+| дедлайн 30 с на планирующий запрос | `the_deadline_follows_the_shape_of_the_request` |
+| отказ планировщика назывался дважды | `a_bad_proposal_is_named_once` |
+| чтение внутри `cd … && …` судилось как запись | `a_read_inside_a_mutating_command_is_not_judged_as_a_write` |
+| транспортная ошибка теряла причину | `a_transport_error_keeps_the_reason_it_was_caused_by` |
+| пул держал сокет дольше серверного keep-alive | `a_pooled_socket_is_never_trusted_past_the_servers_keep_alive` |
+| откат перематывал ветку задачи на скрытый снимок | `a_rollback_does_not_move_the_task_branch_onto_the_snapshot` |
+| `log` показывал метку вместо вердикта | `a_shell_observation_does_not_render_as_its_own_stdout_label` |
+| отчёт закрытой подзадачи не писался в дерево | `a_closed_subtask_keeps_its_report_on_disk` |
+| успешная попытка оставляла запись в `rejected_ideas` | `a_verified_claim_names_no_rejected_idea` |
+| откат оставлял вызвавший его вызов открытым | `a_rolled_back_call_is_closed_so_the_next_restart_does_not_roll_again` |
+| отказ политики обещал ответ человека | `an_escalation_does_not_claim_a_human_was_asked` |
+| две задачи одного проекта писали в один журнал | `a_second_task_of_a_running_project_is_refused_before_its_first_byte` |
+
+Два расхождения найдены и **не** исправлены в этой версии — они записаны в `CHANGELOG.md`
+§«Известные ограничения» и в `docs/decisions.md`: `yolo` снимает вопрос и у `git push` (D-138),
+`git commit` через `shell` обходит трейлер восстановления (D-139).
+
+---
+
 ## 0.2 — петля не теряет найденное
 
 **Сделано, когда:** `immortality metrics --json` на живом прогоне даёт одновременно
@@ -611,6 +658,26 @@ macOS-машине), то есть токен и артефакты журнал
 Третий прогон — не дефект демона: модель действительно не дописала вывод в `main.rs`, и ревьюер
 прав. Это и есть проверка, ради которой веха заведена: работа доехала до ветки, ревьюер её увидел,
 и вердикт описывает работу, а не отсутствие наблюдения.
+
+**Веха пока не закрыта, и это видно по числам.** Критерий требует трёх чисел сразу, а живой прогон
+даёт два. Сводка по всем прогонам на 2026-11-17 (`immortality metrics --json`):
+
+| Прогон | `closed_green` | `green_attempts_not_closed` | `step_exhaustions_without_gates` | `settled_after_step_budget` |
+| --- | --- | --- | --- | --- |
+| `tsk_01M7CZ…` (`black_jack`, 1) | 3 | 0 | **2** | **0** |
+| `tsk_01M7D7…` (`black_jack`, 2) | **5** | 0 | **1** | **0** |
+| `tsk_01M7DA…` (`black_jack`, 3) | **5** | 0 | **2** | **0** |
+| `tsk_01M7J6…` (`black_jack`, документация) | **7** | 0 | **4** | **3** |
+| `tsk_01M7MP…` (`roomly-bench`) | 4 | 0 | **0** | **0** |
+| `live5` (`line-count`, `max_steps_per_attempt = 5`) | 1 | 0 | **0** | **1** |
+
+Читается так: планка `closed_green >= 5` взята тремя прогонами (`black_jack` 2 и 3, документация),
+«гейтов не спрашивали» равно
+нулю только у двух (`roomly-bench` и `live5`, и ни один из них не даёт `settled_after_step_budget`),
+а `settled_after_step_budget > 0` — у двух других, и у обоих ненулевое `step_exhaustions_without_gates`,
+то есть их журналы предшествуют D-115 и о потере работы молчат. Пересечения всех трёх условий нет
+ни на одном прогоне. Поэтому веха остаётся открытой до прогона, где путь D-115 исполнился на
+журнале, который уже видит все исчерпания.
 
 | Регрессия | Что ловит |
 | --- | --- |
