@@ -24,8 +24,8 @@ immortality --version
 ```
 
 Рецепт собирает `target/release/immortality`, копирует его в `bindir` (по умолчанию
-`~/.local/bin`, переопределяется `IMMORTALITY_BINDIR` или `just install bindir=/opt/homebrew/bin`)
-и **запускает установленный бинарь**, чтобы «успех» не оказался копией вне `PATH`. Если каталога
+`~/.local/bin`, переопределяется `IMMORTALITY_BINDIR=/opt/homebrew/bin just install`) и **запускает
+установленный бинарь**, чтобы «успех» не оказался копией вне `PATH`. Если каталога
 нет в `PATH`, он печатает строку для `~/.zshrc` и не трогает ваш конфиг сам:
 
 ```sh
