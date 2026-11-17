@@ -18,7 +18,22 @@ unmaintained = "workspace"
 # Unsound advisories are real memory-safety bugs, but a transitive one with no fixed
 # release would block all work; warn on those, fail on direct dependencies.
 unsound = "workspace"
-ignore = []
+# Each entry is a decision, not a mute: it names the advisory, why it is not actionable
+# today, and the decision that owns the debt. `crates/daemon/tests/ci_contract.rs` fails if
+# an entry loses its `RUSTSEC-` or `D-` reference, so suppressing one means writing it down.
+ignore = [
+    # RUSTSEC-2026-0543, issued 2026-11-17: `chrono` is unmaintained. Type is INFO, not a
+    # vulnerability — no CVE, no described defect — and there is no patched version.
+    # `chrono` is a direct dependency of `core`, `daemon` and `testkit` (85 uses: `Utc`,
+    # `Duration`, `Local`, `TimeZone`, `NaiveDateTime`), and the journal's millisecond
+    # truncation in `core::time` relies on `SubsecRound` semantics: one spelling per
+    # timestamp, so lexicographic order matches chronological order. Migrating to `time` or
+    # `jiff` is a refactor of the domain `Timestamp`, the golden journals and that contract,
+    # not a version bump — so it is scheduled for 0.3 as D-143 rather than smuggled into a
+    # patch. Until then this ignore is the whole of what is being claimed: the crate works
+    # today, and nobody is fixing it if it stops.
+    "RUSTSEC-2026-0543",
+]
 
 [licenses]
 # MIT OR Apache-2.0 is what this project ships under; dependencies must be compatible.
