@@ -3,6 +3,11 @@
 # Deliberately no automatic release: this is a single binary that humans install and run
 # against their own repositories, and a surprise tag is not a service to them. Releases are
 # prepared as pull requests and published by a human.
+#
+# There is no workflow that runs this: `.github/workflows/` holds `ci.yml` only, and the
+# releases so far (0.1.0-0.1.3) were prepared by hand in the same shape `release-plz` would
+# produce. The `[changelog] header` below is kept identical to the top of `CHANGELOG.md` so
+# that the first real run does not rewrite the file.
 
 [workspace]
 changelog_update = true
@@ -23,6 +28,10 @@ header = """
 
 Формат основан на [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/),
 проект следует [Semantic Versioning](https://semver.org/lang/ru/).
+Версии и этот файл обновляются из Conventional Commits: разделы сгруппированы так, как их
+сгруппировал бы `release-plz` (см. `release-plz.toml`), но сам он не запускается — workflow для
+него нет, а решение о версии и теге принимает человек (`AGENTS.md`). Поэтому записи до `0.1.3`
+сделаны руками, и `Unreleased` в файле нет: незавершённых разделов не осталось.
 """
 commit_parsers = [
     { message = "^feat", group = "### Добавлено" },
