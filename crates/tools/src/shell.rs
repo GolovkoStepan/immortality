@@ -53,6 +53,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use immortality_core::artifacts::ArtifactStore;
+use immortality_core::domain::dod::masks_exit_code;
 use immortality_core::protocol::Idempotency;
 use serde_json::{Value, json};
 
@@ -344,7 +345,47 @@ impl Shell {
     }
 
     fn report(&self, command: &str, finished: &Finished, cwd: Option<&Path>) -> ToolResult {
+        let code = finished.status.and_then(|status| status.code());
+        let summary = match (finished.status, code) {
+            (Some(_), Some(0)) if !finished.timed_out => "exited 0".to_string(),
+            (Some(_), Some(code)) => format!("exited {code}"),
+            // A real signal death and our failure to reap both land here; the distinction the
+            // model can act on is "it was killed", and `timed_out` says which kill it was.
+            (Some(_), None) => "killed by a signal".to_string(),
+            (None, _) => "killed, did not report".to_string(),
+        };
+        let masked = masks_exit_code(command);
+
+        // The summary is the first line, not the last. It used to be appended after the output,
+        // which put the one fact the model most needs — did this succeed — behind up to 8 KiB of
+        // transcript, and made the first line of every result a `--- stdout ---` label. Measured
+        // on the `roomly` run: 97 of 100 shell results rendered as `shell: --- stdout ---` in
+        // `immortality log`, so the transcript was unreadable.
+        // The summary is the first line, not the last. It used to be appended after the output,
+        // which put the one fact the model most needs — did this succeed — behind up to 8 KiB of
+        // transcript, and made the first line of every result a `--- stdout ---` label. Measured
+        // on the `roomly` run: 97 of 100 shell results rendered as `shell: --- stdout ---` in
+        // `immortality log`, so the transcript was unreadable.
         let mut observation = String::new();
+        let _ = writeln!(
+            observation,
+            "[{summary} in {:.1} s, {} line(s) of stdout, {} of stderr]",
+            finished.duration.as_secs_f64(),
+            finished.stdout.total_lines,
+            finished.stderr.total_lines
+        );
+        if masked {
+            // `/bin/sh` gives a pipeline the status of its *last* command, so an `exited 0` above
+            // can be `tail`'s and not the command's. Measured on the `roomly` run: nine results
+            // carried a failure in the text — `16 examples, 16 failures` — next to `exited 0`,
+            // because the model wrote `rspec … | tail -30`. D-116 refuses such a command as a
+            // `DoD` check; the tool cannot refuse it, so it says what the number means.
+            let _ = writeln!(
+                observation,
+                "This command is a pipeline: `{summary}` is the status of its last command, not \
+                 of the whole pipeline. Drop the `|` to have a failure earlier in the pipe judged."
+            );
+        }
         if finished.leftovers_killed {
             let _ = writeln!(
                 observation,
@@ -369,9 +410,7 @@ impl Shell {
             }
             omitted += captured.omitted;
             shown += captured.shown;
-            if !observation.is_empty() {
-                observation.push('\n');
-            }
+            observation.push('\n');
             let _ = writeln!(observation, "--- {label} ---");
             observation.push_str(&captured.tail);
             if captured.omitted > 0 {
@@ -382,26 +421,6 @@ impl Shell {
                 );
             }
         }
-
-        let code = finished.status.and_then(|status| status.code());
-        let summary = match (finished.status, code) {
-            (Some(_), Some(0)) if !finished.timed_out => "exited 0".to_string(),
-            (Some(_), Some(code)) => format!("exited {code}"),
-            // A real signal death and our failure to reap both land here; the distinction the
-            // model can act on is "it was killed", and `timed_out` says which kill it was.
-            (Some(_), None) => "killed by a signal".to_string(),
-            (None, _) => "killed, did not report".to_string(),
-        };
-        if !observation.is_empty() {
-            observation.push('\n');
-        }
-        let _ = writeln!(
-            observation,
-            "[{summary} in {:.1} s, {} line(s) of stdout, {} of stderr]",
-            finished.duration.as_secs_f64(),
-            finished.stdout.total_lines,
-            finished.stderr.total_lines
-        );
 
         let artifact = self.spool(command, finished);
 
@@ -838,6 +857,73 @@ mod tests {
         assert!(result.observation.contains("hi"), "{}", result.observation);
         assert_eq!(result.data["exit_code"], 0);
         assert_eq!(result.data["timed_out"], false);
+    }
+
+    #[test]
+    fn the_summary_is_the_first_line_so_a_reader_sees_the_verdict_before_the_output() {
+        // The defect this pins: the summary used to be appended last, so the first line of every
+        // result was a `--- stdout ---` label. `immortality log` renders only the first line, and
+        // 97 of 100 shell calls in the `roomly` run therefore looked like they had no output.
+        let dir = fixture();
+        let shell = Shell::default();
+        let result = run_shell(dir.path(), &shell, json!({"command": "echo hi"})).unwrap();
+        // The first *non-empty* line, because the renderer skips blank lines too: `immortality
+        // log` decides what a step says from the same line, and a leading newline must not be
+        // able to hide the regression.
+        let first = result
+            .observation
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or_default();
+        assert!(
+            first.starts_with("[exited 0 in "),
+            "the verdict must come first, got {first:?}"
+        );
+        assert!(
+            result.observation.contains("--- stdout ---"),
+            "{}",
+            result.observation
+        );
+    }
+
+    #[test]
+    fn a_pipeline_says_that_its_exit_code_is_the_last_command_s() {
+        // Measured on the `roomly` run: nine results carried `16 examples, 16 failures` next to
+        // `exited 0`, because the model wrote `rspec … | tail -30` and `/bin/sh` reports the
+        // pipeline's *last* status. D-116 refuses such a command as a `DoD` check; the tool has to
+        // run what the model asks, so it names the trap instead.
+        let dir = fixture();
+        let shell = Shell::default();
+        let result = run_shell(dir.path(), &shell, json!({"command": "echo hi | tail -1"})).unwrap();
+        assert_eq!(result.data["exit_code"], 0);
+        assert!(
+            result.observation.contains("is a pipeline"),
+            "a masked exit code must be named: {}",
+            result.observation
+        );
+        assert!(
+            result
+                .observation
+                .contains("last command, not of the whole pipeline"),
+            "{}",
+            result.observation
+        );
+    }
+
+    #[test]
+    fn a_command_without_a_pipe_is_not_warned_about() {
+        // The warning has to be rare enough to mean something. A `||` is a deliberate short
+        // circuit, not a masked status, and must not trigger it either.
+        let dir = fixture();
+        let shell = Shell::default();
+        for command in ["echo hi", "false || echo recovered"] {
+            let result = run_shell(dir.path(), &shell, json!({"command": command})).unwrap();
+            assert!(
+                !result.observation.contains("is a pipeline"),
+                "{command} must not be flagged: {}",
+                result.observation
+            );
+        }
     }
 
     #[test]

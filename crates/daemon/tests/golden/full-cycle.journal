@@ -97,8 +97,13 @@
     "dt_ms": 90000,
     "kind": "tool_call_completed",
     "payload": {
+      "bytes": 18,
       "call": "call_write",
-      "observation": "Created src/parser.rs (1 line(s), 18 bytes)."
+      "created": true,
+      "lines": 1,
+      "observation": "Created src/parser.rs (1 line(s), 18 bytes).",
+      "path": "src/parser.rs",
+      "unchanged": false
     },
     "seq": 8,
     "subtask": "sub_01ARZ3NDEKTSV4RRFFQ69G5FAA"
@@ -164,7 +169,12 @@
     "kind": "tool_call_completed",
     "payload": {
       "call": "call_read",
-      "observation": "     1: pub fn parse() {}\n"
+      "observation": "     1: pub fn parse() {}\n",
+      "offset": 1,
+      "path": "src/parser.rs",
+      "returned": 1,
+      "total_lines": 1,
+      "truncated_lines": []
     },
     "seq": 13,
     "subtask": "sub_01ARZ3NDEKTSV4RRFFQ69G5FAA"
@@ -217,7 +227,12 @@
     "kind": "tool_call_completed",
     "payload": {
       "call": "call_read",
-      "observation": "     1: pub fn parse() {}\n"
+      "observation": "     1: pub fn parse() {}\n",
+      "offset": 1,
+      "path": "src/parser.rs",
+      "returned": 1,
+      "total_lines": 1,
+      "truncated_lines": []
     },
     "seq": 17,
     "subtask": "sub_01ARZ3NDEKTSV4RRFFQ69G5FAA"
@@ -283,7 +298,12 @@
     "kind": "tool_call_completed",
     "payload": {
       "call": "call_read",
-      "observation": "     1: pub fn parse() {}\n"
+      "observation": "     1: pub fn parse() {}\n",
+      "offset": 1,
+      "path": "src/parser.rs",
+      "returned": 1,
+      "total_lines": 1,
+      "truncated_lines": []
     },
     "seq": 22,
     "subtask": "sub_01ARZ3NDEKTSV4RRFFQ69G5FAA"
@@ -418,8 +438,13 @@
     "dt_ms": 450000,
     "kind": "tool_call_completed",
     "payload": {
+      "bytes": 18,
       "call": "call_write",
-      "observation": "src/parser.rs already had exactly that content; nothing changed."
+      "created": false,
+      "lines": 1,
+      "observation": "src/parser.rs already had exactly that content; nothing changed.",
+      "path": "src/parser.rs",
+      "unchanged": true
     },
     "seq": 32,
     "subtask": "sub_01ARZ3NDEKTSV4RRFFQ69G5FAA"

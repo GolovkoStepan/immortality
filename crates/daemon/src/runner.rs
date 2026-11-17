@@ -1994,9 +1994,17 @@ impl<'a> StepLoop<'a> {
                     truncated.text
                 };
                 // Before the model sees it: this is what makes the journal authoritative.
+                //
+                // The tool's structured `data` goes in too, not only the text. It used to be
+                // dropped here, so a `shell` result reached the journal as
+                // `{"observation": "..."}` and the `exit_code` the tool had already computed was
+                // lost — which left `immortality log` unable to say how a command ended and made
+                // every result render as its own `--- stdout ---` label. The two merge with the
+                // text last so a `data` field named `observation` cannot overwrite the text the
+                // model was actually shown.
                 log.completed(
                     &intent.call,
-                    serde_json::json!({ "observation": observation }),
+                    with_observation(result.data, observation.clone()),
                     truncated.artifact,
                 )
                 .map_err(|error| backend(&error))?;
@@ -2400,6 +2408,28 @@ fn calls_of(reply: &Reply) -> Vec<ToolCall> {
         .collect()
 }
 
+/// The `tool_call_completed` payload: the tool's structured `data` plus the text it was shown.
+///
+/// `ToolResult` carries both, and `data` is documented as "the structured form, for the journal
+/// and for detectors". It used to be dropped at the call site, so a `shell` result reached the
+/// journal as `{"observation": "..."}` and the `exit_code` the tool had already computed never
+/// left the process. `immortality log` could then only show the text, whose first line is the
+/// tool's own `--- stdout ---` label, and every command read as if it had produced nothing.
+///
+/// `observation` is written last, so a tool that happens to put an `observation` key in its
+/// `data` cannot replace the text the model was actually shown — the journal has to agree with
+/// the model, not with a field the model never saw.
+fn with_observation(data: serde_json::Value, observation: String) -> serde_json::Value {
+    let mut payload = match data {
+        serde_json::Value::Object(map) => map,
+        // `Value::Null` is the common case for a text-only tool, and anything else is
+        // unrepresentable as a merge target without inventing a field name for it.
+        _ => serde_json::Map::new(),
+    };
+    payload.insert("observation".to_string(), serde_json::Value::String(observation));
+    serde_json::Value::Object(payload)
+}
+
 /// A journal or artifact-store failure. Always the end of the attempt.
 fn backend(error: &immortality_core::Error) -> Ending {
     Ending::Backend {
@@ -2442,6 +2472,7 @@ mod tests {
     use immortality_core::domain::{AttemptState, Dod, SubtaskId, SubtaskState};
     use immortality_core::protocol::Idempotency;
     use immortality_tools::tool::RegistryError;
+    use serde_json::json;
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
@@ -2792,6 +2823,40 @@ mod tests {
 
     fn finish() -> Reply {
         Reply::call("call_finish", FINISH_SUBTASK, r#"{"summary":"done"}"#)
+    }
+
+    #[test]
+    fn the_journal_payload_keeps_the_structured_fields_and_the_text() {
+        // `ToolResult` carries both, and `data` is documented as the form "for the journal and
+        // for detectors". It used to be dropped at the call site, so `shell`'s `exit_code` never
+        // reached the record and `immortality log` had nothing to render but the observation's
+        // first line — the tool's own `--- stdout ---` label.
+        let payload = with_observation(
+            serde_json::json!({"command": "cargo test", "exit_code": 1}),
+            "[exited 1 in 0.5 s]".to_string(),
+        );
+        assert_eq!(payload["command"], json!("cargo test"));
+        assert_eq!(payload["exit_code"], json!(1));
+        assert_eq!(payload["observation"], json!("[exited 1 in 0.5 s]"));
+    }
+
+    #[test]
+    fn a_tool_cannot_overwrite_the_observation_the_model_saw() {
+        // The journal has to agree with the model. A tool that happens to name a `data` field
+        // `observation` would otherwise put text into the record that no model ever saw.
+        let payload = with_observation(
+            serde_json::json!({"observation": "something else entirely"}),
+            "the text the model was shown".to_string(),
+        );
+        assert_eq!(payload["observation"], json!("the text the model was shown"));
+    }
+
+    #[test]
+    fn a_text_only_tool_still_yields_a_payload_with_the_observation() {
+        // `ToolResult::text` leaves `data` as `Null`; the record must not become `null` or gain a
+        // placeholder key for it.
+        let payload = with_observation(serde_json::Value::Null, "done".to_string());
+        assert_eq!(payload, serde_json::json!({"observation": "done"}));
     }
 
     #[test]

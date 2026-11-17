@@ -685,6 +685,33 @@ fn an_unknown_program_is_decided_by_the_judge_on_the_production_path() {
         "the record has to name the command a human can check"
     );
     assert_eq!(record.event.payload["verdict"], json!("allow"));
+
+    // The same run is the only cheap proof that the tool's structured `data` reaches the journal.
+    // It used to be dropped at `log.completed`, so `tool_call_completed` carried `call` and
+    // `observation` and nothing else: the `exit_code` `shell` had already computed never left the
+    // process, and `immortality log` could only print the observation's first line — which is the
+    // tool's own `--- stdout ---` label. Measured on the `roomly` run, that made 97 of 100 shell
+    // calls look as if they had produced nothing.
+    let completed = fixture
+        .records(&task)
+        .into_iter()
+        .find(|record| {
+            record.fields.kind == Kind::ToolCallCompleted
+                && record.event.payload["command"] == json!("frobnicate --all")
+        })
+        .expect("the shell result must be in the journal");
+    assert!(
+        completed.event.payload["exit_code"].is_number(),
+        "the journal lost the exit code the tool computed: {}",
+        completed.event.payload
+    );
+    assert!(
+        completed.event.payload["observation"]
+            .as_str()
+            .is_some_and(|text| text.starts_with('[')),
+        "the text the model saw must stay in the journal: {}",
+        completed.event.payload
+    );
 }
 
 #[test]

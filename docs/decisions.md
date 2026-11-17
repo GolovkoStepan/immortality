@@ -4431,3 +4431,75 @@ onto_the_snapshot` падает с `left: 02e9e00… right: c2c4d40…` на у�
 `rollback`. `git checkout -B <branch> <parent>` перед reset: `-B` на ветке, где уже стоим,
 откатывает отслеживаемые правки — ровно поломка D-122. Держать снимок в `git stash`: stash — один
 на репозиторий, а попыток и подзадач много, и вложенные снимки не пережили бы второй откат.
+
+## D-135. Запись о вызове хранит структурный результат, а `shell` называет свой вердикт первым
+
+**Что было.** `immortality log` после прогона `roomly` (задача
+`tsk_01M7MA4E896C8R4BJSXV7XGSGH`, 657 записей) показывал `shell: observation=--- stdout ---`
+для 97 из 100 вызовов `shell`. Транскрипт был нечитаем: по нему нельзя было понять ни что
+запускалось, ни чем кончилось.
+
+**Почему так вышло — три причины, а не одна.**
+
+1. `ToolResult` носит два поля: `observation` (текст модели) и `data` (структурный результат,
+   документированный как «для журнала и детекторов»). `runner` писал в журнал
+   `{"observation": …}` и `data` выбрасывал. Замер: в `roomly/.agent/JOURNAL.jsonl` у
+   `tool_call_completed` ровно два ключа — `call` и `observation`; `exit_code`, который `shell`
+   уже посчитал, до записи не доходил.
+2. `shell` дописывал сводку `[exited N in X s, …]` **последней**, после до 8 KiB вывода, так что
+   первая строка наблюдения всегда была меткой `--- stdout ---`.
+3. Рендерер брал первую строку `observation` как содержание, поэтому метка и попадала в строку.
+
+**Как теперь.** `runner` сливает `data` и текст в один объект (`with_observation`), причём
+`observation` пишется последним: поле с тем же именем внутри `data` не может подменить текст,
+который модель видела. `shell` пишет сводку первой строкой. `describe_result` предпочитает
+структурные поля, если первая строка наблюдения — служебная метка или та же сводка в скобках.
+Для записей, созданных до этой правки (у них нет ничего, кроме текста), `first_content_line`
+пропускает метки сам — старый журнал рендерится, хотя и без строчных полей.
+
+**Замер на живом журнале.** После правки `immortality log` по тому же `roomly/.agent`: 100
+`⎿ shell:` и **0** из них с `--- stdout ---`; до правки было 97. Строки стали вида
+`⎿ shell: 16 examples, 16 failures`.
+
+**Второй дефект из того же прогона: пайп маскирует код возврата.** В 9 из 82 shell-команд с `|`
+стояло `exited 0` рядом с текстом провала: модель писала `rspec … | tail -30`, а `/bin/sh`
+отдаёт статус последней команды пайпа. `DoD`-проверку с пайпом ядро уже отклоняет (D-116), но
+инструмент обязан выполнить то, что просит модель, поэтому `masks_exit_code` (тот же предикат)
+переиспользуется в `shell` для предупреждения в наблюдении. Направление зависимости `tools →
+core` это позволяет.
+
+**Тесты.**
+- `the_journal_payload_keeps_the_structured_fields_and_the_text` (`daemon`): `data` и текст
+  оказываются в одной записи.
+- `a_tool_cannot_overwrite_the_observation_the_model_saw` (`daemon`): `observation` в `data`
+  не подменяет текст.
+- `a_text_only_tool_still_yields_a_payload_with_the_observation` (`daemon`): `data: Null` не
+  даёт `null` вместо объекта.
+- `an_unknown_program_is_decided_by_the_judge_on_the_production_path` (`daemon`, `tests/start.rs`):
+  сквозь `start::start` у `tool_call_completed` есть `exit_code`; до правки записи с `command`
+  в журнале не было вовсе.
+- `the_summary_is_the_first_line_so_a_reader_sees_the_verdict_before_the_output` (`tools`).
+- `a_pipeline_says_that_its_exit_code_is_the_last_command_s` и
+  `a_command_without_a_pipe_is_not_warned_about` (`tools`).
+- `a_shell_result_leads_with_the_exit_code_and_the_command`,
+  `a_shell_observation_does_not_render_as_its_own_stdout_label`,
+  `an_old_record_with_only_a_stdout_label_still_shows_the_output` (`cli`).
+- Золотой журнал `tests/golden/full-cycle.journal` обновлён: в нём теперь видны `path`, `lines`,
+  `bytes` у `write_file` и `offset`, `total_lines` у `read_file` — то есть правка чинила не
+  только `shell`.
+
+**Саботаж.**
+- `with_observation(Null, …)` вместо `result.data` → тест в `tests/start.rs` падает на «the shell
+  result must be in the journal»: записи с `command` больше нет.
+- Вставка `observation` из `data` после текста → `a_tool_cannot_overwrite_…` падает с
+  `left: "something else entirely"`.
+- Сводка снова в конце → тест первой строки падает с `got "--- stdout ---"` (сначала он падал
+  с `got ""`, пока искал буквально первую строку; исправлено на первую непустую — рендерер тоже
+  пропускает пустые).
+- Снятие фильтра в `first_content_line` → тест старой записи падает.
+
+**Отвергнуто.** Чинить только рендер: он не может показать то, чего в записи нет, — `exit_code`
+не сохранялся. Отказывать в пайпе, как `DoD`: инструмент должен выполнять просьбу модели, а
+`DoD`-отказ защищает вердикт о работе, а не ход выполнения. Хранить `data` отдельным полем записи
+`{"data": …, "observation": …}`: рендерер и детекторы уже читают плоский `payload`, и вложенность
+заставила бы их знать про обёртку.
