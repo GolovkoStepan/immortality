@@ -729,15 +729,24 @@ fn collect_segments(dir: &Path) -> crate::Result<Vec<PathBuf>> {
 /// Whether a file in the journal directory is one of ours.
 ///
 /// Deliberately strict: a stray file that happens to end in `.jsonl` must not be replayed as
-/// part of the task's history. Delegates to [`parse_stamp`] so that the reader and the
-/// rotation writer cannot disagree about which names exist — they did, once, and the
+/// part of the task's history. Delegates to [`parse_segment`] so that the reader, the sorter
+/// and the rotation writer cannot disagree about which names exist — they did, once, and the
 /// collision-suffixed segments the writer produced were invisible to the reader.
 fn is_segment_name(name: &str) -> bool {
-    name == "JOURNAL.jsonl" || parse_stamp(name).is_some()
+    name == "JOURNAL.jsonl" || parse_segment(name).is_some()
 }
 
 /// Sort key for a segment: the initial one first, then chronological by parsed stamp.
-fn segment_order(path: &Path) -> (u8, i64, String) {
+///
+/// The collision counter is part of the key, and it is a **number**. Comparing the names as
+/// strings gets the order backwards for exactly the case the counter exists for: two rotations
+/// in one millisecond produce `JOURNAL.<stamp>.jsonl` and `JOURNAL.<stamp>-001.jsonl`, and at
+/// the position after the shared prefix `-` (0x2D) sorts before `.` (0x2E) — so the later
+/// segment would be read first. That is not a cosmetic misordering: the reader sees `seq` go
+/// backwards, reports `SequenceGap` and `ChainBreak`, and a perfectly good journal is declared
+/// corrupt. It showed up as a Linux CI failure once three rotations landed in one millisecond;
+/// on a machine where they spread across milliseconds the string comparison never mattered.
+fn segment_order(path: &Path) -> (u8, i64, u32, String) {
     let name = path
         .file_name()
         .and_then(|n| n.to_str())
@@ -746,32 +755,44 @@ fn segment_order(path: &Path) -> (u8, i64, String) {
     if name == "JOURNAL.jsonl" {
         // The initial segment predates every rotation, so it orders before them. The 0 is not
         // a real timestamp; the discriminator field does the work.
-        return (0, 0, name);
+        return (0, 0, 0, name);
     }
-    match parse_stamp(&name) {
-        // Nanoseconds since the epoch: `NaiveDateTime` is comparable, but a plain integer key
-        // keeps the tuple cheap and avoids a dependency on the timezone type ordering.
-        Some(stamp) => (1, stamp.and_utc().timestamp_millis(), name),
+    match parse_segment(&name) {
+        // Milliseconds since the epoch, then the collision counter within that millisecond.
+        // A plain integer keeps the tuple cheap and avoids a dependency on the timezone type
+        // ordering.
+        Some((stamp, collision)) => (1, stamp.and_utc().timestamp_millis(), collision, name),
         // An unrecognised name is only reachable through a race with an external writer; put
         // it after the parseable ones so it cannot displace them, and let the chain check
         // report it if it contains foreign records.
-        None => (2, 0, name),
+        None => (2, 0, 0, name),
     }
 }
 
-/// Parse the timestamp out of `JOURNAL.<stamp>[-<n>].jsonl`.
-fn parse_stamp(name: &str) -> Option<chrono::NaiveDateTime> {
+/// Parse `JOURNAL.<stamp>[-<n>].jsonl` into the stamp and the collision counter.
+///
+/// The counter is 0 when the name has no suffix. It is parsed as a number so that
+/// `…-001` orders after `…` rather than before it; see [`segment_order`] for why the string
+/// comparison is wrong here.
+fn parse_segment(name: &str) -> Option<(chrono::NaiveDateTime, u32)> {
     let rest = name.strip_prefix("JOURNAL.")?.strip_suffix(".jsonl")?;
     for format in ["%Y-%m-%dT%H-%M-%S%.3f", "%Y-%m-%dT%H-%M-%S"] {
         if let Ok(stamp) = chrono::NaiveDateTime::parse_from_str(rest, format) {
-            return Some(stamp);
+            return Some((stamp, 0));
         }
     }
-    // Collision-suffixed form: `...-001`.
-    let (stamp, _) = rest.rsplit_once('-')?;
+    // Collision-suffixed form: `...-001`. Only digits are a counter — a `-something` tail is
+    // not a name this writer produces, and treating it as one would invent an order for a file
+    // the rotation code never creates.
+    let (stamp, counter) = rest.rsplit_once('-')?;
+    let collision: u32 = counter.parse().ok()?;
     ["%Y-%m-%dT%H-%M-%S%.3f", "%Y-%m-%dT%H-%M-%S"]
         .iter()
-        .find_map(|format| chrono::NaiveDateTime::parse_from_str(stamp, format).ok())
+        .find_map(|format| {
+            chrono::NaiveDateTime::parse_from_str(stamp, format)
+                .ok()
+                .map(|stamp| (stamp, collision))
+        })
 }
 
 /// Offset just past the last newline in a file.
@@ -1173,6 +1194,55 @@ mod tests {
         let order: Vec<u64> = outcome.records.iter().map(|r| r.fields.seq).collect();
         assert_eq!(order, [0, 1, 2]);
         assert_eq!(outcome.problems, Vec::new(), "chain must span segments");
+    }
+
+    /// Three rotations in the **same millisecond** must still read in order.
+    ///
+    /// This is the case that failed on Linux CI and passed on macOS: the clock was the system
+    /// clock, so whether the rotations landed in one millisecond or three depended on the
+    /// machine. Pinning it makes the case deterministic instead of lucky, and it is the case
+    /// the collision counter in `rotate` exists for.
+    ///
+    /// The failure it catches is not a cosmetic ordering: reading `…-001` before `…` makes the
+    /// reader see `seq` go backwards, so it reports `SequenceGap` and `ChainBreak` and a sound
+    /// journal is declared corrupt.
+    #[test]
+    fn segments_created_in_the_same_millisecond_read_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let task = TaskId::from_suffix("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let mut writer = Journal::open(dir.path(), task.clone()).unwrap();
+        // A clock that never moves: every rotation gets the same stamp, so the second and
+        // third segments can only be told apart by the collision counter.
+        writer.set_clock(std::sync::Arc::new(crate::time::FixedClock::at(at())));
+        for seg in 0..3 {
+            writer.written = SEGMENT_LIMIT_BYTES;
+            writer
+                .append_event(at(), Kind::TaskState, serde_json::json!({ "seg": seg }))
+                .unwrap();
+        }
+        writer.close().unwrap();
+
+        let names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names.len(),
+            4,
+            "the initial segment (left empty by rotating before the first append) plus three \
+             rotations: {names:?}"
+        );
+
+        let reader = JournalReader::open(dir.path(), &task).unwrap();
+        let outcome = reader.read().unwrap();
+        let order: Vec<u64> = outcome.records.iter().map(|r| r.fields.seq).collect();
+        assert_eq!(order, [0, 1, 2], "segments were read out of order");
+        assert_eq!(
+            outcome.problems,
+            Vec::new(),
+            "same-millisecond rotation must not look like corruption: {:?}",
+            outcome.problems
+        );
     }
 
     #[test]
