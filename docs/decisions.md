@@ -4778,3 +4778,90 @@ closed attempt 1 …`, в журнале `tool_call_failed {abandoned: true}`. �
 которого и существует `Unknown`. `AbandonCall` без откатa (`Unknown` → закрыть, дерево не
 трогать) — худший вариант: эффект неизвестен, и оставлять его в дереве значит гадать, что
 именно уцелело.
+
+---
+
+## D-141. Отказ политики не выдаёт себя за вопрос человеку
+
+**Что видно.** Прогон `bench-esc` (задача `tsk_01M7MXKP15NAQHZJBD5R32R7D3`, глобальный конфиг
+`/tmp/imm-esc/config.toml` с `yolo = false`). Модель попросила `shell` выполнить
+`frobnicate --check src/count.rs` — программу, которой нет ни в одной таблице классификатора.
+Полученный ответ:
+
+```json
+{"error":"awaiting_human_approval","escalation":"external:command:frobnicate",
+ "hint":"The call did not run. Continue with work that does not need approval,
+         and the human's answer will arrive as an observation.",
+ "reason":"`frobnicate` is not a known command, so it is treated as external"}
+```
+
+Человеку при этом **никто не писал**. Замеры после прогона:
+
+```
+$ immortality escalations tsk_01M7MXKP15NAQHZJBD5R32R7D3
+nothing is waiting for a human.
+$ ls <state>/bench-esc-3707cf/tsk_01M7MXKP15NAQHZJBD5R32R7D3/
+processes/
+$ grep -c escalation .agent/JOURNAL.jsonl     # ни escalation_opened, ни resolved
+0
+$ grep -rl "external:command:frobnicate" <state root>
+(пусто)
+```
+
+То есть вопрос не задан нигде: ни в `escalations.json` (файла нет вовсе — каталог задачи
+содержит только `processes/`), ни в журнале, ни в выводе `escalations`. `awaiting_human_approval`
+в ответе — просто имя кода ошибки.
+
+**Почему это дефект, а не недоделка.** Само по себе «отказать без вопроса» — допустимое
+решение: `PolicyGate` не владеет журналом и очередью, и D-117 прямо запрещает второму писателю
+трогать журнал. Дефект в **тексте**: модель получила утверждение, что ответ придёт, и повела
+себя соответственно. В своём `NOTES.md` (записано через `update_state` в том же прогоне) она
+написала:
+
+> Policy returned `awaiting_human_approval` … So the human was asked; per the hint I continued
+> with work that does not need approval.
+
+Модель не могла знать, что никто не спросил, — ей это сказали. Если бы этот шаг был
+обязательным для работы, подзадача закрылась бы на предположении, которого никто не
+подтверждал, а человек узнал бы об этом из журнала уже после. Ложное утверждение в промпте —
+дефект независимо от того, что «настоящий» вопрос задаётся другим инструментом.
+
+**Связанное, тот же прогон: эскалация через инструмент работает.** Вторая площадка
+(`bench-esc2`, задача `tsk_01M7MXTNGJ72FQDWWV8FSDGKH4`) с задачей, где модель обязана позвать
+`escalate` первой. Проверено живьём: `escalation_opened {id: esc_01M7MXVF4B05YYPNY2E5FRKEKF,
+key: "docs:wording", kind: "blocked", blocking: false}` в журнале, запись в `escalations.json`,
+`immortality escalations` показывает её, `immortality approve <id> allow_for_task` отвечает,
+очередь пустеет, задача доходит до `ready_for_review`. То есть механизм очереди цел; разрыв
+ровно в том, что `Verdict::Escalated` из `check_command` до очереди не доходит.
+
+**Как теперь.** Текст отказа переписан и говорит правду:
+
+```
+The call did not run: no human was asked, because this path only refuses.
+Continue with work that does not need it, or ask with the `escalate` tool if the answer is required.
+```
+
+Ключ `escalation` в payload оставлен: он называет, чего именно не хватило, и по нему оператор
+может заранее расширить таблицы. Имя кода `awaiting_human_approval` не менялось — оно
+фигурирует в трёх существующих тестах (`shell.rs`, `processes.rs`) и в документации; менять
+код ошибки и текст одной правкой значило бы смешать два утверждения. Настоящий вопрос остаётся
+за инструментом `escalate`, у которого есть журнал, очередь и нотификация.
+
+**Тесты.**
+- `an_escalation_does_not_claim_a_human_was_asked` (`tools`): отказ не содержит
+  `answer will arrive`, содержит `no human was asked` и имя инструмента `escalate`.
+
+**Саботаж.** Вернуть старую строку `continues` — тест падает на первом же утверждении с полным
+payload в сообщении: `…"hint":"The call did not run. Continue with work that does not need
+approval, and the human's answer will arrive as an observation."…`.
+
+**Отвергнуто.** Заставить `check_command` писать в очередь. Это смешало бы слои: `PolicyGate`
+живёт в `tools`, а очередь и журнал принадлежат демону, и D-117 объясняет, почему второй писатель
+журнала ломает цепочку. Правильное место для «отказать и спросить» — `shell`/`runner`, где есть
+`ToolCtx` с задачей и `JournalQueue`; это отдельная работа, и пока её нет, честный текст важнее
+молчаливого обещания. Оставить текст и считать, что «модель поймёт по пустой очереди» — модель
+очередь не читает; единственный читатель этого поля — она.
+
+**Что осталось.** Отказ политики по-прежнему не создаёт вопроса, и это осознанное ограничение
+v0.1, зафиксированное здесь, а не спрятанное. Модель теперь об этом знает и может позвать
+`escalate` сама — что и проверено на второй площадке.

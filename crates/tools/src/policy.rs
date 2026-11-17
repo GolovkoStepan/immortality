@@ -854,8 +854,15 @@ impl PolicyGate {
             key: format!("external:{subject}"),
             reason: reason.to_string(),
             auto_approvable,
-            continues: "The call did not run. Continue with work that does not need approval, \
-                        and the human's answer will arrive as an observation."
+            // Nothing is queued for the human by this path, so the message must not say one was
+            // asked. It used to promise "the human's answer will arrive as an observation", and a
+            // live run showed the cost: the model wrote in its own `NOTES.md` that "the human was
+            // asked", a human opening `immortality escalations` saw an empty queue, and the work
+            // continued on an assumption nobody had confirmed. Asking is `escalate`'s job; this is
+            // a refusal with a reason, and the model has to know which of the two it got (D-141).
+            continues: "The call did not run: no human was asked, because this path only refuses. \
+                        Continue with work that does not need it, or ask with the `escalate` tool \
+                        if the answer is required."
                 .to_string(),
         })
     }
@@ -1261,6 +1268,29 @@ mod tests {
         let verdict = gate().check_command("frobnicate --all");
         assert!(matches!(verdict, Verdict::Escalated(_)), "{verdict:?}");
         assert!(verdict.observation().unwrap().contains("not a known command"));
+    }
+
+    #[test]
+    fn an_escalation_does_not_claim_a_human_was_asked() {
+        // A `kill -9`-free live run showed the cost of the old wording: the refusal said "the
+        // human's answer will arrive as an observation", the model wrote in its own notes that
+        // "the human was asked", and `immortality escalations` showed an empty queue — because
+        // this path refuses without queueing anything. A model has to be able to tell a question
+        // from a refusal, or it builds the rest of the subtask on an answer nobody gave (D-141).
+        let verdict = gate().check_command("frobnicate --all");
+        let observation = verdict.observation().expect("an observation");
+        assert!(
+            !observation.contains("answer will arrive"),
+            "the refusal must not promise an answer it never queued: {observation}"
+        );
+        assert!(
+            observation.contains("no human was asked"),
+            "the model must be told that nobody was asked: {observation}"
+        );
+        assert!(
+            observation.contains("`escalate`"),
+            "it must also be told which tool does ask: {observation}"
+        );
     }
 
     #[test]
