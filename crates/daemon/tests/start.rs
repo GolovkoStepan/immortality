@@ -141,6 +141,19 @@ impl Fixture {
             .collect()
     }
 
+    /// Every record of the project's journal, whatever task wrote it.
+    ///
+    /// The journal is one file per repository, so this is the only view that can see a second
+    /// writer: a per-task reader would report each task's own records as well-formed while the
+    /// file as a whole forked (D-142).
+    fn all_records(&self) -> Vec<JournalRecord> {
+        JournalReader::open_unnamed(self.agent())
+            .expect("reader")
+            .read()
+            .expect("records")
+            .records
+    }
+
     /// The task states the journal announced, in order.
     fn states(&self, task: &str) -> Vec<String> {
         self.records(task)
@@ -1107,6 +1120,85 @@ fn a_second_start_of_a_running_task_is_refused_and_names_the_first() {
     gate.release();
     fixture.wait_for(&task, TaskState::ReadyForReview);
     Fixture::wait_until_idle(&state);
+}
+
+#[test]
+fn a_second_task_of_a_running_project_is_refused_before_its_first_byte() {
+    // Measured live: two `start`s of one project a second apart both opened `JOURNAL.jsonl`, and
+    // their in-memory `next_seq` cursors interleaved 0…6 with 7…14, then continued both from 7.
+    // The file ended with 67 repeated `seq` values, `[JOURNAL CORRUPT]` on both tasks, and after a
+    // restart neither could be reopened — both blocked and asked a human, while both worktrees
+    // held green gates and commits. The slot's unit is therefore the project (D-142), and it has
+    // to be claimed before `task_created` is written: a refusal that arrives after that append
+    // has already forked the chain it exists to protect.
+    let fixture = Fixture::new();
+    let gate = Gate::new();
+    let model = Scripted::new(Work::Wait(Arc::clone(&gate)));
+    let state = fixture.state(model);
+
+    let answer = start_now(&state, &json!({ "project": fixture.repo, "goal": GOAL }))
+        .expect("the first admission must succeed");
+    let running = answer["task"].as_str().expect("a task id").to_string();
+    let before = fixture.all_records();
+
+    // A *different* goal, so the refusal cannot be about the plan already existing; and a second
+    // task, which is exactly the run the per-task slot used to let through.
+    let error = start_now(
+        &state,
+        &json!({ "project": fixture.repo, "goal": "add a second notes file" }),
+    )
+    .expect_err("a second task of a running project must be refused");
+    assert!(error.contains("already running"), "{error}");
+    assert!(
+        error.contains(&running),
+        "the refusal must name the task holding the project: {error}"
+    );
+    assert!(
+        error.contains("immortality attach"),
+        "the refusal must say how to watch the holder: {error}"
+    );
+
+    // The refusal came before the write. If it had not, the second `task_created` would have
+    // continued `seq` from its own cursor and the journal would already be unreadable.
+    assert_eq!(
+        fixture.all_records().len(),
+        before.len(),
+        "a refused admission must not write a record"
+    );
+    let seqs: Vec<u64> = fixture
+        .all_records()
+        .iter()
+        .map(|record| record.fields.seq)
+        .collect();
+    let mut unique = seqs.clone();
+    unique.dedup();
+    assert_eq!(seqs, unique, "a refused admission must not fork `seq`");
+
+    gate.release();
+    fixture.wait_for(&running, TaskState::ReadyForReview);
+    Fixture::wait_until_idle(&state);
+
+    // The project is free again once the run ends: the slot is a lock on a live writer, not a
+    // ban on the project.
+    let second = start_now(&state, &json!({ "project": fixture.repo, "goal": GOAL }))
+        .expect("the project must be startable again after the first run ends");
+    let second = second["task"].as_str().expect("a task id").to_string();
+    fixture.wait_for(&second, TaskState::ReadyForReview);
+    Fixture::wait_until_idle(&state);
+
+    // And the two sequential tasks share one well-formed chain: `seq` strictly increases across
+    // the file, so `Journal::open` would accept it.
+    let seqs: Vec<u64> = fixture
+        .all_records()
+        .iter()
+        .map(|record| record.fields.seq)
+        .collect();
+    let mut unique = seqs.clone();
+    unique.dedup();
+    assert_eq!(
+        seqs, unique,
+        "two sequential tasks must share one chain: {seqs:?}"
+    );
 }
 
 #[test]

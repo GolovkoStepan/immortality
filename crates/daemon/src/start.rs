@@ -146,6 +146,11 @@ pub async fn start(state: &ServerState, params: &Value) -> Result<Value, RpcErro
 
     let task = TaskId::generate();
     let at = immortality_core::time::now();
+    // The project's slot is claimed before anything is written. `start` journals `task_created`
+    // before the run thread exists, so a second admission of the same project that was refused
+    // only after that write would still have appended to the one file both runs share — the
+    // refusal has to come before the first byte, not before the thread (D-142).
+    let slot = RunSlot::claim(state, &project.id, &task)?;
     let task_dir = project.state_dir(&state.state_root).join(task.as_str());
     std::fs::create_dir_all(&task_dir)
         .map_err(|error| internal(format!("cannot create {}: {error}", task_dir.display())))?;
@@ -188,7 +193,7 @@ pub async fn start(state: &ServerState, params: &Value) -> Result<Value, RpcErro
         model: state.model.clone(),
         events: state.events.clone(),
     };
-    spawn(state, run)?;
+    spawn(run, slot)?;
 
     Ok(serde_json::json!({
         "task": task,
@@ -247,6 +252,9 @@ fn resume(state: &ServerState, task: &str) -> Result<Value, RpcError> {
     let task_dir = project.state_dir(&state.state_root).join(task.as_str());
     std::fs::create_dir_all(&task_dir)
         .map_err(|error| internal(format!("cannot create {}: {error}", task_dir.display())))?;
+    // Claimed before the cycle reads or writes the journal: a resume of a task whose project is
+    // already running would otherwise race the live run for the same file (D-142).
+    let slot = RunSlot::claim(state, &project.id, &task)?;
 
     let run = Run {
         config: task_config(state, &project)?,
@@ -259,7 +267,7 @@ fn resume(state: &ServerState, task: &str) -> Result<Value, RpcError> {
         model: state.model.clone(),
         events: state.events.clone(),
     };
-    spawn(state, run)?;
+    spawn(run, slot)?;
 
     Ok(serde_json::json!({
         "task": task,
@@ -365,14 +373,17 @@ struct Run {
     events: Option<Events>,
 }
 
-/// Claim the task's single run slot and start the cycle on its own thread.
+/// Start the cycle on its own thread, holding the project's slot for its lifetime.
 ///
 /// The thread is not joined: a cycle is hours and the RPC answer is not its result. What it does
 /// report is that the thread was spawned — a daemon that cannot spawn should say so now, not leave
 /// a task looking started and doing nothing.
-fn spawn(state: &ServerState, run: Run) -> Result<(), RpcError> {
+///
+/// `slot` is passed in rather than claimed here because the claim must happen **before** the
+/// journal is touched: a refused admission that had already appended `task_created` would fork the
+/// very chain the slot exists to protect (D-142).
+fn spawn(run: Run, slot: RunSlot) -> Result<(), RpcError> {
     let task = run.task.clone();
-    let slot = RunSlot::claim(state, task.clone())?;
     let named = task.clone();
     std::thread::Builder::new()
         .name(format!("cycle-{task}"))
@@ -388,41 +399,57 @@ fn spawn(state: &ServerState, run: Run) -> Result<(), RpcError> {
     Ok(())
 }
 
-/// One admission's claim on a task, released when the run ends.
+/// One admission's claim on a **project**, released when the run ends.
 ///
 /// A struct with a `Drop` rather than paired `begin`/`end` calls: the release has to happen on
-/// every path out of the thread, and a path that forgot it would make the task look permanently
+/// every path out of the thread, and a path that forgot it would make the project look permanently
 /// running.
+///
+/// The claim is per project because the journal is one file per repository. It used to be per
+/// task, which let two tasks of one project append to `JOURNAL.jsonl` at once, interleaving `seq`
+/// numbers until the file was `CORRUPT` and neither task could reopen it (D-142).
 #[derive(Debug)]
 struct RunSlot {
-    running: Arc<std::sync::Mutex<std::collections::BTreeSet<TaskId>>>,
-    task: TaskId,
+    running: Arc<std::sync::Mutex<std::collections::BTreeMap<String, TaskId>>>,
+    project: String,
 }
 
 impl RunSlot {
-    fn claim(state: &ServerState, task: TaskId) -> Result<Self, RpcError> {
+    fn claim(state: &ServerState, project: &str, task: &TaskId) -> Result<Self, RpcError> {
         // The guard is dropped before the `Self` is built: a struct holding the mutex it just
         // released would be a deadlock on the next claim, and clippy's early-drop warning is
         // pointing at exactly that shape.
-        let claimed = {
+        let busy = {
             let mut running = state
                 .running
                 .lock()
                 .map_err(|_| internal("the run bookkeeping is poisoned; restart the daemon".to_string()))?;
-            running.insert(task.clone())
+            // Read first, insert only if free: an `if let` on `get` would hold the immutable
+            // borrow across the insert, and `map_or_else` would hide which of the two branches
+            // writes.
+            let holder = running.get(project).cloned();
+            if holder.is_none() {
+                running.insert(project.to_string(), task.clone());
+            }
+            holder
         };
-        if !claimed {
+        if let Some(holder) = busy {
+            // The id is in the message because that is what the human typed; the holder is named
+            // too, since with a project-wide slot the refusal can now be about a *different* task
+            // than the one asked for, and an error that did not say which would read as a bug.
             return Err(RpcError::new(
                 ErrorCode::BadParams,
                 format!(
-                    "task {task} is already running in this daemon; \
-                     watch it with `immortality attach {task}`"
+                    "task {task} cannot run: {holder} is already running in this project, and its \
+                     journal is one file — two runs would fork the chain. Wait for it or cancel \
+                     it, or watch it with `immortality attach {holder}`; `immortality status` \
+                     lists both."
                 ),
             ));
         }
         Ok(Self {
             running: Arc::clone(&state.running),
-            task,
+            project: project.to_string(),
         })
     }
 }
@@ -430,7 +457,7 @@ impl RunSlot {
 impl Drop for RunSlot {
     fn drop(&mut self) {
         if let Ok(mut running) = self.running.lock() {
-            running.remove(&self.task);
+            running.remove(&self.project);
         }
     }
 }
