@@ -13,6 +13,14 @@
 
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
+# Where `just install` puts the binary. Override with `just install bindir=/some/bin`.
+#
+# `~/.local/bin` rather than `~/.cargo/bin` or `/opt/homebrew/bin`: the first is not on PATH on
+# every machine (including this one), and the second belongs to Homebrew, which would not know
+# about a binary it did not install. `install` checks PATH and prints the line to add if needed,
+# instead of leaving you with a command that is not found.
+bindir := env_var_or_default("IMMORTALITY_BINDIR", home_directory() / ".local" / "bin")
+
 default: ci
 
 # Everything CI checks.
@@ -57,6 +65,29 @@ doctor:
 
 build:
     cargo build --release
+
+# Build the release binary and put `immortality` on PATH.
+#
+# One command, and it ends by running the binary it just installed rather than saying "done":
+# a copy that lands in a directory off PATH would otherwise be discovered tomorrow. If the
+# directory is not on PATH, the line to add is printed — the recipe does not edit your shell
+# config behind your back.
+install:
+    cargo build --release
+    mkdir -p "{{bindir}}"
+    install -m 755 target/release/immortality "{{bindir}}/immortality"
+    @echo "installed: {{bindir}}/immortality"
+    @case ":$$PATH:" in \
+        *":{{bindir}}:"*) "{{bindir}}/immortality" --version ;; \
+        *) echo "{{bindir}} is NOT on PATH. Add this to ~/.zshrc and open a new shell:"; \
+           echo '    export PATH="{{bindir}}:$PATH"'; \
+           "{{bindir}}/immortality" --version ;; \
+    esac
+
+# Remove the installed binary. The daemon's own state is left alone on purpose.
+uninstall:
+    rm -f "{{bindir}}/immortality"
+    @echo "removed: {{bindir}}/immortality"
 
 # Format, lint and test in one go, fixing what can be fixed automatically.
 fix:
