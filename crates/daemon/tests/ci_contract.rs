@@ -176,6 +176,43 @@ fn the_install_recipe_installs_into_bindir_and_runs_what_it_installed() {
         command.contains("PATH"),
         "`install` should tell the operator when `bindir` is not on PATH"
     );
+
+    // `$$` in `just` is not the escape it is in `make`: the recipe text is handed to the shell
+    // as written, so `$$PATH` reaches `bash` and expands to the *PID* followed by `PATH`. The
+    // first version of this recipe wrote `case ":$$PATH:"` and therefore compared the PID, which
+    // matched nothing — so the not-on-PATH branch ran even when `bindir` was on PATH. The line
+    // only looked right because the message it prints uses a single `$` inside single quotes.
+    //
+    // This is checked statically because `just` is not installed on the CI runners: executing
+    // the recipe would turn a two-line assertion into a toolchain requirement.
+    assert!(
+        !command.contains("$$"),
+        "`install` must not use `$$`: in `just` it expands to the PID, not to a dollar sign. \
+         Use a single `$` and let the shell see it, found: {command}"
+    );
+}
+
+#[test]
+fn the_documented_way_to_override_bindir_is_one_that_works() {
+    // `just install bindir=X` reads plausibly and is what the README claimed, but `just` only
+    // accepts `name=value` arguments for recipes that declare a parameter — `bindir` is a
+    // file-level variable, so the argument parses as a second recipe name and the command dies
+    // with "does not contain recipe `bindir=X`". `IMMORTALITY_BINDIR=X just install` does work.
+    let readme = read("README.md");
+    assert!(
+        !readme.contains("just install bindir="),
+        "the README documents an override that `just` rejects; use `IMMORTALITY_BINDIR=… just \
+         install`"
+    );
+    let justfile = read("justfile");
+    assert!(
+        !justfile.contains("Override with `just install bindir="),
+        "the justfile's own comment should not advertise the form that fails"
+    );
+    assert!(
+        justfile.contains("IMMORTALITY_BINDIR"),
+        "the justfile should keep `bindir` overridable by environment"
+    );
 }
 
 #[test]

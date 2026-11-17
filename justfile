@@ -13,12 +13,16 @@
 
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
-# Where `just install` puts the binary. Override with `just install bindir=/some/bin`.
+# Where `just install` puts the binary. Override with `IMMORTALITY_BINDIR=/some/bin just install`.
 #
 # `~/.local/bin` rather than `~/.cargo/bin` or `/opt/homebrew/bin`: the first is not on PATH on
 # every machine (including this one), and the second belongs to Homebrew, which would not know
 # about a binary it did not install. `install` checks PATH and prints the line to add if needed,
 # instead of leaving you with a command that is not found.
+#
+# `just install bindir=/some/bin` does NOT work and never did: `just` reads a `name=value`
+# argument only for recipes that declare a parameter, and this is a file-level variable, so the
+# argument is taken as a second recipe name. `just --set bindir /some/bin install` works too.
 bindir := env_var_or_default("IMMORTALITY_BINDIR", home_directory() / ".local" / "bin")
 
 default: ci
@@ -77,7 +81,7 @@ install:
     mkdir -p "{{bindir}}"
     install -m 755 target/release/immortality "{{bindir}}/immortality"
     @echo "installed: {{bindir}}/immortality"
-    @case ":$$PATH:" in \
+    @case ":$PATH:" in \
         *":{{bindir}}:"*) "{{bindir}}/immortality" --version ;; \
         *) echo "{{bindir}} is NOT on PATH. Add this to ~/.zshrc and open a new shell:"; \
            echo '    export PATH="{{bindir}}:$PATH"'; \
