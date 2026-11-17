@@ -677,13 +677,29 @@ fn reclaim_call(
                 }),
                 Probe::Unknown => match &input.last_checkpoint {
                     // L3. Guessing here is how a destructive command runs twice.
-                    Some(checkpoint) => rollbacks.push(RecoveryStep::RollbackToCheckpoint {
-                        sha: checkpoint.sha.clone(),
-                        reason: format!(
+                    Some(checkpoint) => {
+                        let reason = format!(
                             "cannot determine whether `{}` had any effect",
                             open.intent.expected_effect
-                        ),
-                    }),
+                        );
+                        rollbacks.push(RecoveryStep::RollbackToCheckpoint {
+                            sha: checkpoint.sha.clone(),
+                            reason: reason.clone(),
+                        });
+                        // The call is closed as abandoned, not left open. A rollback discards
+                        // whatever the call did, so replaying it is the duplicate L3 exists to
+                        // avoid — and an open call is not a fact that goes away: the next start
+                        // plans the same rollback again, from a tree that by then holds work the
+                        // crash never touched. Measured on a live `kill -9` inside `cargo test`:
+                        // the first restart rolled back correctly, the second one undid the
+                        // following attempt's commit and left a subtask marked `done` whose gate
+                        // was red. Rolling back without closing the call is what made the repair
+                        // repeat instead of finish.
+                        actions.push(RecoveryStep::AbandonCall {
+                            call: call.clone(),
+                            reason: format!("{reason}; the tree was rolled back, so it was not run again"),
+                        });
+                    }
                     None => actions.push(RecoveryStep::AbandonCall {
                         call: call.clone(),
                         reason: "effect cannot be determined and there is no checkpoint to fall \
@@ -1448,6 +1464,36 @@ mod tests {
             step_of(&report, "RollbackToCheckpoint"),
             Some(RecoveryStep::RollbackToCheckpoint { sha, .. }) if sha == "deadbeef"
         ));
+    }
+
+    #[test]
+    fn a_rolled_back_call_is_closed_so_the_next_restart_does_not_roll_again() {
+        // Measured on a live `kill -9` inside `cargo test`: the first restart rolled the tree
+        // back correctly and left the call open. The second restart found the same open call,
+        // planned the same rollback, and executed it against a tree that by then held the next
+        // attempt's commit — undoing work the crash never touched and leaving a subtask marked
+        // `done` whose gate was red. A rollback is only a repair if the call it answers is
+        // closed, or every later start repeats it.
+        let journal = call_with("unknown", "call_closed", true);
+        let mut input = input(
+            &journal,
+            WorkspaceFacts::healthy("agent/tsk_01", "abc"),
+            PersistedState::default(),
+        );
+        input.last_checkpoint = Some(LastCheckpoint {
+            sha: "deadbeef".into(),
+            kind: CheckpointKind::Hidden,
+        });
+        let report = plan(&input, &NoProbe);
+        assert!(
+            matches!(
+                step_of(&report, "AbandonCall"),
+                Some(RecoveryStep::AbandonCall { call, .. }) if call.as_str() == "call_closed"
+            ),
+            "a call the rollback answered must be closed, or the next start plans the rollback \
+             again: {:?}",
+            report.steps
+        );
     }
 
     #[test]

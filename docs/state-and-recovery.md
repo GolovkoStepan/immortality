@@ -112,7 +112,7 @@ logs/2026-10.log.gz           # архивы по месяцам
 | `native_toolcall`, `text_fallback`, `invalid_toolcall` | качество протокола. Пишется только `invalid_toolcall`; два первых объявлены, но их никто не порождает |
 | `tool_call_intent` | **до** исполнения: `call`, `tool`, `idempotency`, `args_digest`, `expected_effect` и **вложенный** `arguments` — аргументы инструмента не лежат рядом с метаданными, иначе аргумент с именем `tool` выдал бы себя за поле записи (D-081) |
 | `tool_call_started` | процесс запущен |
-| `tool_call_completed` / `tool_call_failed` | результат (тело — в artifact) |
+| `tool_call_completed` / `tool_call_failed` | результат (тело — в artifact). `tool_call_failed` с `abandoned: true` — это и закрытие вызова, чей эффект выброшен откатом (D-140) |
 | `tool_call_unknown` | процесс умер, эффект неизвестен |
 | `effect_verified` / `effect_absent` | результат probe после сбоя; пишет их `ToolCallLog::effect` по решению восстановления, `Unknown` вердиктом не записывается |
 | `checkpoint_created` | git-чекпоинт, его SHA и `role` (`base` / `discarded` / `rollback` / `preserved` / `recovery`); `rollback` без последующего `attempt_restarted` — незавершённый откат (D-080) |
@@ -326,7 +326,10 @@ recovery планирует `RollbackToCheckpoint` на названный SHA, 
    - `Idempotent` → перезапустить;
    - `ByContent` → выполнить `probe`; результат записать как `effect_verified` /
      `effect_absent` и подложить модели как observation;
-   - `Unknown` → L3 (откат к чекпоинту и новая попытка).
+   - `Unknown` → L3: откат к чекпоинту, новая попытка, и вызов **закрывается**
+     `tool_call_failed {abandoned: true}`. Откат без закрытия не ответ, а отложенный повтор:
+     следующий старт нашёл бы тот же вызов и откатил дерево ещё раз, уже поверх работы,
+     появившейся после первого (D-140).
 4. **Проверить worktree**: существует ли, на каком SHA, есть ли незакоммиченные изменения.
    Если worktree потерян — пересоздать из `agent/<task>`; если ветки нет — из базовой ветки
    и `checkpoint_created` последнего чекпоинта. Пересоздание адресуется **репозиторию**, а не
