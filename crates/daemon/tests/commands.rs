@@ -305,6 +305,66 @@ fn gc_protects_the_artifacts_of_an_unfinished_task() {
 }
 
 #[test]
+fn gc_reads_this_tasks_state_not_the_newest_in_the_journal() {
+    // One journal per repository, and `is_unfinished` answers from the *last* `task_state` in it.
+    // Asked over the whole file, a project whose newest record belongs to a merged task reports
+    // its running one as finished: that task leaves the live set and `gc` deletes the bodies of
+    // tool results it is about to replay. The same mistake keeps another task's artifacts alive,
+    // because `referenced_artifacts` counts whatever it is handed.
+    //
+    // The order here is the one that exposes it: this task's `running` is written first, so a
+    // whole-journal read ends on the stranger's `merged`.
+    let fixture = Fixture::new();
+    let store =
+        immortality_core::artifacts::ArtifactStore::open(fixture.state().artifacts_dir()).expect("store");
+    let digest = store.put(b"the body of a large tool result").expect("put");
+    {
+        use immortality_core::journal::{JournalEvent, RecordFields};
+
+        let mut journal = fixture.journal();
+        let fields = RecordFields::new(0, immortality_core::time::now(), task(), Kind::ToolCallCompleted);
+        journal
+            .append(
+                fields,
+                JournalEvent::spilled(serde_json::json!({"call": "c"}), digest),
+            )
+            .expect("record");
+        journal
+            .append_event(
+                immortality_core::time::now(),
+                Kind::TaskState,
+                serde_json::json!({"state": TaskState::Running.as_str()}),
+            )
+            .expect("running");
+        journal.close().expect("close");
+    }
+    {
+        let other = TaskId::from_suffix("01ARZ3NDEKTSV4RRFFQ69G5FZZ");
+        let mut theirs = Journal::open(fixture.repo.join(".agent"), other).expect("journal");
+        theirs
+            .append_event(
+                immortality_core::time::now(),
+                Kind::TaskState,
+                serde_json::json!({"state": "merged"}),
+            )
+            .expect("merged");
+        theirs.close().expect("close");
+    }
+
+    let result = commands::collect_garbage(&fixture.state(), &params(serde_json::json!({"dry_run": true})))
+        .expect("gc");
+    assert_eq!(
+        result["unfinished"],
+        serde_json::json!([task().as_str()]),
+        "a merged stranger must not mark this running task finished: {result}"
+    );
+    assert_eq!(
+        result["protected"], 1,
+        "the live task's artifact was left unguarded: {result}"
+    );
+}
+
+#[test]
 fn gc_refuses_to_run_when_a_journal_is_unreadable() {
     // "Unreadable" is not "empty": treating it as empty would put that task's artifacts in the
     // deletable set, which destroys the record of the one task a human is debugging.

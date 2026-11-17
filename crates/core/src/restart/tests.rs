@@ -141,6 +141,26 @@ fn a_first_attempt_has_no_previous_strategy_to_quote() {
 }
 
 #[test]
+fn a_resumed_subtask_quotes_what_earlier_processes_ruled_out() {
+    // A resumed subtask's first attempt in a new process is not a retry: nothing failed *here*.
+    // The one thing worth quoting is what earlier attempts already ruled out, and dropping it is
+    // how a restart re-proposes the idea it was restarted over (D-074).
+    let text = resumed("make the specs pass", &["rewriting the lexer".to_string()]);
+    assert!(text.contains("make the specs pass"), "{text}");
+    assert!(text.contains("These approaches already failed"), "{text}");
+    assert!(text.contains("- rewriting the lexer"), "{text}");
+    assert!(text.contains("Do not propose them again"), "{text}");
+}
+
+#[test]
+fn a_resumed_subtask_with_nothing_rejected_is_just_its_strategy() {
+    // The common case for a subtask a human reopened: a report exists, but it rejected nothing.
+    // The text must not gain an empty header or trailing blank space.
+    assert_eq!(resumed("make the specs pass", &[]), "make the specs pass");
+    assert_eq!(resumed("", &[]), "");
+}
+
+#[test]
 fn rejected_ideas_are_quoted_and_capped_to_the_newest() {
     let rejected: Vec<String> = (0..MAX_REJECTED_IDEAS + 3)
         .map(|index| format!("idea {index}"))
@@ -458,5 +478,91 @@ fn a_journal_that_recorded_more_than_the_config_allows_stops_the_subtask() {
         spent.left(room(2, 1)),
         room(0, 1),
         "attempts clamp at zero; restarts are untouched, since none of these were L3"
+    );
+}
+
+// ── the checkpoint a subtask started from ────────────────────────────────────────────────
+
+/// A checkpoint record, with the role the runner writes it under.
+fn checkpoint(number: u32, role: &str, sha: &str) -> JournalRecord {
+    scoped(
+        number,
+        Kind::CheckpointCreated,
+        serde_json::json!({ "sha": sha, "branch": "agent-ckpt/tsk", "role": role }),
+    )
+}
+
+#[test]
+fn a_subtask_the_journal_never_mentioned_has_no_base() {
+    // Nothing to roll back to is a fact, not a guess: a caller that invented a base would diff an
+    // attempt against a tree nobody named.
+    assert_eq!(base_of(&[], &our_task(), &here()), None);
+    let unrelated = vec![checkpoint(1, "discarded", "discarded-1")];
+    assert_eq!(
+        base_of(&unrelated, &our_task(), &here()),
+        None,
+        "a snapshot that is not a base is not a base"
+    );
+}
+
+#[test]
+fn the_base_is_the_first_one_the_subtask_recorded() {
+    // The bug the reader exists for: a resumed session took a second base, of a tree that already
+    // held the interrupted attempt's work. The base is what the subtask changed *from*, so the
+    // first record is the only one that can be it — later ones are pictures of the work.
+    let records = vec![
+        checkpoint(1, "base", "first"),
+        checkpoint(2, "discarded", "discarded-1"),
+        checkpoint(2, "rollback", "first"),
+        checkpoint(2, "base", "second"),
+        checkpoint(3, "base", "third"),
+    ];
+    assert_eq!(
+        base_of(&records, &our_task(), &here()),
+        Some(Snapshot {
+            sha: "first".to_string(),
+            branch: "agent-ckpt/tsk".to_string(),
+        }),
+        "the newest base is a snapshot of the previous attempt's work, not the tree the subtask found"
+    );
+}
+
+#[test]
+fn a_base_without_a_branch_is_still_a_base() {
+    // The sha is what `reset --hard` needs. A record that named one but no ref must not fall
+    // through to a second, late snapshot: the tree has moved on by the time anyone asks.
+    let records = vec![scoped(
+        1,
+        Kind::CheckpointCreated,
+        serde_json::json!({ "sha": "only-the-sha", "role": "base" }),
+    )];
+    assert_eq!(
+        base_of(&records, &our_task(), &here()),
+        Some(Snapshot {
+            sha: "only-the-sha".to_string(),
+            branch: String::new(),
+        })
+    );
+}
+
+#[test]
+fn another_subtasks_base_is_not_this_subtasks_base() {
+    // Two subtasks run in one worktree, so their bases share a journal. Reading the wrong one
+    // would diff this subtask's work against a state another subtask left behind.
+    let mut foreign = checkpoint(1, "base", "theirs");
+    foreign.fields.subtask = Some(SubtaskId::from_suffix("01ARZ3NDEKTSV4RRFFQ69G5FAB"));
+    assert_eq!(base_of(&[foreign], &our_task(), &here()), None);
+}
+
+#[test]
+fn another_tasks_base_is_not_this_tasks_base() {
+    // `.agent/JOURNAL.jsonl` is shared by every task of a repository, and a plan reuses subtask
+    // ids across runs — the same reason `Spent::read` keys on the task.
+    let mut other = checkpoint(1, "base", "a-previous-run");
+    other.fields.task = crate::domain::TaskId::from_suffix("01ARZ3NDEKTSV4RRFFQ69G5FAC");
+    assert_eq!(
+        base_of(&[other], &our_task(), &here()),
+        None,
+        "a base another run recorded must not narrow this run's gate diff"
     );
 }

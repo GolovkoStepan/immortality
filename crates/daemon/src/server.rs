@@ -70,12 +70,20 @@ pub struct ServerState {
     /// case where nobody is attached. The server always supplies it, because `attach` is only
     /// useful if the run writes into the same channel.
     pub events: Option<Events>,
-    /// Tasks with a live run in *this* process.
+    /// Projects with a live run in *this* process, and which task holds each one.
     ///
-    /// The journal is single-writer (D-001), so two runs of one task would fork its chain. The set
-    /// is in memory on purpose: a restart means the previous writer is gone, and recovery repairs
-    /// the tail before a new run starts.
-    pub running: std::sync::Arc<std::sync::Mutex<std::collections::BTreeSet<TaskId>>>,
+    /// The unit is the **project**, not the task, because the journal is one file per repository
+    /// (`.agent/JOURNAL.jsonl`) shared by every task in it. `Journal` keeps `next_seq` and
+    /// `last_digest` in memory and appends without a lock, so two writers fork the chain: measured
+    /// live with two tasks of one project started a second apart, the file interleaved 0…6 from
+    /// one task with 7…14 from the other and then continued both from 7, which left 67 repeated
+    /// `seq` values. A journal with a repeated `seq` is `CORRUPT` and `Journal::open` refuses it,
+    /// so the next restart blocked *both* tasks and asked a human — work that had already reached
+    /// green gates was stranded on a file nobody could reopen (D-142).
+    ///
+    /// The map is in memory on purpose: a restart means the previous writer is gone, and recovery
+    /// repairs the tail before a new run starts.
+    pub running: std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<String, TaskId>>>,
 }
 
 impl ServerState {
@@ -103,7 +111,7 @@ impl ServerState {
             config: immortality_core::config::Config::default(),
             model: None,
             events: None,
-            running: std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::new())),
+            running: std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
         })
     }
 

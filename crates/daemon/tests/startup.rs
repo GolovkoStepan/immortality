@@ -701,6 +701,68 @@ fn a_path_outside_the_worktree_is_never_written() {
 }
 
 #[test]
+fn another_tasks_open_attempt_is_not_this_tasks_to_close() {
+    // The bug this pins, seen live on `qna_rails` at 15:11. A project's journal is
+    // `<repo>/.agent/JOURNAL.jsonl`, one file for every task in that project, and recovery read it
+    // whole. A daemon restart therefore closed the other task's running attempt and wrote the
+    // record under *this* task's id — `attempt_restarted` with `task=…7SRMP0` and `attempt=3`, a
+    // subtask that belonged to `…8CRGFM`. The victim then started attempt 4 against a limit of 3,
+    // and its `attempts.json` was rewritten from the whole journal, so both caches described both
+    // tasks. The cost was a subtask's worth of work and an hour of a human's attention.
+    let fixture = Fixture::new();
+    let stranger = TaskId::from_suffix("01ARZ3NDEKTSV4RRFFQ69G5FB0");
+    let stranger_subtask = SubtaskId::from_suffix("01ARZ3NDEKTSV4RRFFQ69G5FB1");
+    {
+        // The other task's process dies mid-attempt, leaving it open in the shared journal.
+        let mut journal = Journal::open(fixture.journal_dir(), stranger).expect("journal");
+        journal.set_clock(Arc::clone(&fixture.clock) as Arc<dyn immortality_core::time::Clock>);
+        journal
+            .append_scoped(
+                fixture.clock.now(),
+                Kind::AttemptStarted,
+                json!({}),
+                &Scope::attempt(stranger_subtask.clone(), 1),
+            )
+            .expect("attempt_started");
+        journal.close().expect("close");
+    }
+    // This task has not begun, so it has nothing a crash could have interrupted.
+    let before = fixture.records().records.len();
+
+    let recovered = fixture.recover();
+
+    assert_eq!(
+        recovered.verdict,
+        Verdict::Healthy,
+        "a task whose own records were not interrupted is not repaired: {:?}",
+        recovered.executed
+    );
+    let records = fixture.records().records;
+    assert_eq!(
+        records.len(),
+        before,
+        "recovery wrote about the other task's attempt"
+    );
+    assert!(
+        !records.iter().any(|record| {
+            record.fields.kind == Kind::AttemptRestarted
+                && record.fields.task == fixture.task
+                && record.fields.subtask.as_ref() == Some(&stranger_subtask)
+        }),
+        "the stranger's attempt was closed under this task's id"
+    );
+    assert!(
+        records.iter().all(|record| record.fields.task != fixture.task
+            || record.fields.subtask.as_ref() != Some(&stranger_subtask)),
+        "this task gained a record about the other task's subtask"
+    );
+    assert!(
+        Cache::new(fixture.task_dir()).read().attempts.is_empty(),
+        "this task's cache describes another task's attempts"
+    );
+}
+
+#[test]
 fn recovery_is_idempotent_across_two_passes() {
     let fixture = Fixture::new();
     fixture.open_call(

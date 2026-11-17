@@ -8,11 +8,11 @@
 //! already points at the discarded tree, so a journal that names it is enough to find it again.
 //! Reversing the order would leave a reset tree and a journal that never said a snapshot existed.
 //!
-//! # Why `reset_hard` and not `rollback_to`
+//! # Why `restore_tree` and not `rollback_to`
 //!
 //! `GitRepo::rollback_to` takes its own safety snapshot. The runner takes one first — because it
 //! also has to journal it — so [`Checkpoints::restore`] uses the half that only moves the tree
-//! (`reset_hard`), and the snapshot is taken once, by the caller.
+//! (`restore_tree`), and the snapshot is taken once, by the caller.
 
 use std::path::{Path, PathBuf};
 
@@ -89,15 +89,26 @@ impl Checkpoints for GitCheckpoints {
                 "checkpoint commit {sha} does not exist, so there is nothing to roll back to"
             ));
         }
-        // The checkout is forced and comes before the reset: a worktree left detached by a
+        // The checkout is forced and comes before the read: a worktree left detached by a
         // previous attempt would otherwise have its tree restored onto a detached `HEAD`, and the
         // next commit would land nowhere.
+        //
+        // A branch that does not exist is created at the snapshot's **parent**, not at the
+        // snapshot itself: the snapshot is the hidden commit named `checkpoint`, and making it the
+        // first commit of `agent/<task>` would put that name at the root of the history a human
+        // merges. Its parent is the tip the snapshot was taken from, and the tree on disk comes
+        // from `restore_tree` either way.
         if let Some(branch) = &self.restore {
+            let base = self
+                .repo
+                .first_parent(sha)
+                .map_err(|error| error.to_string())?
+                .unwrap_or_else(|| sha.to_string());
             self.repo
-                .ensure_branch(branch, sha)
+                .ensure_branch(branch, &base)
                 .map_err(|error| error.to_string())?;
         }
-        self.repo.reset_hard(sha).map_err(|error| error.to_string())
+        self.repo.restore_tree(sha).map_err(|error| error.to_string())
     }
 
     /// Commit the tree to the task branch, as one closed subtask's work.
@@ -172,6 +183,42 @@ mod tests {
         world.restore(&snapshot.sha).expect("rollback");
         let text = std::fs::read_to_string(dir.path().join("b.txt")).expect("read");
         assert_eq!(text, "attempt\n", "the tree must be back at the checkpoint");
+    }
+
+    #[test]
+    fn a_rollback_does_not_put_a_checkpoint_commit_on_the_task_branch() {
+        // The daemon-level shape of the same defect: `restore` is what the runner calls, and it
+        // used to end in `reset --hard` while `HEAD` was on `agent/<task>`.
+        let (dir, repo) = repo();
+        let world = checkpoints(dir.path());
+        repo.ensure_branch("agent/tsk_1", "HEAD").expect("branch");
+        std::fs::write(dir.path().join("a.txt"), "landed\n").expect("write");
+        let landed = repo
+            .commit_to_branch("agent/tsk_1", "chore: landed")
+            .expect("commit")
+            .expect("a commit");
+        assert_eq!(
+            repo.git(&["rev-parse", "agent/tsk_1"]).expect("tip").trim(),
+            landed.sha
+        );
+
+        // A dirty tree makes the snapshot a child of the tip, which is what `reset --hard` moved
+        // the branch onto.
+        std::fs::write(dir.path().join("b.txt"), "uncommitted\n").expect("write");
+        let base = world.snapshot("base").expect("checkpoint").expect("a sha");
+        std::fs::write(dir.path().join("b.txt"), "lost\n").expect("write");
+        world.restore(&base.sha).expect("rollback");
+
+        assert_eq!(
+            repo.git(&["rev-parse", "agent/tsk_1"]).expect("tip").trim(),
+            landed.sha,
+            "the history a human merges must not gain a `checkpoint` commit"
+        );
+        // And the rollback still did its job.
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("b.txt")).expect("read"),
+            "uncommitted\n"
+        );
     }
 
     #[test]

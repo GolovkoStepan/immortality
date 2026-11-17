@@ -141,6 +141,19 @@ impl Fixture {
             .collect()
     }
 
+    /// Every record of the project's journal, whatever task wrote it.
+    ///
+    /// The journal is one file per repository, so this is the only view that can see a second
+    /// writer: a per-task reader would report each task's own records as well-formed while the
+    /// file as a whole forked (D-142).
+    fn all_records(&self) -> Vec<JournalRecord> {
+        JournalReader::open_unnamed(self.agent())
+            .expect("reader")
+            .read()
+            .expect("records")
+            .records
+    }
+
     /// The task states the journal announced, in order.
     fn states(&self, task: &str) -> Vec<String> {
         self.records(task)
@@ -190,8 +203,22 @@ impl Fixture {
 
     /// Write `TASKS.json` with one subtask in `state`, and the acceptance file it needs.
     fn write_plan(&self, state: SubtaskState) -> Subtask {
+        self.write_plan_with(state, false)
+    }
+
+    /// The same plan, with the model's review switched on.
+    ///
+    /// The attempt-level diff only exists when a reviewer reads one, and "the reviewer was shown
+    /// an empty diff" is the defect a run without a review cannot see: every check can be green
+    /// while the change is invisible to the only gate that reads it.
+    fn write_reviewed_plan(&self, state: SubtaskState) -> Subtask {
+        self.write_plan_with(state, true)
+    }
+
+    fn write_plan_with(&self, state: SubtaskState, review: bool) -> Subtask {
         let mut subtask = notes_subtask(SystemClock.now());
         subtask.state = state;
+        subtask.dod.review = review;
         std::fs::create_dir_all(self.agent()).expect("agent dir");
         std::fs::write(
             self.agent().join("ACCEPTANCE.md"),
@@ -671,6 +698,33 @@ fn an_unknown_program_is_decided_by_the_judge_on_the_production_path() {
         "the record has to name the command a human can check"
     );
     assert_eq!(record.event.payload["verdict"], json!("allow"));
+
+    // The same run is the only cheap proof that the tool's structured `data` reaches the journal.
+    // It used to be dropped at `log.completed`, so `tool_call_completed` carried `call` and
+    // `observation` and nothing else: the `exit_code` `shell` had already computed never left the
+    // process, and `immortality log` could only print the observation's first line — which is the
+    // tool's own `--- stdout ---` label. Measured on the `roomly` run, that made 97 of 100 shell
+    // calls look as if they had produced nothing.
+    let completed = fixture
+        .records(&task)
+        .into_iter()
+        .find(|record| {
+            record.fields.kind == Kind::ToolCallCompleted
+                && record.event.payload["command"] == json!("frobnicate --all")
+        })
+        .expect("the shell result must be in the journal");
+    assert!(
+        completed.event.payload["exit_code"].is_number(),
+        "the journal lost the exit code the tool computed: {}",
+        completed.event.payload
+    );
+    assert!(
+        completed.event.payload["observation"]
+            .as_str()
+            .is_some_and(|text| text.starts_with('[')),
+        "the text the model saw must stay in the journal: {}",
+        completed.event.payload
+    );
 }
 
 #[test]
@@ -926,6 +980,47 @@ fn a_brief_that_spends_its_steps_is_reported_as_exhausted_not_done() {
 }
 
 #[test]
+fn a_closed_subtask_leaves_its_report_in_the_tree() {
+    // The report is the only thing a later attempt inherits, and `TASKS.json` is where it has to
+    // live for that to survive a process. `set_state` alone wrote the state and left the field
+    // `None`, so `resuming_from` in the cycle always received an empty report: the promise in
+    // `SubtaskReport`'s own doc comment was never true on disk. Measured on `roomly`, where both
+    // `done` subtasks carried `"report": null`.
+    let fixture = Fixture::new();
+    let subtask = fixture.write_plan(SubtaskState::Pending);
+    let model = Scripted::new(Work::Claim);
+    let state = fixture.state(model);
+
+    let answer = start_now(&state, &json!({ "project": fixture.repo, "goal": GOAL }))
+        .expect("the task must be admitted");
+    let task = answer["task"].as_str().expect("a task id").to_string();
+    fixture.wait_for(&task, TaskState::ReadyForReview);
+    Fixture::wait_until_idle(&state);
+
+    // Read the file, not the in-memory tree: surviving the process is the property under test.
+    let text = std::fs::read_to_string(fixture.agent().join("TASKS.json")).expect("tasks");
+    let body: serde_json::Value = serde_json::from_str(&text).expect("json");
+    let closed = body["subtasks"]
+        .as_array()
+        .expect("subtasks")
+        .iter()
+        .find(|candidate| candidate["id"] == json!(subtask.id.to_string()))
+        .expect("the subtask");
+    assert_eq!(closed["state"], json!("done"));
+    let report = closed
+        .get("report")
+        .filter(|value| !value.is_null())
+        .unwrap_or_else(|| panic!("a `done` subtask must keep its report: {text}"));
+    assert!(
+        report
+            .get("outcome")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|text| !text.is_empty()),
+        "the report has to say what was achieved: {report}"
+    );
+}
+
+#[test]
 fn an_existing_plan_is_run_and_not_replaced_without_force() {
     // The roadmap's contract: a human may rewrite `TASKS.json` before the run. Regenerating it
     // because a goal was also given would silently discard exactly that edit.
@@ -1025,6 +1120,85 @@ fn a_second_start_of_a_running_task_is_refused_and_names_the_first() {
     gate.release();
     fixture.wait_for(&task, TaskState::ReadyForReview);
     Fixture::wait_until_idle(&state);
+}
+
+#[test]
+fn a_second_task_of_a_running_project_is_refused_before_its_first_byte() {
+    // Measured live: two `start`s of one project a second apart both opened `JOURNAL.jsonl`, and
+    // their in-memory `next_seq` cursors interleaved 0…6 with 7…14, then continued both from 7.
+    // The file ended with 67 repeated `seq` values, `[JOURNAL CORRUPT]` on both tasks, and after a
+    // restart neither could be reopened — both blocked and asked a human, while both worktrees
+    // held green gates and commits. The slot's unit is therefore the project (D-142), and it has
+    // to be claimed before `task_created` is written: a refusal that arrives after that append
+    // has already forked the chain it exists to protect.
+    let fixture = Fixture::new();
+    let gate = Gate::new();
+    let model = Scripted::new(Work::Wait(Arc::clone(&gate)));
+    let state = fixture.state(model);
+
+    let answer = start_now(&state, &json!({ "project": fixture.repo, "goal": GOAL }))
+        .expect("the first admission must succeed");
+    let running = answer["task"].as_str().expect("a task id").to_string();
+    let before = fixture.all_records();
+
+    // A *different* goal, so the refusal cannot be about the plan already existing; and a second
+    // task, which is exactly the run the per-task slot used to let through.
+    let error = start_now(
+        &state,
+        &json!({ "project": fixture.repo, "goal": "add a second notes file" }),
+    )
+    .expect_err("a second task of a running project must be refused");
+    assert!(error.contains("already running"), "{error}");
+    assert!(
+        error.contains(&running),
+        "the refusal must name the task holding the project: {error}"
+    );
+    assert!(
+        error.contains("immortality attach"),
+        "the refusal must say how to watch the holder: {error}"
+    );
+
+    // The refusal came before the write. If it had not, the second `task_created` would have
+    // continued `seq` from its own cursor and the journal would already be unreadable.
+    assert_eq!(
+        fixture.all_records().len(),
+        before.len(),
+        "a refused admission must not write a record"
+    );
+    let seqs: Vec<u64> = fixture
+        .all_records()
+        .iter()
+        .map(|record| record.fields.seq)
+        .collect();
+    let mut unique = seqs.clone();
+    unique.dedup();
+    assert_eq!(seqs, unique, "a refused admission must not fork `seq`");
+
+    gate.release();
+    fixture.wait_for(&running, TaskState::ReadyForReview);
+    Fixture::wait_until_idle(&state);
+
+    // The project is free again once the run ends: the slot is a lock on a live writer, not a
+    // ban on the project.
+    let second = start_now(&state, &json!({ "project": fixture.repo, "goal": GOAL }))
+        .expect("the project must be startable again after the first run ends");
+    let second = second["task"].as_str().expect("a task id").to_string();
+    fixture.wait_for(&second, TaskState::ReadyForReview);
+    Fixture::wait_until_idle(&state);
+
+    // And the two sequential tasks share one well-formed chain: `seq` strictly increases across
+    // the file, so `Journal::open` would accept it.
+    let seqs: Vec<u64> = fixture
+        .all_records()
+        .iter()
+        .map(|record| record.fields.seq)
+        .collect();
+    let mut unique = seqs.clone();
+    unique.dedup();
+    assert_eq!(
+        seqs, unique,
+        "two sequential tasks must share one chain: {seqs:?}"
+    );
 }
 
 #[test]
@@ -1129,6 +1303,83 @@ fn an_outage_leaves_the_task_running_and_a_later_start_finishes_it() {
         "the resumed attempt lost the goal: {strategies:?}"
     );
     assert_eq!(second_model.executor_calls(), 1);
+}
+
+#[test]
+fn a_resumed_attempt_is_reviewed_against_the_base_the_outage_did_not_move() {
+    // The live defect (D-124), on the production path. An outage ends the attempt without rolling
+    // the tree back, so the resumed run starts over a tree that already holds the first attempt's
+    // work. A base taken at the start of *that* session is a snapshot of the work, and the only
+    // gate that reads the change — the reviewer — is shown an empty diff and rejects it. Measured
+    // on `qna_rails`: attempt 1's base `ae14937`, attempt 2's `104434ea` (containing attempt 1's
+    // work), attempt 3's `589732b` (containing attempt 2's) — and a correct fix rejected with
+    // "The diff is empty" while both checks were green.
+    //
+    // The reviewer is `strict` here, and it has to be: a reviewer that approves anything approves
+    // the empty diff too, and the regression would be invisible.
+    let fixture = Fixture::new();
+    // The reviewed plan is what makes the attempt-level diff exist at all: without a reviewer the
+    // only readers of the change are the `DoD` checks, and both are green either way.
+    fixture.write_reviewed_plan(SubtaskState::Pending);
+    let first = Scripted::new(Work::WriteThenFail);
+    let state = fixture.state(first);
+    let answer = start_now(&state, &json!({ "project": fixture.repo, "goal": GOAL }))
+        .expect("the first admission must succeed");
+    let task = answer["task"].as_str().expect("a task id").to_string();
+    Fixture::wait_until_idle(&state);
+
+    // A new process resumes the task. The work the interrupted attempt wrote is still there, so
+    // the resumed attempt only has to claim it.
+    let second_model = Scripted::strict(Work::Claim);
+    let second = fixture.state(second_model);
+    let resumed = start_now(&second, &json!({ "task": task })).expect("the resume must be admitted");
+    assert_eq!(resumed["resumed"], true);
+    fixture.wait_for(&task, TaskState::ReadyForReview);
+    Fixture::wait_until_idle(&second);
+
+    // One base for the subtask, not one per session: the second session reuses the checkpoint the
+    // first one recorded before the tree was touched.
+    let bases: Vec<String> = fixture
+        .records(&task)
+        .iter()
+        .filter(|record| record.fields.kind == Kind::CheckpointCreated)
+        .filter(|record| record.event.payload["role"] == json!("base"))
+        .filter_map(|record| {
+            record
+                .event
+                .payload
+                .get("sha")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .collect();
+    assert_eq!(
+        bases.len(),
+        1,
+        "the resumed session took its own base, so the reviewer diffed against the interrupted \
+         attempt's work: {bases:?}"
+    );
+
+    // And the reviewer saw the change rather than an empty diff. Both reviews count: the
+    // attempt-level one, which is the one the bug emptied, and the task-level one that follows it.
+    let reviewed: Vec<bool> = fixture
+        .records(&task)
+        .iter()
+        .filter(|record| record.fields.kind == Kind::GateResult)
+        .filter(|record| record.event.payload["gate"] == json!("review"))
+        .filter_map(|record| {
+            record
+                .event
+                .payload
+                .get("approved")
+                .and_then(serde_json::Value::as_bool)
+        })
+        .collect();
+    assert!(
+        !reviewed.is_empty() && reviewed.iter().all(|approved| *approved),
+        "every review must approve the work it was shown; a `false` is the empty-diff rejection \
+         of an attempt diffed against its own work: {reviewed:?}"
+    );
 }
 
 #[test]

@@ -472,6 +472,16 @@ pub struct Runner {
     pub system_prompt: String,
     /// Bytes of one tool result that may enter the prompt.
     pub max_tool_output_bytes: usize,
+    /// Completion budget for one step: what a single `write_file` argument may cost.
+    pub max_completion_tokens: u32,
+    /// Whether the executor asks the backend to reason before answering.
+    ///
+    /// The planner already honoured `backend.enable_thinking`; the executor did not, so a
+    /// configuration file that turned reasoning off was obeyed for planning only. On
+    /// `swift-iq2_xs` that is not a style setting: reasoning is charged against the completion
+    /// budget, so with the default off a step spends its budget on `reasoning_content` and
+    /// returns `finish_reason: length` with nothing in `content`.
+    pub enable_thinking: bool,
     /// Soft and hard context budgets.
     pub budget: Budget,
     /// Step, token and time limits.
@@ -650,20 +660,34 @@ impl Runner {
             .finish(trigger, ending.failure_reason(), self.clock.now())
             .map_err(|error| immortality_core::Error::Protocol(error.to_string()))?;
 
+        let mut payload = serde_json::json!({
+            "attempt": attempt.id.to_string(),
+            "state": attempt.state.as_str(),
+            "ending": ending.as_str(),
+            "steps": attempt.steps_used,
+            "tokens": attempt.tokens_used,
+            // For `looped` this is the strategy the restart exists for; every other ending
+            // leaves the field out rather than writing `null`, which reads as "unknown".
+            "detector": state.stopped_by.map(|reaction| reaction.detector.as_str()),
+            "level": state.stopped_by.map(|reaction| reaction.level.as_str()),
+        });
+        // Only for `backend`: the backend's own words, which are the difference between "the
+        // connection was refused" and "the turn was truncated, so its work was discarded". Both
+        // end the attempt the same way (D-027), and without this field they also *read* the same,
+        // which cost an hour on `qna_rails`: two attempts labelled `backend_unavailable` had in
+        // fact died of `finish_reason: length` on a healthy backend.
+        //
+        // Inserted rather than declared in the literal so that every other ending keeps the
+        // record it had: a `"detail": null` on a `steps` ending is a field with nothing to say,
+        // and it would date every golden journal for a fact none of them record.
+        if let Ending::Backend { detail } = &ending {
+            payload["detail"] = serde_json::Value::String(detail.clone());
+        }
+
         journal.append_scoped(
             self.clock.now(),
             Kind::AttemptFailed,
-            serde_json::json!({
-                "attempt": attempt.id.to_string(),
-                "state": attempt.state.as_str(),
-                "ending": ending.as_str(),
-                "steps": attempt.steps_used,
-                "tokens": attempt.tokens_used,
-                // For `looped` this is the strategy the restart exists for; every other ending
-                // leaves the field out rather than writing `null`, which reads as "unknown".
-                "detector": state.stopped_by.map(|reaction| reaction.detector.as_str()),
-                "level": state.stopped_by.map(|reaction| reaction.level.as_str()),
-            }),
+            payload,
             &Scope::attempt(subtask.id.clone(), attempt_number),
         )?;
 
@@ -1067,27 +1091,7 @@ impl<'a> AttemptSession<'a> {
         allowance: Allowance,
         journal: &mut Journal,
     ) -> immortality_core::Result<SessionEnd> {
-        // The base is the state the subtask *started* from, so it has to be taken before the
-        // first attempt touches the tree. Taking it inside the rollback — which is what this did
-        // — snapshots a tree that already contains the failed attempt's work, journals that as
-        // "base", and then resets the branch onto it: the rollback discards nothing, and the
-        // attempt's own work becomes the commit its gates are reviewing, so `git diff HEAD` is
-        // empty and the reviewer rejects work that is on disk. Measured in a live run: the three
-        // checkpoint records of one restart all named the same SHA.
-        if self.base.is_none() && self.base_error.is_none() {
-            match self.capture_base(journal) {
-                Ok(Some(base)) => self.base = Some(base),
-                // Nothing to roll back to. Kept as a reason rather than a stop of its own: a
-                // session that never restarts does not need a base, and refusing to start it
-                // would turn a missing commit into a task that cannot run at all.
-                Ok(None) => {
-                    self.base_error = Some(
-                        "the worktree has no commits, so a restart has nothing to roll back to".to_string(),
-                    );
-                }
-                Err(why) => self.base_error = Some(why),
-            }
-        }
+        self.take_base(journal)?;
         let mut left = allowance;
         loop {
             let number = self.next;
@@ -1101,7 +1105,7 @@ impl<'a> AttemptSession<'a> {
             )?;
             self.absorb(&outcome.report);
             let cause = Self::cause_of(&outcome);
-            self.remember(number, &cause);
+            self.remember(number, &outcome, &cause);
             self.last = Some(cause);
 
             // The attempt just run has spent one of the budget, whichever way it ended: a stop is
@@ -1110,7 +1114,13 @@ impl<'a> AttemptSession<'a> {
             match restart::decide(outcome.ended(), left) {
                 // Nothing is started, so nothing is written: the stop is the caller's to act on,
                 // and the scheduler owns what a subtask becomes.
-                Decision::Stop(stop) => return Ok(SessionEnd { outcome, stop }),
+                Decision::Stop(stop) => {
+                    return Ok(SessionEnd {
+                        outcome,
+                        stop,
+                        report: self.report.clone(),
+                    });
+                }
                 Decision::Retry(_) => {
                     // The tree stays: a rejected claim is evidence about the work on disk, and
                     // rolling it away throws away the closest thing to a finished subtask.
@@ -1127,6 +1137,7 @@ impl<'a> AttemptSession<'a> {
                             return Ok(SessionEnd {
                                 outcome,
                                 stop: Stop::Blocked(reason),
+                                report: self.report.clone(),
                             });
                         }
                     }
@@ -1139,7 +1150,10 @@ impl<'a> AttemptSession<'a> {
     /// The strategy for the attempt about to start.
     fn strategy(&self) -> String {
         let Some(cause) = self.last.clone() else {
-            return self.seed.clone();
+            // The first attempt of this process. A subtask resumed from a report is not starting
+            // fresh: an earlier process already ruled out these approaches, and quoting them is
+            // the whole reason the report survives the restart.
+            return restart::resumed(&self.seed, &self.report.rejected_ideas);
         };
         restart::strategy(&cause, &self.seed, &self.report.rejected_ideas)
     }
@@ -1165,7 +1179,18 @@ impl<'a> AttemptSession<'a> {
     /// The gate path already records its own reason in `settle_claim`, so only the other endings
     /// are added here: it is the same sentence the cause prints, and a brief that listed it twice
     /// would look like two failures.
-    fn remember(&mut self, number: u32, cause: &Cause) {
+    ///
+    /// Only an outcome that actually failed is remembered. `cause_of` has to answer with some
+    /// `Cause` for every ending because its caller stores one, and it answers `Stalled` for the
+    /// endings that need no cause at all — `Verified`, `Split`, `Abandoned`. Recording that answer
+    /// wrote `attempt 1: it produced no tool call for the stall budget` into the report of every
+    /// subtask that closed green on its first try, which is the one sentence a resumed attempt
+    /// must not be told. The ending is therefore read directly rather than inferred from the
+    /// cause.
+    fn remember(&mut self, number: u32, outcome: &RunOutcome, cause: &Cause) {
+        if !matches!(outcome.ended(), Ended::Failed(_)) {
+            return;
+        }
         if matches!(cause, Cause::Gate { .. }) {
             return;
         }
@@ -1184,11 +1209,75 @@ impl<'a> AttemptSession<'a> {
         }
     }
 
+    /// Make sure the session has the base a restart would roll back to.
+    ///
+    /// The base belongs to the **subtask**, not to the session, and that distinction is the whole
+    /// function. A session used to take it whenever its own `self.base` was empty, which is the
+    /// same sentence as "before the first attempt" only while a subtask fits into one session. It
+    /// does not: an abandoned attempt ends the session and leaves the worktree holding whatever
+    /// the attempt wrote, so the resume starts a second session over a tree that is no longer the
+    /// one the subtask found. Its "base" then names the interrupted attempt's work, the gate diff
+    /// against it is empty, and the reviewer rejects correct work as "nothing changed" — measured
+    /// on a live run, where attempts 1 and 2 were outages and attempt 3 was rejected on an empty
+    /// diff (D-124).
+    ///
+    /// So the journal is asked first: the first `checkpoint_created {role:"base"}` a previous
+    /// session wrote is the base this session must use, because only the first snapshot of a
+    /// subtask can be of the tree the subtask started from. A snapshot is taken only when the
+    /// journal has none, which is exactly the first session — and then journalled before any
+    /// attempt touches the tree, or the record would name work the attempt had already done.
+    ///
+    /// Nothing to take — a repository with no commits — is kept as `base_error` rather than a
+    /// stop: a session that never restarts does not need a base, and refusing to start would turn
+    /// a missing commit into a task that cannot run at all. A recorded base leaves `base_error`
+    /// `None`, because a resumed session can roll back even though its own snapshot never
+    /// happened.
+    fn take_base(&mut self, journal: &mut Journal) -> immortality_core::Result<()> {
+        if self.base.is_some() {
+            return Ok(());
+        }
+        // Read before writing: the records on disk are the previous sessions' account, and this
+        // session's own writes would make its own late snapshot look like an earlier one.
+        let records = immortality_core::journal::JournalReader::open(journal.dir(), journal.task())
+            .and_then(|reader| reader.read())
+            .map(|outcome| outcome.records)?;
+        if let Some(base) = restart::base_of(&records, journal.task(), &self.subtask.id) {
+            self.base = Some(base);
+            self.base_error = None;
+            return Ok(());
+        }
+        if self.base_error.is_some() {
+            return Ok(());
+        }
+        // No base record. A snapshot is only the subtask's *starting* tree while nothing has run:
+        // once the journal holds an attempt, whatever is on disk may be that attempt's work, and a
+        // failure to snapshot earlier is not a licence to snapshot later. This is the same defect
+        // one layer down — a session whose first `capture_base` failed would otherwise retry on
+        // the resume and name the interrupted attempt's tree as the base, silently.
+        if attempts_started(&records, journal.task(), &self.subtask.id) {
+            self.base_error = Some(
+                "no base checkpoint was recorded before this subtask's first attempt, so a restart \
+                 has nothing it can prove the tree came from"
+                    .to_string(),
+            );
+            return Ok(());
+        }
+        match self.capture_base(journal) {
+            Ok(Some(base)) => self.base = Some(base),
+            Ok(None) => {
+                self.base_error =
+                    Some("the worktree has no commits, so a restart has nothing to roll back to".to_string());
+            }
+            Err(why) => self.base_error = Some(why),
+        }
+        Ok(())
+    }
+
     /// Take the checkpoint a restart would roll back to.
     ///
-    /// Called once, before the first attempt, so the base is the tree the subtask *started* from.
-    /// `Ok(None)` is a repository with no commits: there is nothing to return to, which is a fact
-    /// about the repository rather than an error.
+    /// Called once per subtask, before the first attempt, so the base is the tree the subtask
+    /// *started* from. `Ok(None)` is a repository with no commits: there is nothing to return to,
+    /// which is a fact about the repository rather than an error.
     fn capture_base(&self, journal: &mut Journal) -> Result<Option<restart::Snapshot>, String> {
         let Some(checkpoints) = self.runner.checkpoints.as_deref() else {
             return Err("a restart needs a checkpoint world, and none is wired".to_string());
@@ -1302,12 +1391,21 @@ impl<'a> AttemptSession<'a> {
 ///
 /// Both fields are mandatory: every stop is reached after an attempt ran, and a stop without the
 /// attempt that caused it is a message a human cannot act on.
+/// What ended a session, and what it learned.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionEnd {
     /// The attempt that ended the loop.
     pub outcome: RunOutcome,
     /// Why no further attempt is started.
     pub stop: Stop,
+    /// Everything the session accumulated, not only the last attempt's report.
+    ///
+    /// `outcome.report` describes the attempt that ended the loop; this one also carries what
+    /// earlier attempts learned, and `rejected_ideas` is the part that has to survive a process
+    /// — a restart exists so that the next attempt does not repeat them. Without this field the
+    /// caller has nothing to write into the tree, and a resumed subtask starts as blind as the
+    /// first one.
+    pub report: SubtaskReport,
 }
 
 /// What putting the tree back produced.
@@ -1327,6 +1425,23 @@ fn checkpoint_snapshot(
     reason: &str,
 ) -> Result<Option<restart::Snapshot>, String> {
     checkpoints.snapshot(reason)
+}
+
+/// Whether this subtask of this task has ever started an attempt.
+///
+/// The question `take_base` has to ask before it is allowed to snapshot: a base can only be taken
+/// while the tree is still the one the subtask found, and an `attempt_started` record is the
+/// journal's proof that it no longer necessarily is.
+fn attempts_started(
+    records: &[immortality_core::journal::JournalRecord],
+    task: &TaskId,
+    subtask: &SubtaskId,
+) -> bool {
+    records.iter().any(|record| {
+        &record.fields.task == task
+            && record.fields.subtask.as_ref() == Some(subtask)
+            && record.fields.kind == Kind::AttemptStarted
+    })
 }
 
 /// Append a `checkpoint_created` record for one attempt's tree state.
@@ -1666,6 +1781,12 @@ impl<'a> StepLoop<'a> {
         // execute here. A model cannot call what it was not offered.
         tools.push(split_def());
         request.tools = Some(tools);
+        // Without this the client sends `DEFAULT_MAX_TOKENS`, which is sized for a tool call and
+        // truncates the one tool whose argument is a whole file. See the field's doc comment.
+        request.max_tokens = Some(self.runner.max_completion_tokens);
+        // Applied here for the same reason: the client's default is `false`, and a project that
+        // turns reasoning on must get it in the executor too, not only in the planner.
+        request = request.with_thinking(self.runner.enable_thinking);
         request
     }
 
@@ -1903,9 +2024,17 @@ impl<'a> StepLoop<'a> {
                     truncated.text
                 };
                 // Before the model sees it: this is what makes the journal authoritative.
+                //
+                // The tool's structured `data` goes in too, not only the text. It used to be
+                // dropped here, so a `shell` result reached the journal as
+                // `{"observation": "..."}` and the `exit_code` the tool had already computed was
+                // lost — which left `immortality log` unable to say how a command ended and made
+                // every result render as its own `--- stdout ---` label. The two merge with the
+                // text last so a `data` field named `observation` cannot overwrite the text the
+                // model was actually shown.
                 log.completed(
                     &intent.call,
-                    serde_json::json!({ "observation": observation }),
+                    with_observation(result.data, observation.clone()),
                     truncated.artifact,
                 )
                 .map_err(|error| backend(&error))?;
@@ -2309,6 +2438,28 @@ fn calls_of(reply: &Reply) -> Vec<ToolCall> {
         .collect()
 }
 
+/// The `tool_call_completed` payload: the tool's structured `data` plus the text it was shown.
+///
+/// `ToolResult` carries both, and `data` is documented as "the structured form, for the journal
+/// and for detectors". It used to be dropped at the call site, so a `shell` result reached the
+/// journal as `{"observation": "..."}` and the `exit_code` the tool had already computed never
+/// left the process. `immortality log` could then only show the text, whose first line is the
+/// tool's own `--- stdout ---` label, and every command read as if it had produced nothing.
+///
+/// `observation` is written last, so a tool that happens to put an `observation` key in its
+/// `data` cannot replace the text the model was actually shown — the journal has to agree with
+/// the model, not with a field the model never saw.
+fn with_observation(data: serde_json::Value, observation: String) -> serde_json::Value {
+    let mut payload = match data {
+        serde_json::Value::Object(map) => map,
+        // `Value::Null` is the common case for a text-only tool, and anything else is
+        // unrepresentable as a merge target without inventing a field name for it.
+        _ => serde_json::Map::new(),
+    };
+    payload.insert("observation".to_string(), serde_json::Value::String(observation));
+    serde_json::Value::Object(payload)
+}
+
 /// A journal or artifact-store failure. Always the end of the attempt.
 fn backend(error: &immortality_core::Error) -> Ending {
     Ending::Backend {
@@ -2351,6 +2502,7 @@ mod tests {
     use immortality_core::domain::{AttemptState, Dod, SubtaskId, SubtaskState};
     use immortality_core::protocol::Idempotency;
     use immortality_tools::tool::RegistryError;
+    use serde_json::json;
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
@@ -2537,6 +2689,8 @@ mod tests {
             gate: Arc::new(gate),
             system_prompt: "You are an agent.".to_string(),
             max_tool_output_bytes: 8192,
+            max_completion_tokens: 8192,
+            enable_thinking: false,
             budget: Budget {
                 soft: 32_000,
                 hard: 64_000,
@@ -2586,6 +2740,12 @@ mod tests {
         refused: Mutex<Vec<String>>,
         runs: Mutex<Vec<String>>,
         failing: Mutex<Vec<String>>,
+        /// Every base a diff was asked for, in order.
+        ///
+        /// The base is the whole subject of D-124: an attempt reviewed against its own work sees
+        /// an empty diff. Asserting on which base the gate asked for is the only way to see the
+        /// bug from inside the runner, because a fake diff cannot be empty by accident.
+        bases: Mutex<Vec<Option<String>>>,
     }
 
     impl FakeGates {
@@ -2615,10 +2775,18 @@ mod tests {
         fn ran(&self) -> Vec<String> {
             self.runs.lock().map(|runs| runs.clone()).unwrap_or_default()
         }
+
+        /// Every base a diff was asked for, in order.
+        fn bases(&self) -> Vec<Option<String>> {
+            self.bases.lock().map(|bases| bases.clone()).unwrap_or_default()
+        }
     }
 
     impl Gates for FakeGates {
-        fn diff(&self, _base: Option<&str>) -> Result<immortality_core::gate::Diff, String> {
+        fn diff(&self, base: Option<&str>) -> Result<immortality_core::gate::Diff, String> {
+            if let Ok(mut bases) = self.bases.lock() {
+                bases.push(base.map(str::to_string));
+            }
             Ok(self.diff.lock().map(|diff| diff.clone()).unwrap_or_default())
         }
 
@@ -2685,6 +2853,40 @@ mod tests {
 
     fn finish() -> Reply {
         Reply::call("call_finish", FINISH_SUBTASK, r#"{"summary":"done"}"#)
+    }
+
+    #[test]
+    fn the_journal_payload_keeps_the_structured_fields_and_the_text() {
+        // `ToolResult` carries both, and `data` is documented as the form "for the journal and
+        // for detectors". It used to be dropped at the call site, so `shell`'s `exit_code` never
+        // reached the record and `immortality log` had nothing to render but the observation's
+        // first line — the tool's own `--- stdout ---` label.
+        let payload = with_observation(
+            serde_json::json!({"command": "cargo test", "exit_code": 1}),
+            "[exited 1 in 0.5 s]".to_string(),
+        );
+        assert_eq!(payload["command"], json!("cargo test"));
+        assert_eq!(payload["exit_code"], json!(1));
+        assert_eq!(payload["observation"], json!("[exited 1 in 0.5 s]"));
+    }
+
+    #[test]
+    fn a_tool_cannot_overwrite_the_observation_the_model_saw() {
+        // The journal has to agree with the model. A tool that happens to name a `data` field
+        // `observation` would otherwise put text into the record that no model ever saw.
+        let payload = with_observation(
+            serde_json::json!({"observation": "something else entirely"}),
+            "the text the model was shown".to_string(),
+        );
+        assert_eq!(payload["observation"], json!("the text the model was shown"));
+    }
+
+    #[test]
+    fn a_text_only_tool_still_yields_a_payload_with_the_observation() {
+        // `ToolResult::text` leaves `data` as `Null`; the record must not become `null` or gain a
+        // placeholder key for it.
+        let payload = with_observation(serde_json::Value::Null, "done".to_string());
+        assert_eq!(payload, serde_json::json!({"observation": "done"}));
     }
 
     #[test]
@@ -3108,6 +3310,45 @@ mod tests {
         let tools = request.tools.expect("tools are offered");
         let names: Vec<&str> = tools.iter().map(|tool| tool.function.name.as_str()).collect();
         assert!(names.contains(&SPLIT_SUBTASK), "{names:?}");
+    }
+
+    #[test]
+    fn every_step_carries_the_configured_completion_budget() {
+        // The defect this pins: the runner set no `max_tokens`, so `ChatRequest`'s default (1024,
+        // sized for a tool call) applied to every step. A `write_file` whose argument is a whole
+        // document therefore ran out mid-argument and the turn was discarded — measured twice on
+        // `qna_rails`, at steps 19 and 23, both labelled `backend_unavailable`.
+        //
+        // The runner here is configured with a budget that is *not* the client default, so a
+        // request that silently omitted the field would still be caught.
+        let model = Scripted::new(vec![Ok(finish())]);
+        let (dir, mut runner) = runner(model.clone(), registry(vec![Arc::new(Touch)]));
+        runner.max_completion_tokens = 12_345;
+        let mut journal = journal(&dir);
+        runner.run(&subtask(), 1, "", &mut journal).expect("run");
+
+        let request = model.requests().pop().expect("a request");
+        assert_eq!(
+            request.max_tokens,
+            Some(12_345),
+            "the step must ask for the configured budget, not the client default"
+        );
+    }
+
+    #[test]
+    fn the_thinking_setting_reaches_the_executor() {
+        // The planner honoured `backend.enable_thinking` and the executor did not, so a project
+        // file that turned reasoning off was obeyed for planning only. On `swift-iq2_xs` that is
+        // not cosmetic: reasoning is charged against the completion budget.
+        let model = Scripted::new(vec![Ok(finish())]);
+        let (dir, mut runner) = runner(model.clone(), registry(vec![Arc::new(Touch)]));
+        runner.enable_thinking = true;
+        let mut journal = journal(&dir);
+        runner.run(&subtask(), 1, "", &mut journal).expect("run");
+
+        let request = model.requests().pop().expect("a request");
+        let kwargs = request.chat_template_kwargs.expect("template kwargs");
+        assert_eq!(kwargs["enable_thinking"], true, "{kwargs}");
     }
 
     #[test]
@@ -3587,6 +3828,39 @@ mod tests {
     }
 
     #[test]
+    fn the_reason_a_backend_ending_happened_reaches_the_journal() {
+        // The defect this pins: `attempt_failed` recorded only `ending: backend`, so "the
+        // connection was refused" and "the turn was truncated and thrown away" read identically.
+        // On `qna_rails` that cost an hour: two attempts looked like a dead backend and had in
+        // fact died of `finish_reason: length` against a healthy one.
+        let model = Scripted::new(vec![Err(
+            "model failure (ThinkingTruncated): finish_reason=length, 0 chars of reasoning, \
+             empty content and no tool calls"
+                .to_string(),
+        )]);
+        let (dir, runner) = runner(model, registry(vec![Arc::new(Touch)]));
+        let mut journal = journal(&dir);
+        runner.run(&subtask(), 1, "", &mut journal).expect("run");
+
+        let records = immortality_core::journal::JournalReader::open(journal.dir(), journal.task())
+            .expect("reader")
+            .read()
+            .expect("records")
+            .records;
+        let failed = records
+            .iter()
+            .find(|record| record.fields.kind == Kind::AttemptFailed)
+            .expect("an attempt_failed record");
+        let detail = failed
+            .event
+            .payload
+            .get("detail")
+            .and_then(serde_json::Value::as_str)
+            .expect("the detail field");
+        assert!(detail.contains("finish_reason=length"), "{detail}");
+    }
+
+    #[test]
     fn an_empty_reply_ends_the_attempt() {
         let model = Scripted::new(vec![Ok(Reply::default())]);
         let (dir, runner) = runner(model, registry(vec![Arc::new(Touch)]));
@@ -3594,6 +3868,33 @@ mod tests {
         let outcome = runner.run(&subtask(), 1, "", &mut journal).expect("run");
 
         assert_eq!(outcome.ending, Ending::Empty);
+    }
+
+    #[test]
+    fn an_ending_that_is_not_a_backend_one_records_no_detail() {
+        // The other half of `the_reason_a_backend_ending_happened_reaches_the_journal`, and the
+        // reason the field is inserted rather than declared in the payload literal: a
+        // `"detail": null` on a `steps` ending is a field with nothing to say, and declaring it
+        // would have dated every golden journal for a fact none of them record.
+        let model = Scripted::new(vec![Ok(Reply::default())]);
+        let (dir, runner) = runner(model, registry(vec![Arc::new(Touch)]));
+        let mut journal = journal(&dir);
+        runner.run(&subtask(), 1, "", &mut journal).expect("run");
+
+        let records = immortality_core::journal::JournalReader::open(journal.dir(), journal.task())
+            .expect("reader")
+            .read()
+            .expect("records")
+            .records;
+        let failed = records
+            .iter()
+            .find(|record| record.fields.kind == Kind::AttemptFailed)
+            .expect("an attempt_failed record");
+        assert!(
+            failed.event.payload.get("detail").is_none(),
+            "an empty ending has no backend detail to report: {}",
+            failed.event.payload
+        );
     }
 
     #[test]
@@ -4698,6 +4999,11 @@ mod tests {
         calls: Mutex<Vec<String>>,
         /// When set, `restore` fails with this reason.
         refuse: Mutex<Option<String>>,
+        /// When set, `snapshot` fails with this reason.
+        ///
+        /// A base that could not be taken is the case D-124's guard exists for: the tree moves on
+        /// regardless, so the resume must not quietly take the snapshot its own session could not.
+        refuse_snapshot: Mutex<Option<String>>,
         /// When true, `snapshot` reports a clean tree (no SHA to record).
         clean: Mutex<bool>,
         /// Journal directory to read at `restore` time, when the test is about durability.
@@ -4731,6 +5037,13 @@ mod tests {
             fake
         }
 
+        /// Every snapshot is refused, as a git failure would be.
+        fn refuse_snapshots(&self, reason: &str) {
+            if let Ok(mut refuse) = self.refuse_snapshot.lock() {
+                *refuse = Some(reason.to_string());
+            }
+        }
+
         fn watching(journal_dir: impl Into<std::path::PathBuf>) -> Arc<Self> {
             let fake = Self::new();
             if let Ok(mut watching) = fake.watching.lock() {
@@ -4755,6 +5068,11 @@ mod tests {
             let clean = self.clean.lock().is_ok_and(|clean| *clean);
             if let Ok(mut calls) = self.calls.lock() {
                 calls.push(format!("snapshot:{reason}"));
+            }
+            if let Ok(refuse) = self.refuse_snapshot.lock()
+                && let Some(reason) = refuse.as_ref()
+            {
+                return Err(reason.clone());
             }
             if clean {
                 return Ok(None);
@@ -5286,6 +5604,144 @@ mod tests {
     }
 
     #[test]
+    fn a_resumed_session_keeps_the_base_the_previous_session_recorded() {
+        // The live bug (D-124). An abandoned attempt ends the session *without* rolling back, so
+        // the resumed session starts over a tree that already holds the first attempt's work. A
+        // base taken "at the start of the session" is then a snapshot of that work: the gate diff
+        // against it is empty, and a reviewer rejects a correct change as "nothing changed".
+        //
+        // Measured on `qna_rails`: the base of attempts 1, 2 and 3 were three different SHAs, each
+        // containing the previous attempt's work, and attempt 3's review came back `the diff is
+        // empty` with both checks green.
+        let checkpoints = FakeCheckpoints::new();
+        // Attempt 1 writes nothing and reports the backend gone; attempt 2 writes and claims, so
+        // it is the attempt whose gates run — and the one whose base this test is about.
+        let model = Scripted::new(vec![
+            Err("connection refused".to_string()),
+            Ok(Reply::call("call_1", "touch", r#"{"path":"src/parser.rs"}"#)),
+            Ok(finish()),
+        ]);
+        let gates = Arc::new(FakeGates::green());
+        let (dir, mut runner) = runner(model, registry(vec![Arc::new(Touch)]));
+        runner.gates = Some(Arc::clone(&gates) as Arc<dyn Gates + Send + Sync>);
+        runner = with_checkpoints(runner, Arc::clone(&checkpoints));
+        let mut journal = journal(&dir);
+
+        let first = runner
+            .session(&subtask(), 1)
+            .drive(allowance(3, 2), &mut journal)
+            .expect("the first session");
+        assert_eq!(
+            first.stop,
+            Stop::Abandoned,
+            "the fixture is only about the bug if the first session ends on an outage"
+        );
+
+        // The resume the daemon performs on the next start.
+        let second = runner
+            .session(&subtask(), 2)
+            .drive(allowance(3, 2), &mut journal)
+            .expect("the resumed session");
+
+        assert_eq!(
+            checkpoints.snapshot_count(),
+            1,
+            "a resumed session must reuse the base the first one recorded, not take a second one \
+             of a tree that already holds the interrupted attempt's work"
+        );
+        let bases: Vec<String> = gates.bases().into_iter().flatten().collect();
+        assert_eq!(
+            bases,
+            vec!["ckpt-0".to_string()],
+            "the gate must diff the resumed attempt against the subtask's base; diffing against \
+             the resumed session's own late snapshot is the empty diff of D-124"
+        );
+        assert!(
+            second.outcome.verified(),
+            "the work is on the tree and the gates are green, so the attempt must be verified: {:?}",
+            second.outcome
+        );
+    }
+
+    #[test]
+    fn a_session_does_not_snapshot_a_base_the_first_one_failed_to_take() {
+        // The same defect one layer down. If the first session could not snapshot — git failed,
+        // the seam was not wired — the journal holds an attempt and no base. A resume that took a
+        // snapshot now would name a tree the interrupted attempt wrote: not a missing base, a
+        // wrong one, and the reviewer would again be shown an empty diff.
+        let checkpoints = FakeCheckpoints::new();
+        checkpoints.refuse_snapshots("git is gone");
+        let model = Scripted::new(vec![
+            Ok(Reply::call("call_1", "touch", r#"{"path":"src/parser.rs"}"#)),
+            Err("connection refused".to_string()),
+            Ok(Reply::call("call_2", "touch", r#"{"path":"src/other.rs"}"#)),
+        ]);
+        let (dir, mut runner) = runner(model, registry(vec![Arc::new(Touch)]));
+        runner = with_checkpoints(runner, Arc::clone(&checkpoints));
+        let mut journal = journal(&dir);
+
+        runner
+            .session(&subtask(), 1)
+            .drive(allowance(3, 2), &mut journal)
+            .expect("the first session");
+        assert_eq!(
+            checkpoints.snapshot_count(),
+            1,
+            "the first session asked for a base and was refused"
+        );
+
+        let second = runner
+            .session(&subtask(), 2)
+            .drive(allowance(3, 2), &mut journal)
+            .expect("the resumed session");
+        assert_eq!(
+            checkpoints.snapshot_count(),
+            1,
+            "the resume may not take the base its own session failed to take: the tree has moved"
+        );
+        assert_eq!(
+            second.stop,
+            Stop::Abandoned,
+            "the fixture only says something if the first session really was an outage"
+        );
+    }
+
+    #[test]
+    fn an_attempt_on_record_forbids_a_late_base_snapshot() {
+        // The predicate the guard reads, on its own: it is a question about the journal, and the
+        // caller must not be able to answer it from memory.
+        let task = TaskId::from_suffix("01ARZ3NDEKTSV4RRFFQ69G5FAA");
+        let started = vec![immortality_core::journal::JournalRecord::new(
+            immortality_core::journal::RecordFields {
+                seq: 0,
+                at: immortality_core::time::now(),
+                task: task.clone(),
+                subtask: Some(subtask().id),
+                attempt: Some(1),
+                kind: Kind::AttemptStarted,
+            },
+            immortality_core::journal::JournalEvent::with_payload(serde_json::json!({})),
+            None,
+        )];
+        assert!(
+            attempts_started(&started, &task, &subtask().id),
+            "an attempt on record is what forbids a late snapshot"
+        );
+        assert!(
+            !attempts_started(
+                &started,
+                &task,
+                &SubtaskId::from_suffix("01ARZ3NDEKTSV4RRFFQ69G5FAB")
+            ),
+            "another subtask's attempt says nothing about this one's tree"
+        );
+        assert!(
+            !attempts_started(&[], &task, &subtask().id),
+            "a subtask nothing ran for is the one case where a fresh base is the right answer"
+        );
+    }
+
+    #[test]
     fn a_restarted_attempt_gets_a_strategy_that_forbids_the_previous_one() {
         // The whole reason a restart is worth a rollback: the next brief is not the same brief.
         // The assertion reads the brief the model actually received, not the function's output.
@@ -5519,6 +5975,34 @@ mod tests {
     }
 
     #[test]
+    fn a_verified_claim_names_no_rejected_idea() {
+        // Measured on the `roomly-bench` run: every one of four subtasks closed green on its
+        // first attempt, and every one of the four reports still carried
+        //
+        //   "attempt 1: it produced no tool call for the stall budget, so nothing happened on disk"
+        //
+        // `drive` calls `remember` for every outcome, and `cause_of` maps the endings that need
+        // no cause (`Verified`, `Split`, `Abandoned`) to `Cause::Stalled`, so a success was
+        // recorded as a failure. `rejected_ideas` is what a resumed attempt is told not to
+        // repeat (D-074, D-136) — a false entry there tells the next context that the work it
+        // just finished was a dead end.
+        let (dir, mut runner) = runner(Scripted::new(vec![Ok(finish())]), registry(vec![Arc::new(Touch)]));
+        runner.gates = Some(Arc::new(FakeGates::green()));
+        let mut journal = journal(&dir);
+        let end = runner
+            .session(&subtask(), 1)
+            .drive(allowance(3, 2), &mut journal)
+            .expect("session");
+
+        assert_eq!(end.stop, Stop::Done, "{:?}", end.stop);
+        assert!(
+            end.report.rejected_ideas.is_empty(),
+            "a subtask that closed green rejected nothing, but the report says {:?}",
+            end.report.rejected_ideas
+        );
+    }
+
+    #[test]
     fn a_verified_claim_ends_the_session_without_a_restart() {
         let checkpoints = FakeCheckpoints::new();
         let (dir, mut runner) = runner(Scripted::new(vec![Ok(finish())]), registry(vec![Arc::new(Touch)]));
@@ -5611,6 +6095,39 @@ mod tests {
         assert!(
             system.contains("regenerating the parser from scratch"),
             "{system}"
+        );
+        assert!(system.contains("Do not propose them again"), "{system}");
+    }
+
+    #[test]
+    fn the_first_attempt_of_a_resumed_subtask_quotes_what_an_earlier_process_rejected() {
+        // The other half of the promise, and the half a retry cannot cover: the *first* brief of
+        // a resumed session has no `Cause`, so it never goes through `restart::strategy`. It used
+        // to return the seed untouched, so a subtask reopened by a human — or resumed after a
+        // restart — began as blind as its very first attempt, which is the opposite of what
+        // `resuming_from`'s own doc comment says.
+        let model = Scripted::new(vec![Ok(finish())]);
+        let (dir, runner) = runner(
+            Arc::clone(&model) as Arc<dyn Model>,
+            registry(vec![Arc::new(Touch)]),
+        );
+        let mut journal = journal(&dir);
+        let mut report = SubtaskReport::new("nothing yet");
+        report.rejected_ideas.push("rewriting the lexer".to_string());
+        runner
+            .session(&subtask(), 2)
+            .with_strategy("make the specs pass")
+            .resuming_from(report)
+            .drive(allowance(3, 1), &mut journal)
+            .expect("session");
+
+        let requests = model.requests();
+        let first = requests.first().expect("the first attempt");
+        let system = first.messages[0].content.as_deref().unwrap_or("");
+        assert!(system.contains("make the specs pass"), "{system}");
+        assert!(
+            system.contains("rewriting the lexer"),
+            "the first brief of a resumed subtask dropped what was already rejected: {system}"
         );
         assert!(system.contains("Do not propose them again"), "{system}");
     }

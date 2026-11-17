@@ -43,6 +43,42 @@ use tokio::net::UnixStream;
 /// terminal forever is the failure mode this project exists to avoid.
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long a request that asks the daemon to **think** may take.
+///
+/// `plan --goal` and `start "<goal>"` call the model inside the request: the planner writes up to
+/// `MAX_PLAN_TOKENS` of subtasks, and the backend's own timeout is 600 s. Measured on 2026-11-16
+/// against the live backend, the same one-line goal took 22.9 s once and 29.6 s another time, and
+/// then three times in a row the client gave up at 30.00 s — while the daemon finished the plan
+/// seconds later, so the human saw "the daemon did not answer within 30 seconds" over a plan that
+/// had in fact been written. A timeout that fires just before success is worse than no timeout:
+/// it invites a retry that pays for a second plan.
+///
+/// Bounded rather than absent. `attach` waits forever because silence there is the model thinking
+/// and the stream is the product; a request needs an answer, and a daemon wedged in the planner
+/// must still be reported.
+const THINKING_TIMEOUT: Duration = Duration::from_mins(15);
+
+/// How long a request may wait, given what it asks the daemon to do.
+///
+/// Only two shapes make the daemon call the model before it answers, and both are the same
+/// question — "build a plan": `plan` carries a `goal`, and `start` carries a `goal` rather than a
+/// `task`. Everything else answers from disk. The distinction is by *shape* rather than by name
+/// because both methods have a second shape that answers at once (`plan` without a goal reports
+/// the tree on disk; `start --task` resumes), and a name-only rule would make the fast shape wait
+/// a quarter of an hour for a socket that has already closed.
+///
+/// Measured on 2026-11-16 against the live backend: the planning shape took 22.9 s once and
+/// 29.6 s another time, then three runs in a row hit the 30-second deadline while the daemon
+/// finished and wrote the plan seconds later. A deadline that fires just before success invites a
+/// retry that pays for a second plan.
+fn deadline_for(method: &str, params: &Value, answer: Duration) -> Duration {
+    let plans = match method {
+        "plan" | "start" => params.get("goal").is_some(),
+        _ => false,
+    };
+    if plans { THINKING_TIMEOUT } else { answer }
+}
+
 /// How many reconnects that deliver nothing in a row are tolerated before giving up.
 ///
 /// A daemon that closes every connection immediately is broken. One reconnect is the normal
@@ -184,9 +220,19 @@ impl Client {
 
     /// Send one request and read exactly one response.
     ///
+    /// The deadline depends on what the request asks the daemon to do; see [`deadline_for`]. It is
+    /// decided here rather than at each call site so a call site cannot forget it, and so the two
+    /// are testable together through this one function.
+    ///
     /// # Errors
-    /// The socket died mid-request, or the daemon sent a message that is not a response.
+    /// The socket died mid-request, the daemon sent a message that is not a response, or the
+    /// daemon did not answer within the deadline its method allows.
     pub async fn request(&mut self, method: &str, params: Value) -> Result<Response> {
+        let deadline = deadline_for(method, &params, self.answer_timeout);
+        self.request_within(method, params, deadline).await
+    }
+
+    async fn request_within(&mut self, method: &str, params: Value, deadline: Duration) -> Result<Response> {
         self.next_id += 1;
         let request = Request {
             id: self.next_id,
@@ -203,7 +249,7 @@ impl Client {
             .flush()
             .await
             .context("the daemon closed the connection while sending the request")?;
-        let line = self.read_line().await?;
+        let line = self.read_line_within(Some(deadline)).await?;
         rpc::decode(line.trim_end()).map_err(|error| anyhow::anyhow!("{error}"))
     }
 
@@ -317,12 +363,6 @@ impl Client {
             bail!("the daemon refused the reconnect: {}", error.message);
         }
         Ok(client)
-    }
-
-    /// Read one line, with a deadline.
-    async fn read_line(&mut self) -> Result<String> {
-        let deadline = self.answer_timeout;
-        self.read_line_within(Some(deadline)).await
     }
 
     /// Read one line, waiting at most `deadline`.
@@ -656,5 +696,104 @@ mod tests {
         // `attach` loops forever by design; the event arriving before the timeout is the point.
         assert!(outcome.is_err(), "attach should still be streaming, not returned");
         assert_eq!(seen, vec![Some(0)], "the silent stream must still deliver");
+    }
+
+    /// A daemon that answers `hello`, then answers the next request after `delay`.
+    ///
+    /// The listener is bound **before** the thread starts. Binding inside it raced the client:
+    /// under a full parallel test run `Client::connect` reached a socket that did not exist yet and
+    /// failed with "the daemon closed the connection" — seen once in three whole-binary runs and
+    /// never in isolation, which is the shape of a race and not of a broken test.
+    fn slow_request_daemon(dir: &Path, delay: Duration) -> std::path::PathBuf {
+        let socket = dir.join("daemon.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind");
+        listener
+            .set_nonblocking(true)
+            .expect("the listener is handed to tokio");
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            runtime.block_on(async move {
+                let listener = tokio::net::UnixListener::from_std(listener).expect("a non-blocking listener");
+                let (stream, _) = listener.accept().await.expect("accept");
+                let (read, mut write) = stream.into_split();
+                let mut lines = tokio::io::BufReader::new(read).lines();
+                // `hello`
+                if lines.next_line().await.ok().flatten().is_none() {
+                    return;
+                }
+                write
+                    .write_all(b"{\"id\":1,\"result\":{\"version\":1}}\n")
+                    .await
+                    .ok();
+                // The one request, answered only after the planner-shaped wait.
+                if lines.next_line().await.ok().flatten().is_none() {
+                    return;
+                }
+                tokio::time::sleep(delay).await;
+                write
+                    .write_all(b"{\"id\":2,\"result\":{\"created\":true}}\n")
+                    .await
+                    .ok();
+            });
+        });
+        socket
+    }
+
+    #[tokio::test]
+    async fn a_planning_request_outlives_the_status_deadline() {
+        // The bug, measured three times in a row on 2026-11-16: `plan --goal` and `start "<goal>"`
+        // call the backend inside the request, and the planner's answer took 22.9 s once and
+        // 29.6 s another time. The 30-second deadline sized for `status` therefore fired just
+        // before success, and the plan was written to disk anyway — the human saw "the daemon did
+        // not answer within 30 seconds" over a plan that existed.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = slow_request_daemon(dir.path(), Duration::from_millis(400));
+        let token_path = dir.path().join("daemon.token");
+        std::fs::write(&token_path, "t\n").expect("token");
+
+        let mut client = Client::connect(&socket, &token_path).await.expect("connect");
+        // Shorter than the daemon's wait: only the planning rule can survive it.
+        client.answer_timeout = Duration::from_millis(100);
+        let response = client
+            .request("plan", json!({"goal": "x"}))
+            .await
+            .expect("a planning request waits for the planner");
+        assert_eq!(
+            response.result.expect("result")["created"],
+            json!(true),
+            "the answer the daemon owed still arrives"
+        );
+    }
+
+    #[test]
+    fn the_deadline_follows_the_shape_of_the_request() {
+        // The rule `a_planning_request_outlives_the_status_deadline` depends on, stated directly:
+        // the two shape-sensitive methods get the long deadline only when they carry a goal, and
+        // everything else gets the short one. Without this, a call site could keep the 30-second
+        // wait in place and the socket test above would still pass on a fast backend.
+        let short = Duration::from_secs(30);
+        for (method, params, long) in [
+            ("plan", json!({"goal": "x"}), true),
+            ("start", json!({"goal": "x"}), true),
+            // The fast shapes of the same methods: a plan that already exists, a task being resumed.
+            ("plan", json!({"project": "/tmp/p"}), false),
+            ("start", json!({"task": "tsk_01ARZ3NDEKTSV4RRFFQ69G5FAV"}), false),
+            // Everything else answers from disk.
+            ("status", json!({}), false),
+            ("log", json!({"task": "t"}), false),
+            ("metrics", json!({}), false),
+            ("gc", json!({"dry_run": true}), false),
+            ("attach", json!({"task": "t"}), false),
+        ] {
+            let got = deadline_for(method, &params, short);
+            assert_eq!(
+                got,
+                if long { THINKING_TIMEOUT } else { short },
+                "`{method}` with {params} got {got:?}"
+            );
+        }
     }
 }

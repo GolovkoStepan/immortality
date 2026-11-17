@@ -175,17 +175,48 @@ fn truncate(text: &str, limit: usize) -> String {
 /// first says the host is down and the second says the prompt is large.
 #[must_use]
 pub fn classify_transport(error: &reqwest::Error) -> Failure {
+    let detail = transport_detail(error);
     if error.is_timeout() {
-        return Failure::retryable(RetryKind::Timeout, error.to_string());
+        return Failure::retryable(RetryKind::Timeout, detail);
     }
     if error.is_connect() {
-        return Failure::retryable(RetryKind::Connect, error.to_string());
+        return Failure::retryable(RetryKind::Connect, detail);
     }
     if error.is_body() || error.is_decode() {
         // A body that died mid-stream: the connection dropped, so the same request may work.
-        return Failure::retryable(RetryKind::BrokenStream, error.to_string());
+        return Failure::retryable(RetryKind::BrokenStream, detail);
     }
-    Failure::retryable(RetryKind::BrokenStream, error.to_string())
+    Failure::retryable(RetryKind::BrokenStream, detail)
+}
+
+/// What `reqwest` says, followed by what caused it.
+///
+/// `reqwest::Error`'s own `Display` is `error sending request for url (<url>)` and nothing else —
+/// it names the endpoint and stops there. The reason (`connection refused`, `connection reset by
+/// peer`, a DNS failure, a body that died mid-stream) is in its `source()` chain, which
+/// `to_string()` does not walk.
+///
+/// That matters because `detail` is the field that answers "why did this attempt end" (D-125):
+/// it was added so that "the backend died" and "the model was truncated" would stop reading the
+/// same in the journal. Measured on `qna_rails`, 2026-11-16: two abandoned attempts both reached
+/// the journal as `error sending request for url (…)` with no cause at all, so a human reading
+/// the journal could not tell a flaky network from a dropped connection from a bug in the client.
+fn transport_detail(error: &reqwest::Error) -> String {
+    use std::error::Error as _;
+
+    let mut detail = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        let text = cause.to_string();
+        // A repeated reason adds a way to read the same fact twice — and a chain long enough to
+        // loop would otherwise never end.
+        if !detail.contains(&text) {
+            detail.push_str(": ");
+            detail.push_str(&text);
+        }
+        source = cause.source();
+    }
+    detail
 }
 
 /// Classify a completed turn.
@@ -293,6 +324,87 @@ mod tests {
     fn backoff_is_zero_safe() {
         // Attempt 0 does not exist, but a caller that passes one must not underflow.
         assert_eq!(backoff(0), Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn a_timeout_stays_a_timeout_and_still_names_its_cause() {
+        // The classification is the load-bearing half: a timeout says the prompt was large and a
+        // connect failure says the host is down, and `should_retry` treats the two the same only
+        // because both are worth retrying. A `detail` that grew a cause must not have changed
+        // which arm was taken, or an operator would start reading `Timeout` where the truth is
+        // `Connect`.
+        //
+        // Silence is the honest way to produce a timeout: the request is sent and the client's
+        // own deadline expires before anything answers.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(120))
+            .build()
+            .expect("client");
+        let error = client
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .expect_err("a silent listener must time out");
+        let failure = classify_transport(&error);
+        let Failure::Retryable { kind, detail } = &failure else {
+            panic!("a transport error is always retryable: {failure}");
+        };
+        assert_eq!(
+            *kind,
+            RetryKind::Timeout,
+            "a timeout must stay a timeout: {failure}"
+        );
+        // The cause is what the fix adds; the url alone is what it replaced.
+        assert!(
+            detail.contains("127.0.0.1"),
+            "the endpoint should be named: {detail}"
+        );
+        assert!(
+            detail.matches(':').count() > 2,
+            "the client's own sentence is the whole detail again: {detail}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_transport_error_keeps_the_reason_it_was_caused_by() {
+        // Live `qna_rails`, 2026-11-16 16:40 and 16:48. Two attempts were abandoned and both
+        // reached the journal as the same sentence:
+        //
+        //   retryable backend failure (BrokenStream): error sending request for url
+        //   (http://llm-server:47832/v1/chat/completions)
+        //
+        // That is `reqwest::Error`'s own `Display`, and it names the url and nothing else. The
+        // reason — connection reset, connection refused, DNS, a body that died mid-stream — lives
+        // in the error's `source()` chain, which `to_string()` does not walk.
+        //
+        // `detail` exists for exactly this question (D-125): telling "the backend died" from "the
+        // model was truncated" is what the field was added for, and an outage whose cause is
+        // invisible cannot be told from any other outage. Two different causes read identically
+        // in the journal, so a human reading it cannot tell a flaky network from a bug.
+        //
+        // A closed port is a real transport failure produced by `reqwest` itself, not a hand-made
+        // struct: the test has to exercise the same `Display`/`source` split the live run hit.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        drop(listener); // nothing is listening now, so a connect is refused
+        let error = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/chat/completions"))
+            .send()
+            .await
+            .expect_err("a closed port must fail");
+        let failure = classify_transport(&error);
+        let text = failure.to_string();
+        assert!(
+            text.contains("refused") || text.contains("connect"),
+            "the transport error lost its cause: {text}"
+        );
+        // The url is not the reason; keeping it is fine, keeping only it is not.
+        assert!(
+            text.contains(&port.to_string()),
+            "the failing endpoint should still be named: {text}"
+        );
     }
 
     #[test]

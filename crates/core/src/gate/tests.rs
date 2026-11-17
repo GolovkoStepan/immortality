@@ -252,6 +252,81 @@ fn a_short_bare_word_is_not_a_secret() {
 }
 
 #[test]
+fn a_parameter_named_password_is_not_a_secret() {
+    // The line is a Ruby method signature, and `password:` there is a parameter name. Judging the
+    // whole rest of the line made `nil, sign: nil)` — 22 characters with commas and a bracket —
+    // look like a value, and the gate refused a document that was telling the truth. Measured on
+    // `qna_rails`: three attempts of a documentation subtask died on exactly this string.
+    for line in [
+        "- `initialize(username: nil, password: nil, sign: nil)` — raises `AuthError` unless",
+        "    def initialize(password:, username: nil)",
+        "def create(password = nil, remember_me = false)",
+        "password: nil, sign: nil, expires_at: nil",
+        "  attr_reader :password, :username",
+        "if params[:password].blank? && params[:token].blank?",
+    ] {
+        let changed = file("docs/inventory.md", FileStatus::Modified, &[line]);
+        assert_clean(&diff(vec![changed]), line);
+    }
+}
+
+#[test]
+fn a_real_value_after_a_parameter_list_is_still_a_finding() {
+    // The other side of the cut: stopping at the delimiter must not make the rule blind. A
+    // credential followed by a comma is still a credential.
+    for line in [
+        r#"password: "hunter2hunter2", username: "admin""#,
+        "password=8f3a9c2b1d4e5f60,user=root",
+        "  password: 'sup3r-s3cret',",
+        // A quoted literal with a space inside it: the reason the value is taken to the closing
+        // quote rather than to the first space. Cutting at the space would read `correct` — seven
+        // letters, no digits — and let a real password through.
+        r#"password: "correct horse battery""#,
+    ] {
+        let changed = file("config/secrets.yml", FileStatus::Modified, &[line]);
+        let findings = sanity(&diff(vec![changed]));
+        assert_eq!(findings.len(), 1, "{line} was not flagged: {findings:?}");
+        assert!(matches!(findings[0], Finding::Secret { .. }), "{findings:?}");
+    }
+}
+
+#[test]
+fn a_namespaced_class_named_password_is_not_a_secret() {
+    // `::` is Ruby's scope operator. `OneTimePassword::Client` read as `password:` plus a value,
+    // and the value `::client.new` cleared the twelve-character bar. Measured on `qna_rails`: five
+    // findings in one `docs/services.md`, every one a namespaced class, and the attempt spent its
+    // last steps editing blindly because the finding names the file and not the line.
+    for line in [
+        "- `otp_service` memoises `Services::OneTimePassword::Client.new`",
+        "`rescue Services::OneTimePassword::Errors::TooManyPerHour`",
+        "`rescue Services::OneTimePassword::Errors::CodeExpired`",
+        "- `OneTimePassword::Client.new`",
+        "`Services::SmsSender::Errors::AuthError`",
+    ] {
+        let changed = file("docs/services.md", FileStatus::Modified, &[line]);
+        assert_clean(&diff(vec![changed]), line);
+    }
+}
+
+#[test]
+fn a_comment_after_a_parameter_is_not_part_of_its_value() {
+    // `#` terminates the value with no whitespace in between, which is valid Ruby (`x = nil#note`)
+    // and the only case where the terminator changes the answer. With a space before the comment
+    // the whitespace cut already ends the value, so a test written that way would pass without
+    // `#` in the list at all. Measured: each line below clears the twelve-character bar as a whole
+    // and falls under it once the comment is removed, so without the cut the gate reads
+    // `nil#defaults to ENV[...]` as a literal credential.
+    for line in [
+        r#"password = nil#defaults to ENV["PASSWORD"]"#,
+        "api_key = nil#read from .env.sample, never commit it",
+        "secret_key = blank#configured per environment by the operator",
+    ] {
+        let changed = file("lib/services/client.rb", FileStatus::Modified, &[line]);
+        assert_clean(&diff(vec![changed]), line);
+    }
+}
+
+#[test]
 fn a_token_with_no_secret_name_is_not_flagged() {
     // The heuristic is name-based, and being honest about that is better than a regex over
     // entropy that would flag every hash in every lock file.

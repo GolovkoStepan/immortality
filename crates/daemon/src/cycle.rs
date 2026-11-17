@@ -423,7 +423,11 @@ impl Pass<'_> {
             .session(&running, spent.next)
             .with_strategy(strategy)
             // A resumed subtask inherits what its last attempt learned. Without this its first
-            // brief in the new process is as blind as the very first one.
+            // brief in the new process is as blind as the very first one. The report is written
+            // to the tree when a subtask closes (`set_report`), and an *open* subtask has none:
+            // its accumulated ideas live only in the session, which is the honest limit — a
+            // process that died mid-subtask has nothing durable to inherit from, and the journal
+            // is where the reason it died is recorded.
             .resuming_from(running.report.clone().unwrap_or_default());
         let end = session
             .drive(spent.left(self.limits.allowance()), self.journal)
@@ -448,8 +452,19 @@ impl Pass<'_> {
                 // Tree first, then journal. A crash between the two leaves a settled tree with a
                 // missing audit line, which reads as "nothing to say"; the other order announces a
                 // closure the tree never received.
+                //
+                // The report goes in with the state, not after it: it is what the next subtask
+                // inherits, and `rejected_ideas` is what a resumed attempt of *this* subtask
+                // inherits. Leaving it out is what made `resuming_from` below always receive
+                // `None`, so a restarted process re-proposed ideas the previous attempts had
+                // already ruled out.
                 self.plan
-                    .set_state(&subtask.id, SubtaskState::Done, self.runner.clock.now())
+                    .set_report(
+                        &subtask.id,
+                        SubtaskState::Done,
+                        end.report.clone(),
+                        self.runner.clock.now(),
+                    )
                     .map_err(|error| CycleError::Store(error.to_string()))?;
                 self.subtask_state(&subtask.id, "done")?;
                 self.closed.push(subtask.id.to_string());
@@ -479,8 +494,16 @@ impl Pass<'_> {
                 .map_err(|error| CycleError::Store(error.to_string()))?;
             }
             Stop::Exhausted(_) => {
+                // The report matters here at least as much as on `done`: a subtask that is out
+                // of attempts is the one a human is most likely to reopen by hand, and the ideas
+                // that already failed are exactly what its next attempt must not repeat.
                 self.plan
-                    .set_state(&subtask.id, SubtaskState::Blocked, self.runner.clock.now())
+                    .set_report(
+                        &subtask.id,
+                        SubtaskState::Blocked,
+                        end.report.clone(),
+                        self.runner.clock.now(),
+                    )
                     .map_err(|error| CycleError::Store(error.to_string()))?;
                 self.subtask_state(&subtask.id, "blocked")?;
             }

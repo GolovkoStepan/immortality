@@ -73,6 +73,21 @@ fn internal(message: impl Into<String>) -> RpcError {
     RpcError::new(ErrorCode::Internal, message)
 }
 
+/// How a planner refusal reaches the human.
+///
+/// `PlanError`'s own `Display` is the message: each arm is already a sentence that names the
+/// problem and, where it can, what to do — `BadProposal` says "the planner's answer is unusable"
+/// and carries the parser's reason, `DuplicateName` names the two subtasks. The wrapper this
+/// replaces prefixed `BadProposal` again, so the live message read "the planner's answer is
+/// unusable: the planner's answer is unusable: the answer contains no JSON object" — two failures
+/// where there was one, and the useful half pushed to the end of a line.
+///
+/// A function rather than an inline closure because the rule is worth a test that does not need a
+/// model to answer badly on purpose.
+fn plan_error(error: &immortality_core::plan::PlanError) -> RpcError {
+    internal(error.to_string())
+}
+
 /// The request that asks for a plan.
 ///
 /// No `tools`: that absence is what makes the planner a planner. [`planner::SYSTEM`] says so in
@@ -202,7 +217,12 @@ pub async fn write_plan(state: &ServerState, params: &Value) -> Result<Value, Rp
             .complete(&request)
             .map_err(|error| internal(format!("the planner could not answer: {error}")))?;
         let (proposal, subtasks) = compile_answer(&asked, &answer.content, depth)
-            .map_err(|error| internal(format!("the planner's answer is unusable: {error}")))?;
+            // No prefix of its own: every `PlanError` already reads as a complete sentence, and
+            // the `BadProposal` arm already says "the planner's answer is unusable". Adding that
+            // here produced it twice — "the planner's answer is unusable: the planner's answer is
+            // unusable: the answer contains no JSON object" — which reads as two failures and
+            // buries the one reason. `plan_error` is the rule, and it is tested directly.
+            .map_err(|error| plan_error(&error))?;
         let files = planner::render(&proposal, &subtasks)
             .map_err(|error| internal(format!("cannot render the plan: {error}")))?;
         planner::write(&root, &files, depth, force)
@@ -231,4 +251,46 @@ fn report(project: &str, root: &Path, depth: u8, plan: &Plan, goal: &str) -> Val
         "written": planner::existing(root).names(),
         "created": true,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use immortality_core::plan::PlanError;
+
+    #[test]
+    fn a_bad_proposal_is_named_once() {
+        // The live message read "the planner's answer is unusable: the planner's answer is
+        // unusable: the answer contains no JSON object": the `BadProposal` arm already opens with
+        // that phrase, and the caller prefixed it a second time. Two failures where there was one.
+        let error = plan_error(&PlanError::BadProposal {
+            reason: "the answer contains no JSON object".to_string(),
+        });
+        let message = error.message;
+        assert_eq!(
+            message.matches("the planner's answer is unusable").count(),
+            1,
+            "the phrase was doubled: {message}"
+        );
+        assert!(
+            message.contains("the answer contains no JSON object"),
+            "the reason must survive: {message}"
+        );
+        assert_eq!(error.code, ErrorCode::Internal);
+    }
+
+    #[test]
+    fn a_plan_error_keeps_its_own_words() {
+        // The wrappers that are *not* doubled still have to arrive intact: a fix that dropped the
+        // `Display` for something generic would trade a doubled prefix for no message at all.
+        let error = plan_error(&PlanError::DuplicateName {
+            name: "write the docs".to_string(),
+        });
+        assert!(
+            error.message.contains("write the docs"),
+            "the offending name must be named: {}",
+            error.message
+        );
+        assert_eq!(error.code, ErrorCode::Internal);
+    }
 }

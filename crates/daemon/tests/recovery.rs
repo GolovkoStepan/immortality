@@ -734,6 +734,67 @@ fn an_open_attempt_is_closed_when_recovery_interrupts_it() {
 }
 
 #[test]
+fn a_rolled_back_shell_call_is_closed_on_disk_so_the_repair_does_not_repeat() {
+    // The live failure this pins: a `kill -9` inside `cargo test` left an unknown `shell` call.
+    // The first restart rolled the tree back and left the call open; the second restart found the
+    // same call, rolled the tree back *again* — this time over the commit the following attempt
+    // had already made — and the subtask stayed `done` with a red gate.
+    //
+    // The claim here is about the file, not the plan: after the executor runs, the journal must
+    // hold a terminal record for the call, so `open_calls` is empty and a second start plans no
+    // rollback at all.
+    let fixture = Fixture::new();
+    {
+        let mut journal = fixture.journal();
+        let head = GitRepo::new(&fixture.worktree)
+            .head()
+            .expect("head")
+            .expect("a commit");
+        journal
+            .append_scoped(
+                fixture.clock.now(),
+                Kind::CheckpointCreated,
+                json!({ "sha": head, "branch": exec::expected_branch(&fixture.task), "role": "base" }),
+                &Scope::task(),
+            )
+            .expect("checkpoint");
+        journal.sync().expect("sync");
+    }
+    fixture.open_call("call_shell", "shell", &json!({"command": "rm -rf build"}), true);
+
+    let (_records, report, _executed) = fixture.run_plan();
+    assert!(
+        report
+            .steps
+            .iter()
+            .any(|step| matches!(step, recover::RecoveryStep::RollbackToCheckpoint { .. })),
+        "the fixture must plan the L3 rollback: {:?}",
+        report.steps
+    );
+
+    let after = fixture.records();
+    assert!(
+        immortality_core::protocol::open_calls(&after.records).is_empty(),
+        "the rollback answered the call, so the call must be closed: {:?}",
+        immortality_core::protocol::open_calls(&after.records)
+    );
+
+    // The second start is the one that loses work if this is wrong.
+    let second = recover::plan(
+        &fixture.input(&after, workspace_facts(&fixture.worktree)),
+        &fixture.probe(),
+    );
+    assert!(
+        !second
+            .steps
+            .iter()
+            .any(|step| matches!(step, recover::RecoveryStep::RollbackToCheckpoint { .. })),
+        "a closed call must not plan a second rollback: {:?}",
+        second.steps
+    );
+}
+
+#[test]
 fn a_corrupt_journal_blocks_the_task_and_asks_a_human() {
     let fixture = Fixture::new();
     // A chain break: a record whose `prev` does not match.

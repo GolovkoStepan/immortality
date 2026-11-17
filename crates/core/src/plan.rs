@@ -40,7 +40,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::atomic::write_atomically;
-use crate::domain::{Dod, Subtask, SubtaskId, SubtaskState, SubtaskTrigger, Timestamp};
+use crate::domain::{Dod, Subtask, SubtaskId, SubtaskReport, SubtaskState, SubtaskTrigger, Timestamp};
 
 /// Schema version of `TASKS.json`.
 pub const SCHEMA_VERSION: u16 = 1;
@@ -367,6 +367,35 @@ impl Plan {
         let subtask = find_mut(&mut self.subtasks, id)
             .ok_or_else(|| PlanError::UnknownSubtask { id: id.to_string() })?;
         subtask.state = state;
+        subtask.updated_at = at;
+        self.write()
+    }
+
+    /// Record what a closed subtask achieved, and write the tree.
+    ///
+    /// The report is the only thing the next subtask inherits (see [`SubtaskReport`]), and
+    /// `rejected_ideas` is why it has to reach disk rather than die with the process: a restart
+    /// exists so that the next attempt does not repeat them (D-074). `set_state` alone left the
+    /// field at its default, so a resumed subtask started as blind as the first one — the
+    /// `resuming_from` call in the cycle read a `report` nothing ever wrote.
+    ///
+    /// Takes the state with it, in one write: a `done` subtask whose report is missing and a
+    /// report attached to an open subtask are both states no reader is prepared for, and two
+    /// writes would leave the first one visible after a crash.
+    ///
+    /// # Errors
+    /// The id is not in the tree, or the write fails.
+    pub fn set_report(
+        &mut self,
+        id: &SubtaskId,
+        state: SubtaskState,
+        report: SubtaskReport,
+        at: Timestamp,
+    ) -> Result<(), PlanError> {
+        let subtask = find_mut(&mut self.subtasks, id)
+            .ok_or_else(|| PlanError::UnknownSubtask { id: id.to_string() })?;
+        subtask.state = state;
+        subtask.report = Some(report);
         subtask.updated_at = at;
         self.write()
     }
@@ -735,6 +764,79 @@ mod tests {
         )
         .expect("write");
         (dir, root)
+    }
+
+    #[test]
+    fn a_closed_subtask_keeps_its_report_on_disk() {
+        // The report is the only thing the next attempt inherits, and `rejected_ideas` is why it
+        // must reach the tree rather than die with the process (D-074). `set_state` alone left
+        // the field `None`, so `resuming_from` in the cycle always received nothing.
+        let (dir, root) = fixture(&[sub("01ARZ3NDEKTSV4RRFFQ69G5FAA", &[])]);
+        let mut plan = Plan::load(&root, 2).expect("load");
+        let id = plan.subtasks()[0].id.clone();
+        let report = SubtaskReport {
+            outcome: "added the parser".to_string(),
+            rejected_ideas: vec!["rewriting the lexer".to_string()],
+            ..SubtaskReport::default()
+        };
+        plan.set_report(&id, SubtaskState::Done, report.clone(), crate::time::now())
+            .expect("write");
+
+        // Read the file rather than the in-memory tree: the field being set in memory is not the
+        // property under test — surviving the process is.
+        let reloaded = Plan::load(&root, 2).expect("reload");
+        let subtask = reloaded.subtask(&id).expect("the subtask");
+        assert_eq!(subtask.state, SubtaskState::Done);
+        assert_eq!(subtask.report.as_ref(), Some(&report));
+        drop(dir);
+    }
+
+    #[test]
+    fn a_tree_written_without_a_report_still_loads() {
+        // Every `TASKS.json` on disk today has no `report` key, because nothing ever wrote one.
+        // The field has `serde(default)` for that reason, and the property is worth pinning: a
+        // subtask that cannot be loaded is a task that cannot be resumed at all.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("repo");
+        let agent = root.join(".agent");
+        std::fs::create_dir_all(&agent).expect("mkdir");
+        std::fs::write(agent.join("ACCEPTANCE.md"), "# acceptance\n").expect("write");
+        std::fs::write(
+            agent.join("TASKS.json"),
+            r#"{"v":1,"subtasks":[{
+                "id":"sub_01ARZ3NDEKTSV4RRFFQ69G5FAA",
+                "depth":1,
+                "title":"t",
+                "goal":"g",
+                "dod":{"statement":"s","checks":[{"id":"ok","command":"true","required":true}],"review":false},
+                "state":"done",
+                "created_at":"2026-01-01T00:00:00Z",
+                "updated_at":"2026-01-01T00:00:00Z"
+            }]}"#,
+        )
+        .expect("write");
+        let plan = Plan::load(&root, 2).expect("a tree without a report must load");
+        let subtask = &plan.subtasks()[0];
+        assert_eq!(subtask.state, SubtaskState::Done);
+        assert_eq!(subtask.report, None);
+        drop(dir);
+    }
+
+    #[test]
+    fn a_report_for_an_unknown_subtask_is_refused() {
+        let (dir, root) = fixture(&[sub("01ARZ3NDEKTSV4RRFFQ69G5FAA", &[])]);
+        let mut plan = Plan::load(&root, 2).expect("load");
+        let ghost = SubtaskId::parse("sub_01ARZ3NDEKTSV4RRFFQ69G5FAB").expect("id");
+        let error = plan
+            .set_report(
+                &ghost,
+                SubtaskState::Done,
+                SubtaskReport::default(),
+                crate::time::now(),
+            )
+            .expect_err("unknown");
+        assert!(matches!(error, PlanError::UnknownSubtask { .. }), "{error}");
+        drop(dir);
     }
 
     #[test]

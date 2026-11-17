@@ -983,7 +983,14 @@ fn describe_result(payload: &Value) -> String {
     ];
 
     if let Some(observation) = payload.get("observation").and_then(Value::as_str) {
-        return truncate(&first_line(observation), 200);
+        // A `shell` result's observation starts with a `--- stdout ---` label, so its first line
+        // says nothing: the whole transcript used to render as `shell: --- stdout ---`, which made
+        // `immortality log` useless for reading a run. The structured fields answer the question
+        // the label cannot — "what ran, and how did it end" — so they win when the first line is
+        // one of the tool's own section labels.
+        if !is_section_label(observation) {
+            return truncate(&first_line(observation), 200);
+        }
     }
 
     let mut parts: Vec<String> = Vec::new();
@@ -1021,8 +1028,16 @@ fn describe_result(payload: &Value) -> String {
     }
 
     if parts.is_empty() {
-        // No known field: show the compact form rather than an empty result line, which would
-        // read as a tool that did nothing.
+        // No known field. Recorded before the journal kept `data`, a result has only
+        // `observation`, so the labels have to be skipped here or an old transcript still reads
+        // `observation=--- stdout ---` — the same blindness in a different spelling.
+        if let Some(text) = payload.get("observation").and_then(Value::as_str)
+            && let Some(line) = first_content_line(text)
+        {
+            return truncate(&line, 200);
+        }
+        // Show the compact form rather than an empty result line, which would read as a tool that
+        // did nothing.
         for (key, value) in payload
             .as_object()
             .map(|object| object.iter().collect::<Vec<_>>())
@@ -1089,6 +1104,46 @@ fn first_line(text: &str) -> String {
         .find(|line| !line.trim().is_empty())
         .unwrap_or_default()
         .to_string()
+}
+
+/// Whether a `shell` observation opens with one of the section labels this tool writes itself.
+///
+/// The first line of a `shell` result is a label rather than a result: `--- stdout ---`, or the
+/// timeout and background-process notices that precede it. Rendering that as the summary is what
+/// made every command in a transcript read as `shell: --- stdout ---`.
+///
+/// The bracket summary (`[exited 1 in 0.5 s, 22 line(s) …]`) counts as well. It is informative,
+/// but the structured `command` and `exit_code` fields say the same thing in fewer characters and
+/// include the command, which the bracket does not.
+fn is_section_label(observation: &str) -> bool {
+    let first = first_line(observation);
+    first.starts_with("--- ") || first.starts_with("The command ") || is_bracket_summary(&first)
+}
+
+/// Whether a line is the `shell` tool's own `[exited N in X s, …]` summary.
+fn is_bracket_summary(line: &str) -> bool {
+    line.starts_with("[exited ") || line.starts_with("[killed ") || line.starts_with("[timed out ")
+}
+
+/// The first line of an observation that carries information rather than scaffolding.
+///
+/// A `shell` result is written as a sequence of labelled sections — `--- stdout ---`, the body,
+/// maybe `--- stderr ---` — so the first line alone is a label. A record that has nothing but
+/// this text (any record written before the journal kept `data`) has to skip the scaffolding, or
+/// the transcript says `observation=--- stdout ---` for every command in it.
+fn first_content_line(observation: &str) -> Option<String> {
+    observation
+        .lines()
+        .map(str::trim)
+        .find(|line| {
+            !line.is_empty()
+                && !line.starts_with("--- ")
+                && !is_bracket_summary(line)
+                && !line.starts_with("The command ")
+                && !line.starts_with("This command is a pipeline")
+                && !line.starts_with('…')
+        })
+        .map(str::to_string)
 }
 
 /// A string field, or a placeholder rather than a panic.
@@ -1400,6 +1455,58 @@ mod tests {
         assert!(out.contains("cargo test"), "{out}");
         assert!(out.contains("exit 0"), "{out}");
         assert!(!out.contains("duration_ms"), "raw keys are not for humans: {out}");
+    }
+
+    #[test]
+    fn a_shell_observation_does_not_render_as_its_own_stdout_label() {
+        // The defect this pins, measured on the `roomly` run: a shell observation starts with
+        // `--- stdout ---`, and the renderer took the first line as the summary. Every command in
+        // the transcript read `shell: --- stdout ---` — 97 of 100 of them — so `immortality log`
+        // showed nothing about almost any step.
+        let out = rendered(&json!({
+            "seq": 9, "kind": "tool_call_completed",
+            "payload": {
+                "call": "c",
+                "command": "bundle exec rspec",
+                "exit_code": 1,
+                "observation": "[exited 1 in 0.5 s, 22 line(s) of stdout, 0 of stderr]\n\n--- stdout ---\n16 examples, 16 failures\n"
+            }
+        }));
+        assert!(
+            !out.contains("shell: --- stdout ---"),
+            "the label must not be the summary: {out}"
+        );
+        assert!(out.contains("bundle exec rspec"), "{out}");
+        assert!(out.contains("exit 1"), "{out}");
+    }
+
+    #[test]
+    fn an_old_record_with_only_a_stdout_label_still_shows_the_output() {
+        // Records written before the journal kept `data` carry nothing but the text. There is no
+        // `command` and no `exit_code` to prefer, so the renderer has to skip the tool's own
+        // labels itself — otherwise an old transcript keeps saying `observation=--- stdout ---`,
+        // which is the same blindness in a different spelling. Measured on `roomly/.agent`:
+        // 657 records, all of them shaped like this.
+        let out = rendered(&json!({
+            "seq": 9, "kind": "tool_call_completed",
+            "payload": {
+                "call": "c",
+                "observation": "--- stdout ---\n16 examples, 16 failures\n--- stderr ---\n"
+            }
+        }));
+        assert!(out.contains("16 examples, 16 failures"), "{out}");
+        assert!(!out.contains("--- stdout ---"), "{out}");
+    }
+
+    #[test]
+    fn a_shell_observation_whose_first_line_is_a_labelless_result_still_wins() {
+        // The other side of the same rule: not every shell observation opens with a label. When
+        // the tool hands over prose, that prose is still the most useful single line.
+        let out = rendered(&json!({
+            "seq": 9, "kind": "tool_call_completed",
+            "payload": {"call": "c", "observation": "wrote 12 line(s) to src/lib.rs\n"}
+        }));
+        assert!(out.contains("wrote 12 line(s) to src/lib.rs"), "{out}");
     }
 
     #[test]

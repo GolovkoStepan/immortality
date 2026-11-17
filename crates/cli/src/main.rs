@@ -445,6 +445,8 @@ async fn plan_command(project: Option<String>, goal: Option<String>, force: bool
         params["goal"] = serde_json::json!(goal);
         params["force"] = serde_json::json!(force);
     }
+    // With a goal the daemon calls the planner before it answers; without one it reports the tree
+    // already on disk. `Client::request` picks the deadline from that shape.
     let result = take(client.request("plan", params).await?)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&result)?);

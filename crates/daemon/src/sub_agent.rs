@@ -148,6 +148,8 @@ impl BriefRunner {
             gate: Arc::clone(&parent.gate),
             system_prompt: parent.system_prompt.clone(),
             max_tool_output_bytes: parent.max_tool_output_bytes,
+            max_completion_tokens: parent.max_completion_tokens,
+            enable_thinking: parent.enable_thinking,
             budget: parent.budget,
             limits: AttemptLimits {
                 max_steps: delegation.max_steps.max(1),

@@ -181,6 +181,22 @@ fn fallback_addition(repo: &GitRepo, path: &str) -> String {
     out
 }
 
+/// The default answer budget for [`ModelReviewer`].
+///
+/// # The defect this replaces
+///
+/// The reviewer used to cap itself at 1024 tokens, the number that fits a tool call. A reviewer is
+/// not a tool call: it is handed the definition of done and a diff and asked to explain itself, so
+/// a large subtask produces a long answer. Measured on `qna_rails` (2026-11-16): the reviewer
+/// stopped at `finish_reason=length` after 3727 characters of content, the gate turned that into
+/// `review_rejected: the reviewer could not be called`, and the subtask was blocked — with its
+/// document written and its checks green. The truncation was invisible in the verdict: an input
+/// that was merely too long to review reads exactly like a change that failed review.
+///
+/// 4096 rather than the executor's 8192: a review is one argument, not a file being written, and a
+/// reviewer that needs eight thousand tokens is describing a change nobody wants merged.
+pub const REVIEW_MAX_TOKENS: u32 = 4096;
+
 /// The production [`Reviewer`]: one model call, no tools.
 ///
 /// The absence of tools is the enforcement of "the reviewer cannot edit code". A sentence in the
@@ -202,8 +218,19 @@ impl ModelReviewer {
         Self {
             model,
             model_name: model_name.into(),
-            max_tokens: 1024,
+            max_tokens: REVIEW_MAX_TOKENS,
         }
+    }
+
+    /// A reviewer whose answer is capped at `max_tokens`.
+    ///
+    /// The cap is the operator's, not this type's: a reviewer asked to judge a large diff writes
+    /// free prose, and the number that fits a tool call does not fit it. See
+    /// [`REVIEW_MAX_TOKENS`] for the defect.
+    #[must_use]
+    pub const fn with_max_tokens(mut self, max_tokens: u32) -> Self {
+        self.max_tokens = max_tokens;
+        self
     }
 }
 
@@ -476,5 +503,62 @@ mod tests {
     fn no_base_means_head() {
         assert_eq!(attempt_base(None), None);
         assert_eq!(attempt_base(Some("abc123")), Some("abc123".to_string()));
+    }
+
+    /// A model that answers "approved" and remembers what it was asked.
+    #[derive(Debug)]
+    struct Recorder {
+        asked: std::sync::Mutex<Vec<immortality_llm::wire::ChatRequest>>,
+    }
+
+    impl Model for Recorder {
+        fn complete(
+            &self,
+            request: &immortality_llm::wire::ChatRequest,
+        ) -> Result<crate::runner::Reply, String> {
+            self.asked.lock().expect("lock").push(request.clone());
+            Ok(crate::runner::Reply::text("APPROVED"))
+        }
+    }
+
+    #[test]
+    fn the_reviewers_budget_is_the_operators_not_a_tool_calls() {
+        // The defect: the reviewer capped itself at 1024 tokens, the number that fits a tool call.
+        // On `qna_rails` it stopped at `finish_reason=length` after 3727 characters, the gate read
+        // that as `review_rejected: the reviewer could not be called`, and a subtask with its
+        // document written and its checks green was blocked. A too-long input and a change that
+        // failed review must not produce the same verdict.
+        let recorder = Arc::new(Recorder {
+            asked: std::sync::Mutex::new(Vec::new()),
+        });
+
+        // The default is the reviewer's own, and it is bigger than a tool call's.
+        let reviewer = ModelReviewer::new(Arc::clone(&recorder) as Arc<dyn Model>, "utility");
+        assert!(
+            reviewer.max_tokens > immortality_llm::wire::DEFAULT_MAX_TOKENS,
+            "a review is prose and cannot be capped at a tool call's budget"
+        );
+        reviewer
+            .review(&ReviewRequest {
+                statement: "docs/services.md exists".to_string(),
+                diff: immortality_core::gate::Diff::default(),
+            })
+            .expect("review");
+        {
+            let asked = recorder.asked.lock().expect("lock");
+            assert_eq!(asked.len(), 1);
+            assert_eq!(asked[0].max_tokens, Some(REVIEW_MAX_TOKENS));
+        }
+
+        // And the operator's field reaches this type, so one number sizes every completion.
+        ModelReviewer::new(Arc::clone(&recorder) as Arc<dyn Model>, "utility")
+            .with_max_tokens(20_000)
+            .review(&ReviewRequest {
+                statement: "docs/services.md exists".to_string(),
+                diff: immortality_core::gate::Diff::default(),
+            })
+            .expect("review");
+        let asked = recorder.asked.lock().expect("lock");
+        assert_eq!(asked[1].max_tokens, Some(20_000));
     }
 }

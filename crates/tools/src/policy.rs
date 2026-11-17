@@ -618,6 +618,32 @@ impl PolicyGate {
             let Some(resolved) = self.resolve(&used.path) else {
                 return Verdict::Denied(Self::denial_for_unresolvable(used));
             };
+
+            // A path the command only *reads* is judged by the read rules, even when some other
+            // part of the same line mutates. `Effect` is a property of the whole command, and
+            // `cd` alone makes it `Mutate` — so every shell line that starts with `cd`, which is
+            // how a shell reaches a directory, used to send its reads through this function.
+            //
+            // The live cost on `qna_rails` (2026-11-16): `cd <worktree> && cat .env.sample` was
+            // denied as "the path is protected by the deny list (matched `**/.env*`)", because
+            // `**/.env*` is an operator's *write* glob and this function applied it to a read.
+            // `.env.sample` is committed to the repository and exists to be read. Three attempts
+            // spent their step budgets on refused reads and closed without writing a byte. The
+            // other face is containment: `cd app && cd ../lib && ls` was refused as "the path is
+            // outside the task worktree" for `../lib`, though `cd` writes nothing.
+            //
+            // [`PathUse::write`] is the flag that carries the difference, and the write rules
+            // below are what it selects. Reads were already confined to the workspace root and
+            // already honour `deny_read_globs` in [`Self::check_reads`], so nothing is waived by
+            // this branch — the read rules are simply the right ones.
+            if !used.write {
+                let verdict = self.check_reads(std::slice::from_ref(used));
+                if verdict.is_denied() {
+                    return verdict;
+                }
+                continue;
+            }
+
             let Some(relative) = self.relative(&resolved) else {
                 return Verdict::Denied(
                     Denial::new("the path is outside the task worktree", &used.path)
@@ -828,8 +854,15 @@ impl PolicyGate {
             key: format!("external:{subject}"),
             reason: reason.to_string(),
             auto_approvable,
-            continues: "The call did not run. Continue with work that does not need approval, \
-                        and the human's answer will arrive as an observation."
+            // Nothing is queued for the human by this path, so the message must not say one was
+            // asked. It used to promise "the human's answer will arrive as an observation", and a
+            // live run showed the cost: the model wrote in its own `NOTES.md` that "the human was
+            // asked", a human opening `immortality escalations` saw an empty queue, and the work
+            // continued on an assumption nobody had confirmed. Asking is `escalate`'s job; this is
+            // a refusal with a reason, and the model has to know which of the two it got (D-141).
+            continues: "The call did not run: no human was asked, because this path only refuses. \
+                        Continue with work that does not need it, or ask with the `escalate` tool \
+                        if the answer is required."
                 .to_string(),
         })
     }
@@ -1000,6 +1033,56 @@ mod tests {
         // A task legitimately reads a sibling project or the shared config.
         let verdict = gate().check(Effect::Read, &[PathUse::read("/tmp/ws/other/file.rs")]);
         assert_eq!(verdict, Verdict::Allowed);
+    }
+
+    #[test]
+    fn a_read_inside_a_mutating_command_is_not_judged_as_a_write() {
+        // The live failure on `qna_rails`, 2026-11-16 15:59 and 16:06. The model ran
+        // `cd <worktree> && cat .env.sample; echo ...; cat .env.test` — a command that reads two
+        // files — and the gate answered `denied_by_policy: the path is protected by the deny list
+        // (matched **/.env*)`. `cd` is `Effect::Mutate`, so `check_writes` judged every path in
+        // the line, and `**/.env*` is a *write* glob the operator chose so an env file cannot be
+        // rewritten. Reading `.env.sample` is the whole point of a sample file: it is committed
+        // to the repository and documents which variables a developer must set.
+        //
+        // The cost was not the read. Two attempts in a row spent their full step budget on reads,
+        // were refused twice on this rule, and closed without writing a byte; the third attempt
+        // repeated it. `path_use.write` is the flag that separates the two, and a read inside a
+        // mutating command must be judged by the read rules.
+        let verdict = gate().check(
+            Effect::Mutate,
+            &[PathUse::read(".env.sample"), PathUse::read(".env.test")],
+        );
+        assert_eq!(
+            verdict,
+            Verdict::Allowed,
+            "a read in a mutating command was judged as a write: {verdict:?}"
+        );
+    }
+
+    #[test]
+    fn a_write_to_an_env_file_is_still_denied_inside_a_mutating_command() {
+        // The other half, so the fix above cannot be "stop checking the deny list": a command
+        // that *does* write `.env` must still be refused, in the same shape as the read above.
+        let verdict = gate().check(
+            Effect::Mutate,
+            &[PathUse::read(".env.sample"), PathUse::write(".env")],
+        );
+        assert!(verdict.is_denied(), "{verdict:?}");
+        let observation = verdict.observation().expect("an observation");
+        assert!(observation.contains(".env"), "{observation}");
+    }
+
+    #[test]
+    fn a_read_outside_the_worktree_inside_a_mutating_command_is_allowed() {
+        // The same defect's second face, at 16:03: `cd app && ... && cd ../lib && ls -R .` was
+        // refused as "the path is outside the task worktree" with subject `../lib`. `..` is how a
+        // shell walks a repository, and `cd ../lib` changes the directory rather than writing to
+        // it: `cd` is recorded as `PathUse::read`. Containment for *writes* exists so a mutation
+        // cannot escape the worktree; a directory a later command reads is judged by the read
+        // rules, which allow anything under the workspace root.
+        let verdict = gate().check(Effect::Mutate, &[PathUse::read("../lib")]);
+        assert_eq!(verdict, Verdict::Allowed, "{verdict:?}");
     }
 
     #[test]
@@ -1185,6 +1268,29 @@ mod tests {
         let verdict = gate().check_command("frobnicate --all");
         assert!(matches!(verdict, Verdict::Escalated(_)), "{verdict:?}");
         assert!(verdict.observation().unwrap().contains("not a known command"));
+    }
+
+    #[test]
+    fn an_escalation_does_not_claim_a_human_was_asked() {
+        // A `kill -9`-free live run showed the cost of the old wording: the refusal said "the
+        // human's answer will arrive as an observation", the model wrote in its own notes that
+        // "the human was asked", and `immortality escalations` showed an empty queue — because
+        // this path refuses without queueing anything. A model has to be able to tell a question
+        // from a refusal, or it builds the rest of the subtask on an answer nobody gave (D-141).
+        let verdict = gate().check_command("frobnicate --all");
+        let observation = verdict.observation().expect("an observation");
+        assert!(
+            !observation.contains("answer will arrive"),
+            "the refusal must not promise an answer it never queued: {observation}"
+        );
+        assert!(
+            observation.contains("no human was asked"),
+            "the model must be told that nobody was asked: {observation}"
+        );
+        assert!(
+            observation.contains("`escalate`"),
+            "it must also be told which tool does ask: {observation}"
+        );
     }
 
     #[test]
