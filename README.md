@@ -107,6 +107,62 @@ CLI-клиент подключается к демону по unix-сокету
 `/`, и искать `.agent/config.toml` от него бессмысленно (D-119). Полный разбор ключей и значений —
 [docs/design.md](docs/design.md) §3.
 
+## Проверки: что запускать перед коммитом и перед тегом
+
+Есть два разных гейта, и путать их дорого: `v0.1.3` был помечен тегом при красном CI, потому что
+локальный гейт состоял из трёх проверок, а в CI их было четыре.
+
+### Перед коммитом
+
+```sh
+cargo fmt --all
+cargo clippy --workspace --all-targets --offline
+cargo test --workspace --offline
+```
+
+Это быстро и покрывает то, что ломается от правки. `--offline` здесь законен: локальный кэш
+тёплый, а сеть для компиляции не нужна.
+
+### Перед тегом или push — всё, что делает CI
+
+```sh
+just ci
+```
+
+`just ci` = `fmt-check` + `lint` + `test` + `audit` + `layering`, то есть **все четыре джоба**
+воркфлоу. Если `just` не установлен (`brew install just`), те же команды по одной:
+
+```sh
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features
+
+# джоб `dependencies`: база уязвимостей, дубликаты версий, лицензии, источники
+cargo deny check advisories bans licenses sources
+
+# джоб `crate layering`: ядро остаётся синхронным и без HTTP-клиентов
+grep -E '^(tokio|reqwest|hyper|immortality-daemon|immortality-tools)' crates/core/Cargo.toml \
+  && echo "core must stay free of async/HTTP dependencies" && exit 1
+```
+
+Проверка зависимостей — **единственная**, которую нельзя запустить офлайн: `cargo deny` тянет
+базу RustSec из сети, и именно поэтому она меняет результат без коммитов. Запись `RUSTSEC-2026-0543`
+(`chrono` неподдерживаем) появилась 2026-11-17 и покрасила уже выпущенный тег. Отсюда правило:
+**перед тегом `just ci` целиком, а не только `cargo test`.**
+
+`cargo deny` установлен не всегда: `cargo install cargo-deny --locked`, версия 0.20.2 или новее
+(конфиг использует `unmaintained`/`unsound` как строки, в старых это другие ключи).
+
+Паритет локального гейта и CI проверяется тестом, а не обещанием:
+`crates/daemon/tests/ci_contract.rs` парсит `justfile` и `.github/workflows/ci.yml` и падает, если
+в CI появился джоб без рецепта в `just ci`, если `audit` перестал запускать полный набор проверок
+или если запись в `ignore` (`deny.toml`) осталась без ссылки на решение `D-NNN` (D-143).
+
+### Linux
+
+`just ci` идёт на macOS и о Linux-джобе молчит. Перед релизом полезно прогнать хотя бы `test` в
+контейнере — рецепт и три неочевидные детали в [docs/linux-check.md](docs/linux-check.md).
+
 ## Документы
 
 | Документ | Содержание |
