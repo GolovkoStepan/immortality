@@ -349,20 +349,35 @@ impl GitRepo {
         reason: &str,
     ) -> Result<Option<Checkpoint>, GitError> {
         let safety = self.hidden_checkpoint(task_branch, reason)?;
-        self.reset_hard(sha)?;
+        self.restore_tree(sha)?;
         Ok(safety)
     }
 
-    /// Move the tree to `sha` and delete what the reset would otherwise leave behind.
+    /// Put the tree at `sha` without moving `HEAD` or the branch it points at.
     ///
     /// No safety checkpoint: this is the second half of [`Self::rollback_to`], and the caller
     /// that takes its own snapshot first — the daemon's L3 path does, because the snapshot has to
     /// be journaled *before* the tree is destroyed — would otherwise take it twice.
     ///
+    /// # Why `read-tree --reset -u` and not `reset --hard`
+    ///
+    /// A hidden checkpoint is a **child** of the branch tip (`commit-tree` with `-p HEAD`), so
+    /// `git reset --hard <snapshot>` moves the branch itself onto that commit. Measured on a live
+    /// run: `agent/<task>` grew a commit named `checkpoint` between two `chore:` commits, carrying
+    /// the work of a subtask that later went `blocked`. D-011 keeps snapshots on
+    /// `agent-ckpt/<task>` precisely so the history a human merges stays readable, and `reset
+    /// --hard` broke that promise from inside the rollback that was supposed to protect it.
+    ///
+    /// `read-tree` sets the index and the worktree to the commit's tree and leaves `HEAD` alone,
+    /// so the rollback restores the same files while the branch stays where the last closed
+    /// subtask left it. Work that was uncommitted when the snapshot was taken comes back as
+    /// uncommitted, which is what it was: the deletion of a tracked file and the creation of an
+    /// untracked one both round-trip, because the index is moved to the snapshot's tree too.
+    ///
     /// # Errors
-    /// `sha` is not a commit, or git refuses the reset. A refusal is reported and not retried:
+    /// `sha` is not a commit, or git refuses the read. A refusal is reported and not retried:
     /// the tree may be half-moved, and continuing is how a run builds on a state nobody knows.
-    pub fn reset_hard(&self, sha: &str) -> Result<(), GitError> {
+    pub fn restore_tree(&self, sha: &str) -> Result<(), GitError> {
         if self
             .git(&["cat-file", "-e", &format!("{sha}^{{commit}}")])
             .is_err()
@@ -372,8 +387,8 @@ impl GitRepo {
                 "checkpoint commit does not exist",
             ));
         }
-        self.git(&["reset", "--hard", sha])?;
-        // Untracked files are not touched by `reset --hard`, and they are exactly the leftovers
+        self.git(&["read-tree", "--reset", "-u", sha])?;
+        // Untracked files are not touched by `read-tree`, and they are exactly the leftovers
         // that make the next attempt fail for reasons nobody understands.
         self.git(&["clean", "-fd"])?;
         Ok(())
@@ -417,6 +432,20 @@ impl GitRepo {
     #[must_use]
     pub fn branch_exists(&self, branch: &str) -> bool {
         self.git(&["rev-parse", "--verify", branch]).is_ok()
+    }
+
+    /// The first parent of `sha`, or `None` when it is a root commit.
+    ///
+    /// Used to place a branch at the commit a hidden snapshot was taken *from*: the snapshot is a
+    /// child of the tip, and a branch created at the snapshot would start its history with a
+    /// commit named `checkpoint` — the one name D-011 keeps off `agent/<task>`.
+    ///
+    /// # Errors
+    /// git failed for a reason other than "no parent" (a missing repository, a bad object).
+    pub fn first_parent(&self, sha: &str) -> Result<Option<String>, GitError> {
+        let out = self.git(&["rev-list", "--parents", "-n", "1", sha])?;
+        // Format: `<sha> <parent>...`, with the parents absent for a root commit.
+        Ok(out.split_whitespace().nth(1).map(str::to_string))
     }
 
     /// Whether a SHA exists in this repository.
@@ -772,7 +801,58 @@ mod tests {
     }
 
     #[test]
-    fn reset_hard_moves_the_tree_without_taking_a_second_snapshot() {
+    fn a_rollback_does_not_move_the_task_branch_onto_the_snapshot() {
+        // A snapshot is a *child* of the branch tip, so `git reset --hard <snapshot>` moves the
+        // branch itself onto it. Measured on a live run: `agent/<task>` grew a commit named
+        // `checkpoint` between two `chore:` commits, carrying the work of a subtask that later
+        // went `blocked`. D-011 keeps snapshots on `agent-ckpt/<task>` precisely so the history a
+        // human merges stays readable, and this is what breaks that promise.
+        let fixture = Fixture::new();
+        fixture.repo.ensure_branch("agent/tsk_1", "main").unwrap();
+        fixture.write("landed.txt", "work a closed subtask committed");
+        fixture
+            .repo
+            .commit_to_branch("agent/tsk_1", "chore: landed work")
+            .unwrap()
+            .expect("a commit");
+        let tip = fixture
+            .repo
+            .git(&["rev-parse", "agent/tsk_1"])
+            .unwrap()
+            .trim()
+            .to_string();
+
+        // A subtask can start on a tree that already carries uncommitted work, which is the case
+        // that makes the snapshot a child of the tip rather than the tip itself.
+        fixture.write("carried.txt", "uncommitted work of an earlier subtask");
+        let base = fixture
+            .repo
+            .hidden_checkpoint("agent/tsk_1", "base")
+            .unwrap()
+            .expect("a baseline");
+        assert_ne!(base.sha, tip, "a dirty tree must produce a new commit");
+
+        // The attempt does work, then loses it.
+        fixture.write("attempt.txt", "work this attempt is about to lose");
+        fixture.repo.restore_tree(&base.sha).unwrap();
+
+        let after = fixture.repo.git(&["rev-parse", "agent/tsk_1"]).unwrap();
+        assert_eq!(
+            after.trim(),
+            tip,
+            "the task branch must never move onto a hidden snapshot"
+        );
+        // The rollback still restored the exact tree: carried work is back, the attempt's is gone.
+        assert!(fixture.dir.path().join("carried.txt").exists());
+        assert_eq!(
+            fixture.read("carried.txt"),
+            "uncommitted work of an earlier subtask"
+        );
+        assert!(!fixture.dir.path().join("attempt.txt").exists());
+    }
+
+    #[test]
+    fn restore_tree_moves_the_tree_without_taking_a_second_snapshot() {
         // The daemon snapshots first (so the discarded work can be journaled before it is gone)
         // and then calls this. A second safety checkpoint here would journal two SHAs for one
         // rollback and leave the caller reading a branch pointer that moved twice.
@@ -786,7 +866,7 @@ mod tests {
         let branch_before = fixture.repo.git(&["rev-parse", "agent-ckpt/tsk_1"]).unwrap();
 
         fixture.write("work.txt", "broken");
-        fixture.repo.reset_hard(&checkpoint.sha).unwrap();
+        fixture.repo.restore_tree(&checkpoint.sha).unwrap();
 
         assert_eq!(fixture.read("work.txt"), "good");
         let branch_after = fixture.repo.git(&["rev-parse", "agent-ckpt/tsk_1"]).unwrap();
@@ -794,13 +874,13 @@ mod tests {
     }
 
     #[test]
-    fn reset_hard_refuses_a_missing_sha_and_leaves_the_tree_alone() {
+    fn restore_tree_refuses_a_missing_sha_and_leaves_the_tree_alone() {
         let fixture = Fixture::new();
         fixture.write("work.txt", "keep me");
         assert!(
             fixture
                 .repo
-                .reset_hard("0000000000000000000000000000000000000000")
+                .restore_tree("0000000000000000000000000000000000000000")
                 .is_err()
         );
         assert_eq!(fixture.read("work.txt"), "keep me");

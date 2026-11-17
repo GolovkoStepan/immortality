@@ -606,9 +606,16 @@ impl<'a> Executor<'a> {
                 &Scope::task(),
             )
             .map_err(|error| format!("cannot journal the rollback marker: {error}"))?;
-        repo.ensure_branch(&self.deps.branch, sha)
+        // The branch is placed at the snapshot's parent, never at the snapshot: a hidden snapshot
+        // is a child of the tip, and `reset --hard` onto it moved `agent/<task>` itself. See
+        // `GitRepo::restore_tree` for the measured consequence.
+        let base = repo
+            .first_parent(sha)
+            .map_err(|error| format!("cannot read the parent of {sha}: {error}"))?
+            .unwrap_or_else(|| sha.to_string());
+        repo.ensure_branch(&self.deps.branch, &base)
             .map_err(|error| format!("cannot check out {}: {error}", self.deps.branch))?;
-        repo.reset_hard(sha)
+        repo.restore_tree(sha)
             .map_err(|error| format!("cannot reset to {sha}: {error}"))?;
         self.base = Some(sha.to_string());
         Ok(format!("rolled the tree back to {sha}"))
