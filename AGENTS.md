@@ -43,9 +43,27 @@ advisories bans licenses sources`, и проверка слоёв: `immortality-
 **любой** push в любую ветку (и на каждый PR), а не только на `main`. macOS-джоб идёт на каждый
 push, а в PR — только с меткой `macos` (это дорогой раннер).
 
-`just ci` = `fmt-check` + `lint` + `test`; `cargo deny` и проверку слоёв он **не** запускает —
-зависимости отдельно проверяет `just audit`, а условие по слоям приходится повторять руками
-(`grep -E '^(tokio|reqwest|hyper|immortality-daemon|immortality-tools)' crates/core/Cargo.toml`).
+## Перед тегом или push — `just ci` целиком
+
+**Урок `v0.1.3`.** Тег был поставлен при красном джобе `dependencies`. Локально ничего не
+«пропустили»: `just ci` был объявлен как `fmt-check lint test`, то есть **не** запускал ни
+`cargo deny`, ни проверку слоёв, хотя комментарий над ним обещал «exactly what GitHub Actions
+runs». Комментарий не падает, тест — падает.
+
+Правило: **перед тегом, push в `master` или релизом гоняется `just ci`, а не только `cargo test`.**
+
+```sh
+just ci     # fmt-check + lint + test + audit + layering — все четыре джоба
+```
+
+Если `just` нет: `brew install just`. `cargo deny` — `cargo install cargo-deny --locked`;
+он единственный требует сеть (база RustSec тянется на каждом прогоне, поэтому результат меняется
+без коммитов — так и покраснел `v0.1.3`).
+
+Паритет держит `crates/daemon/tests/ci_contract.rs`: он парсит `justfile` и `ci.yml` и падает,
+если джоб есть в CI и нет в `ci`, если `audit` сузился, или если запись в `deny.toml` `ignore`
+осталась без `D-NNN` в комментарии над ней. Добавляешь джоб в CI — добавь рецепт, строку в
+`JOB_COVERAGE` и зависимость `ci`.
 
 `just ci` идёт на macOS и о Linux-джобе молчит. Если push покраснел там, а локально всё зелёное,
 прогон воспроизводится контейнером — рецепт в [`docs/linux-check.md`](docs/linux-check.md).
