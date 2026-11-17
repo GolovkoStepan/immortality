@@ -4503,3 +4503,77 @@ core` это позволяет.
 `DoD`-отказ защищает вердикт о работе, а не ход выполнения. Хранить `data` отдельным полем записи
 `{"data": …, "observation": …}`: рендерер и детекторы уже читают плоский `payload`, и вложенность
 заставила бы их знать про обёртку.
+
+## D-136. Отчёт закрытой подзадачи пишется в `TASKS.json`, и первый бриф после рестарта его цитирует
+
+**Что было.** `Subtask::report` документирован как «written to state when it closes» и «the
+*only* thing the next subtask inherits». `cycle.rs` его **читал** —
+`.resuming_from(running.report.clone().unwrap_or_default())` — а писать было некому: при
+закрытии подзадачи вызывался `Plan::set_state`, который трогает `state` и `updated_at` и
+`report` оставляет `None`. Замер на `roomly`: у обеих `done`-подзадач
+(`sub_01M7MA1XJA1X2HSRA64APJWVSF`, `sub_01M7MA1XJA8RVTF00XK3WS49CN`) в `TASKS.json` стояло
+`"report": null`.
+
+**Почему это дефект, а не косметика.** `rejected_ideas` существуют ровно затем, чтобы пережить
+контекст, который их породил (D-074). Внутри одного процесса они накапливались
+(`AttemptSession::absorb`), а с концом процесса исчезали: `AttemptSession` нового процесса
+начинался с `SubtaskReport::default()`. Модель после рестарта заново предлагала то, что уже
+отвергли, — то самое, ради предотвращения чего написаны `restart::strategy` и
+`MAX_REJECTED_IDEAS`.
+
+**Вторая половина того же дефекта.** Даже с отчётом в дереве первый бриф возобновлённой сессии
+его бы не увидел: `AttemptSession::strategy` при `last: None` возвращал `self.seed` как есть.
+`restart::strategy` вызывается только когда есть [`Cause`], а у первого шага нового процесса
+причины нет — её не было, здесь ничего не падало. То есть `resuming_from` обещал в докстроке
+ровно то, чего `strategy()` не делал.
+
+**Как теперь.** `Plan::set_report(id, state, report, at)` пишет состояние и отчёт **одной**
+записью: `done` без отчёта и отчёт у открытой подзадачи — оба состояния, к которым читатель не
+готов, и две записи оставили бы первое видимым после краха. `AttemptSession::drive` отдаёт
+накопленный отчёт в `SessionEnd::report` — не `outcome.report`, который описывает только
+последнюю попытку. `cycle.rs` передаёт его в `set_report` при `Stop::Done` **и** при
+`Stop::Exhausted` (подзадача, у которой кончились попытки, — первая, которую человек вернёт
+руками, и её следующий бриф нуждается в списке отказов сильнее всех). Блок «эти подходы уже
+провалились» вынесен в `restart::failed_before` и переиспользуется `restart::resumed`, который
+теперь зовёт `AttemptSession::strategy` при `last: None`.
+
+**Открытая подзадача отчёта не имеет**, и это честная граница: `kill -9` посреди подзадачи не
+оставляет durable-знания, а причина смерти — в журнале (`attempt_failed`). Придумывать отчёт из
+последней попытки значило бы утверждать, что подзадача чему-то научилась, чего никто не проверял.
+
+**Тесты.**
+- `a_closed_subtask_keeps_its_report_on_disk` (`core`): отчёт перечитывается из файла, а не из
+  памяти, — свойство под тестом именно переживание процесса.
+- `a_report_for_an_unknown_subtask_is_refused` (`core`): чужой id отвергается, а не пишется молча.
+- `a_tree_written_without_a_report_still_loads` (`core`): старый `TASKS.json` без ключа читается
+  (`serde(default)`); файл без отчёта — это файл, который нельзя возобновить.
+- `a_closed_subtask_leaves_its_report_in_the_tree` (`daemon`, `tests/start.rs`): сквозь
+  `start::start` у `done`-подзадачи в файле есть отчёт с непустым `outcome`.
+- `the_first_attempt_of_a_resumed_subtask_quotes_what_an_earlier_process_rejected` (`daemon`):
+  **первый** запрос возобновлённой сессии содержит и стратегию, и отвергнутые идеи.
+- `a_resumed_subtask_quotes_what_earlier_processes_ruled_out` и
+  `a_resumed_subtask_with_nothing_rejected_is_just_its_strategy` (`core`): текст `resumed` и
+  отсутствие пустого заголовка, когда отвергать нечего.
+
+**Саботаж.**
+- `set_state` вместо `set_report` при `Stop::Done` → `a_closed_subtask_leaves_its_report_in_the_tree`
+  падает на «a `done` subtask must keep its report».
+- `strategy()` возвращает `self.seed` при `last: None` → новый тест на первый бриф падает с
+  «the first brief of a resumed subtask dropped what was already rejected».
+- `set_report` пишет `SubtaskReport { outcome, ..Default }` (собирается, в отличие от «не
+  использовать параметр», который ловится `-D unused-variables`) →
+  `a_closed_subtask_keeps_its_report_on_disk` падает на пустом `rejected_ideas`.
+
+**Найденное при саботаже.** Существующий `a_resumed_subtask_starts_from_the_report_it_inherited`
+проверял **второй** запрос, где работает обычный `restart::strategy` с `Cause`. Он проходил и
+без правки, поэтому не покрывал первую половину пути; для неё добавлен отдельный тест.
+Первый вариант того же теста падал с `got ""` вместо имени метки — исправлено на первую
+**непустую** строку, потому что рендерер пропускает пустые так же.
+
+**Отвергнуто.** Писать отчёт из журнала при загрузке дерева: журнал — источник истины для
+попыток (`Spent`), но отчёт — свойство закрытой подзадачи, и реконструкция сделала бы `TASKS.json`
+производным кэшем, которым он намеренно не является (D-078). Отчёт для `Abandoned`/`Blocked` по
+таймауту git: там нечего сообщать, и пустой отчёт неотличим от «ничего не пробовали».
+Хранить `rejected_ideas` в журнале отдельным видом записи: они уже есть в `attempt_failed.why` и
+в `attempt_restarted`, а второй источник разошёлся бы с первым — ровно класс дефекта, который
+эта правка закрывает.

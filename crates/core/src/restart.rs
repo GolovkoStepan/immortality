@@ -497,16 +497,51 @@ pub fn strategy(cause: &Cause, previous: &str, rejected: &[String]) -> String {
 
     // The newest are the most relevant, and the order inside the block stays chronological: a
     // list read newest-first is a list a model matches against its own last idea.
+    out.push_str(&failed_before(rejected));
+    out.trim_end().to_string()
+}
+
+/// The "these approaches already failed" block, or nothing when the list is empty.
+///
+/// Split out because it is quoted in two places that must not disagree: the strategy of a retry
+/// (which has a [`Cause`] to explain) and the strategy of a *resumed* subtask, whose first attempt
+/// has no cause in this process but does have ideas an earlier process already ruled out. Letting
+/// that first attempt lose the block is how a restart re-proposes the very thing it was restarted
+/// over — measured on `qna_rails`, where two attempts labelled `gate` named the same rejected
+/// approach in turn.
+fn failed_before(rejected: &[String]) -> String {
+    use std::fmt::Write as _;
+
     let start = rejected.len().saturating_sub(MAX_REJECTED_IDEAS);
     let rejected = &rejected[start..];
-    if !rejected.is_empty() {
-        out.push('\n');
-        let _ = writeln!(out, "These approaches already failed for this subtask:");
-        for idea in rejected {
-            let _ = writeln!(out, "- {}", one_line(idea, MAX_QUOTE_CHARS));
+    if rejected.is_empty() {
+        return String::new();
+    }
+    let mut out = String::new();
+    out.push('\n');
+    let _ = writeln!(out, "These approaches already failed for this subtask:");
+    for idea in rejected {
+        let _ = writeln!(out, "- {}", one_line(idea, MAX_QUOTE_CHARS));
+    }
+    out.push('\n');
+    let _ = writeln!(out, "Do not propose them again.");
+    out
+}
+
+/// The strategy for a subtask resumed from a report, when this process has no cause yet.
+///
+/// A resumed subtask's first attempt is not a retry: nothing failed *here*. The only thing worth
+/// quoting is what earlier processes already ruled out, which is exactly what
+/// [`crate::domain::SubtaskReport::rejected_ideas`] exists to carry across a restart (D-074).
+#[must_use]
+pub fn resumed(previous: &str, rejected: &[String]) -> String {
+    let mut out = previous.trim().to_string();
+    let failed = failed_before(rejected);
+    if !failed.is_empty() {
+        if !out.is_empty() {
+            out.push('\n');
         }
-        out.push('\n');
-        let _ = writeln!(out, "Do not propose them again.");
+        out.push_str(failed.trim_start());
     }
     out.trim_end().to_string()
 }

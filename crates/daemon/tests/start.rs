@@ -967,6 +967,47 @@ fn a_brief_that_spends_its_steps_is_reported_as_exhausted_not_done() {
 }
 
 #[test]
+fn a_closed_subtask_leaves_its_report_in_the_tree() {
+    // The report is the only thing a later attempt inherits, and `TASKS.json` is where it has to
+    // live for that to survive a process. `set_state` alone wrote the state and left the field
+    // `None`, so `resuming_from` in the cycle always received an empty report: the promise in
+    // `SubtaskReport`'s own doc comment was never true on disk. Measured on `roomly`, where both
+    // `done` subtasks carried `"report": null`.
+    let fixture = Fixture::new();
+    let subtask = fixture.write_plan(SubtaskState::Pending);
+    let model = Scripted::new(Work::Claim);
+    let state = fixture.state(model);
+
+    let answer = start_now(&state, &json!({ "project": fixture.repo, "goal": GOAL }))
+        .expect("the task must be admitted");
+    let task = answer["task"].as_str().expect("a task id").to_string();
+    fixture.wait_for(&task, TaskState::ReadyForReview);
+    Fixture::wait_until_idle(&state);
+
+    // Read the file, not the in-memory tree: surviving the process is the property under test.
+    let text = std::fs::read_to_string(fixture.agent().join("TASKS.json")).expect("tasks");
+    let body: serde_json::Value = serde_json::from_str(&text).expect("json");
+    let closed = body["subtasks"]
+        .as_array()
+        .expect("subtasks")
+        .iter()
+        .find(|candidate| candidate["id"] == json!(subtask.id.to_string()))
+        .expect("the subtask");
+    assert_eq!(closed["state"], json!("done"));
+    let report = closed
+        .get("report")
+        .filter(|value| !value.is_null())
+        .unwrap_or_else(|| panic!("a `done` subtask must keep its report: {text}"));
+    assert!(
+        report
+            .get("outcome")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|text| !text.is_empty()),
+        "the report has to say what was achieved: {report}"
+    );
+}
+
+#[test]
 fn an_existing_plan_is_run_and_not_replaced_without_force() {
     // The roadmap's contract: a human may rewrite `TASKS.json` before the run. Regenerating it
     // because a goal was also given would silently discard exactly that edit.

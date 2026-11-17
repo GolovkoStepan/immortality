@@ -1114,7 +1114,13 @@ impl<'a> AttemptSession<'a> {
             match restart::decide(outcome.ended(), left) {
                 // Nothing is started, so nothing is written: the stop is the caller's to act on,
                 // and the scheduler owns what a subtask becomes.
-                Decision::Stop(stop) => return Ok(SessionEnd { outcome, stop }),
+                Decision::Stop(stop) => {
+                    return Ok(SessionEnd {
+                        outcome,
+                        stop,
+                        report: self.report.clone(),
+                    });
+                }
                 Decision::Retry(_) => {
                     // The tree stays: a rejected claim is evidence about the work on disk, and
                     // rolling it away throws away the closest thing to a finished subtask.
@@ -1131,6 +1137,7 @@ impl<'a> AttemptSession<'a> {
                             return Ok(SessionEnd {
                                 outcome,
                                 stop: Stop::Blocked(reason),
+                                report: self.report.clone(),
                             });
                         }
                     }
@@ -1143,7 +1150,10 @@ impl<'a> AttemptSession<'a> {
     /// The strategy for the attempt about to start.
     fn strategy(&self) -> String {
         let Some(cause) = self.last.clone() else {
-            return self.seed.clone();
+            // The first attempt of this process. A subtask resumed from a report is not starting
+            // fresh: an earlier process already ruled out these approaches, and quoting them is
+            // the whole reason the report survives the restart.
+            return restart::resumed(&self.seed, &self.report.rejected_ideas);
         };
         restart::strategy(&cause, &self.seed, &self.report.rejected_ideas)
     }
@@ -1370,12 +1380,21 @@ impl<'a> AttemptSession<'a> {
 ///
 /// Both fields are mandatory: every stop is reached after an attempt ran, and a stop without the
 /// attempt that caused it is a message a human cannot act on.
+/// What ended a session, and what it learned.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionEnd {
     /// The attempt that ended the loop.
     pub outcome: RunOutcome,
     /// Why no further attempt is started.
     pub stop: Stop,
+    /// Everything the session accumulated, not only the last attempt's report.
+    ///
+    /// `outcome.report` describes the attempt that ended the loop; this one also carries what
+    /// earlier attempts learned, and `rejected_ideas` is the part that has to survive a process
+    /// — a restart exists so that the next attempt does not repeat them. Without this field the
+    /// caller has nothing to write into the tree, and a resumed subtask starts as blind as the
+    /// first one.
+    pub report: SubtaskReport,
 }
 
 /// What putting the tree back produced.
@@ -6037,6 +6056,39 @@ mod tests {
         assert!(
             system.contains("regenerating the parser from scratch"),
             "{system}"
+        );
+        assert!(system.contains("Do not propose them again"), "{system}");
+    }
+
+    #[test]
+    fn the_first_attempt_of_a_resumed_subtask_quotes_what_an_earlier_process_rejected() {
+        // The other half of the promise, and the half a retry cannot cover: the *first* brief of
+        // a resumed session has no `Cause`, so it never goes through `restart::strategy`. It used
+        // to return the seed untouched, so a subtask reopened by a human — or resumed after a
+        // restart — began as blind as its very first attempt, which is the opposite of what
+        // `resuming_from`'s own doc comment says.
+        let model = Scripted::new(vec![Ok(finish())]);
+        let (dir, runner) = runner(
+            Arc::clone(&model) as Arc<dyn Model>,
+            registry(vec![Arc::new(Touch)]),
+        );
+        let mut journal = journal(&dir);
+        let mut report = SubtaskReport::new("nothing yet");
+        report.rejected_ideas.push("rewriting the lexer".to_string());
+        runner
+            .session(&subtask(), 2)
+            .with_strategy("make the specs pass")
+            .resuming_from(report)
+            .drive(allowance(3, 1), &mut journal)
+            .expect("session");
+
+        let requests = model.requests();
+        let first = requests.first().expect("the first attempt");
+        let system = first.messages[0].content.as_deref().unwrap_or("");
+        assert!(system.contains("make the specs pass"), "{system}");
+        assert!(
+            system.contains("rewriting the lexer"),
+            "the first brief of a resumed subtask dropped what was already rejected: {system}"
         );
         assert!(system.contains("Do not propose them again"), "{system}");
     }

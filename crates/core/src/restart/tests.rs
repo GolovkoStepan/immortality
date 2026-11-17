@@ -141,6 +141,26 @@ fn a_first_attempt_has_no_previous_strategy_to_quote() {
 }
 
 #[test]
+fn a_resumed_subtask_quotes_what_earlier_processes_ruled_out() {
+    // A resumed subtask's first attempt in a new process is not a retry: nothing failed *here*.
+    // The one thing worth quoting is what earlier attempts already ruled out, and dropping it is
+    // how a restart re-proposes the idea it was restarted over (D-074).
+    let text = resumed("make the specs pass", &["rewriting the lexer".to_string()]);
+    assert!(text.contains("make the specs pass"), "{text}");
+    assert!(text.contains("These approaches already failed"), "{text}");
+    assert!(text.contains("- rewriting the lexer"), "{text}");
+    assert!(text.contains("Do not propose them again"), "{text}");
+}
+
+#[test]
+fn a_resumed_subtask_with_nothing_rejected_is_just_its_strategy() {
+    // The common case for a subtask a human reopened: a report exists, but it rejected nothing.
+    // The text must not gain an empty header or trailing blank space.
+    assert_eq!(resumed("make the specs pass", &[]), "make the specs pass");
+    assert_eq!(resumed("", &[]), "");
+}
+
+#[test]
 fn rejected_ideas_are_quoted_and_capped_to_the_newest() {
     let rejected: Vec<String> = (0..MAX_REJECTED_IDEAS + 3)
         .map(|index| format!("idea {index}"))
