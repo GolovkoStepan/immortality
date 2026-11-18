@@ -101,6 +101,7 @@ impl Fixture {
             program: self.dir.path().join("bin").join("immortality"),
             state_root: self.dir.path().join("state"),
             log_path: self.dir.path().join("state").join("logs").join("daemon.log"),
+            path: None,
         }
     }
 }

@@ -1202,6 +1202,55 @@ fn a_second_task_of_a_running_project_is_refused_before_its_first_byte() {
 }
 
 #[test]
+fn force_start_of_a_running_project_is_refused_before_it_touches_the_plan() {
+    // The defect this pins: the slot used to be claimed *after* `plan_now`, so a second
+    // `start --force` spent a model call and rewrote `PLAN.md`/`TASKS.json` — the exact files the
+    // live run is executing — and only then answered "already running". The human got both
+    // answers: the work was replaced and the request failed. Claiming first makes the refusal
+    // free and leaves the running task's tree untouched.
+    let fixture = Fixture::new();
+    let gate = Gate::new();
+    let model = Scripted::new(Work::Wait(Arc::clone(&gate)));
+    let state = fixture.state(model.clone());
+
+    let answer = start_now(&state, &json!({ "project": fixture.repo, "goal": GOAL }))
+        .expect("the first admission must succeed");
+    let running = answer["task"].as_str().expect("a task id").to_string();
+    let plan_before = std::fs::read_to_string(fixture.agent().join("TASKS.json")).expect("tasks");
+
+    let error = start_now(
+        &state,
+        &json!({ "project": fixture.repo, "goal": "a completely different goal", "force": true }),
+    )
+    .expect_err("a forced start over a running project must be refused");
+
+    // The refusal must name the task the human has to wait for; either guard's wording is fine,
+    // and asserting the exact phrase would pin belt-and-braces to one of its two belts.
+    assert!(
+        error.contains(&running),
+        "the refusal must name the holder: {error}"
+    );
+    // The two assertions that catch the live bug, and they are about *effects*, not wording: the
+    // refused start must not spend a planning call and must not touch the plan a live run is
+    // executing. Removing the early slot claim alone still leaves the planner's own guard, so this
+    // only goes red when both are gone — which is the point of having both.
+    assert_eq!(
+        model.planner_calls(),
+        1,
+        "the refused start must not spend a planning call: only the first admission planned"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.agent().join("TASKS.json")).expect("tasks"),
+        plan_before,
+        "a refused forced start must not rewrite the plan a live run is executing"
+    );
+
+    gate.release();
+    fixture.wait_for(&running, TaskState::ReadyForReview);
+    Fixture::wait_until_idle(&state);
+}
+
+#[test]
 fn a_finished_task_cannot_be_resumed() {
     // `ready_for_review` is a verdict, not a pause. Resuming it would be a second claim about
     // work already judged, and the lifecycle has no edge for that.

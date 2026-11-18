@@ -391,6 +391,19 @@ pub fn merge(state: &ServerState, params: &serde_json::Value) -> Result<serde_js
         .map_err(|error| internal(error.to_string()))?
         .ok_or_else(|| not_found(format!("no project owns task {task}")))?;
 
+    // A merge appends to the project's one journal, and a live run in the same project is
+    // appending to it too — the exact interleaving D-142 exists to prevent. The slot is the same
+    // map `start` claims, so a merge can never overlap a run; a merge of *another* project is
+    // unaffected, because the journal is per project.
+    if let Some(holder) = state.running_in(&project.id) {
+        return Err(bad_params(format!(
+            "task {holder} is running in {}, and merging would append to the same journal it is \
+             writing. Wait for it or watch it with `immortality attach {holder}`; \
+             `immortality status` lists it.",
+            project.path.display()
+        )));
+    }
+
     let outcome = JournalReader::open(project.agent_dir(), &task)
         .and_then(|reader| reader.read())
         .map_err(|error| internal(error.to_string()))?;

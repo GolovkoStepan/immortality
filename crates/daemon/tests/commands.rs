@@ -496,6 +496,46 @@ fn merge_lands_the_branch_and_journals_merged() {
 }
 
 #[test]
+fn merge_refuses_while_another_task_runs_in_the_project() {
+    // A merge appends `merged` to the project's one journal, and `Journal::open` keeps a `seq`
+    // cursor per writer. A merge racing a live run interleaves those cursors exactly the way two
+    // runs did before D-142 — the failure that left both tasks `CORRUPT`. The merge is a human
+    // action, so refusing it with "wait" costs nothing and keeps the file single-writer.
+    let fixture = Fixture::new();
+    fixture.record_merged_ready();
+    fixture.agent_commit("work.txt");
+    let state = fixture.state();
+    let holder = TaskId::generate();
+    let project = Registry::open(fixture.state_root.join(immortality_core::registry::FILE_NAME))
+        .expect("registry")
+        .projects()
+        .first()
+        .expect("the fixture registers one project")
+        .id
+        .clone();
+    state
+        .running
+        .lock()
+        .expect("run set")
+        .insert(project, holder.clone());
+
+    let error = commands::merge(&state, &params(serde_json::json!({"task": task().as_str()})))
+        .expect_err("a merge must not race a live run");
+
+    assert!(error.message.contains("running"), "{}", error.message);
+    assert!(
+        error.message.contains(&holder.to_string()),
+        "the refusal must name the running task: {}",
+        error.message
+    );
+    // The merge must not have happened: the branch is not on main and no record was written.
+    assert!(
+        !fixture.repo.join("work.txt").exists(),
+        "a refused merge must not land the work"
+    );
+}
+
+#[test]
 fn merge_lands_a_run_that_left_its_own_bookkeeping_modified() {
     // Measured on the `word-count` fixture after a run that closed three subtasks green: the main
     // checkout was dirty with ` M .agent/PLAN.md`, ` M .agent/TASKS.json` and

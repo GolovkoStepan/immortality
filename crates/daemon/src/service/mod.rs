@@ -65,10 +65,21 @@ pub struct ServiceSpec {
     pub state_root: PathBuf,
     /// Where stdout and stderr go. Both managers append; neither rotates.
     pub log_path: PathBuf,
+    /// `PATH` to install the job with, captured from the shell that ran `service install`.
+    ///
+    /// `None` means "do not set one", and the manager supplies its own. Both managers give a
+    /// service a PATH that is not the human's: `launchd` hands an agent
+    /// `/usr/bin:/bin:/usr/sbin:/sbin` and `systemd --user` does not read `.zprofile` either. For
+    /// a project whose toolchain comes from a version manager (asdf, mise, nvm, pyenv) that means
+    /// the daemon runs a *different* interpreter than the human's shell — the tool is not found,
+    /// or an older one is found first. Capturing the PATH at install time is the only moment the
+    /// good value exists: the human is in the shell that has it, and the daemon is not.
+    pub path: Option<String>,
 }
 
 impl ServiceSpec {
-    /// The spec for this machine: the running binary, and the discovered state root.
+    /// The spec for this machine: the running binary, the discovered state root, and this process's
+    /// `PATH`.
     ///
     /// # Errors
     /// `current_exe` cannot be read, or `$HOME` is unusable.
@@ -83,6 +94,7 @@ impl ServiceSpec {
             log_path: state_root.join("logs").join("daemon.log"),
             program,
             state_root,
+            path: std::env::var("PATH").ok().filter(|path| !path.trim().is_empty()),
         })
     }
 }

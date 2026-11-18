@@ -27,6 +27,7 @@ fn spec() -> ServiceSpec {
         program: PathBuf::from("/Users/test/bin/immortality"),
         state_root: PathBuf::from("/Users/test/Library/Application Support/immortality"),
         log_path: PathBuf::from("/Users/test/Library/Application Support/immortality/logs/daemon.log"),
+        path: None,
     }
 }
 
@@ -82,6 +83,37 @@ fn the_plist_round_trips_through_plutil_with_the_expected_keys() {
         .expect("ProgramArguments is an array");
     assert_eq!(arguments[0], "/Users/test/bin/immortality");
     assert_eq!(arguments[1], "serve");
+}
+
+#[test]
+fn the_path_from_install_time_reaches_launchd_as_one_string() {
+    // The daemon inherits the *installed* environment, not the shell's. launchd's own default is
+    // `/usr/bin:/bin:/usr/sbin:/sbin`, which on a machine whose Ruby or Node comes from asdf finds
+    // an older system interpreter first — the run then either cannot find its toolchain or, worse,
+    // uses the wrong one. This asserts the PATH survives CoreFoundation's parser intact.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("agent.plist");
+    let with_path = ServiceSpec {
+        path: Some("/Users/test/.asdf/shims:/opt/homebrew/bin:/usr/bin:/bin".to_string()),
+        ..spec()
+    };
+    std::fs::write(&path, service::plist(&with_path)).expect("write");
+
+    let output = Command::new("plutil")
+        .args(["-convert", "json", "-o", "-"])
+        .arg(&path)
+        .output()
+        .expect("plutil");
+    assert!(
+        output.status.success(),
+        "launchd would refuse this plist: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("plutil emits JSON");
+    assert_eq!(
+        value["EnvironmentVariables"]["PATH"],
+        "/Users/test/.asdf/shims:/opt/homebrew/bin:/usr/bin:/bin"
+    );
 }
 
 #[test]

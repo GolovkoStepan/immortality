@@ -72,7 +72,7 @@ pub fn plist(spec: &ServiceSpec) -> String {
   <key>EnvironmentVariables</key>
   <dict>
     <key>IMMORTALITY_STATE_DIR</key>
-    <string>{state}</string>
+    <string>{state}</string>{path}
   </dict>
   <key>RunAtLoad</key>
   <true/>
@@ -94,8 +94,20 @@ pub fn plist(spec: &ServiceSpec) -> String {
         program = escape(&spec.program.display().to_string()),
         state = escape(&spec.state_root.display().to_string()),
         log = escape(&spec.log_path.display().to_string()),
+        path = path_entry(spec.path.as_deref()),
         throttle = RESTART_SECONDS,
     )
+}
+
+/// The `PATH` entry for the plist's `EnvironmentVariables`, or nothing.
+///
+/// Indented to match its sibling key because the plist is a document a human may read; an entry
+/// appended without its leading newline would produce `...</string><key>PATH</key>`, which parses
+/// but looks like a mistake.
+fn path_entry(path: Option<&str>) -> String {
+    path.map_or_else(String::new, |path| {
+        format!("\n    <key>PATH</key>\n    <string>{}</string>", escape(path))
+    })
 }
 
 /// Escape the five characters the XML spec requires in text content.
@@ -349,6 +361,7 @@ mod tests {
             program: PathBuf::from("/Users/test/bin/immortality"),
             state_root: PathBuf::from("/Users/test/Library/Application Support/immortality"),
             log_path: PathBuf::from("/Users/test/Library/Application Support/immortality/logs/daemon.log"),
+            path: None,
         }
     }
 
@@ -413,5 +426,47 @@ mod tests {
         });
         assert_ne!(one, two);
         assert_eq!(one, plist(&spec()));
+    }
+
+    #[test]
+    fn the_plist_carries_the_path_it_was_installed_with() {
+        // launchd gives an agent `/usr/bin:/bin:/usr/sbin:/sbin` and reads no shell profile, so a
+        // toolchain from asdf or mise is invisible to the daemon. The PATH captured in the shell
+        // that ran `service install` is the only correct value that ever exists, and losing it
+        // here means the daemon silently runs an older interpreter.
+        let with_path = ServiceSpec {
+            path: Some("/Users/test/.asdf/shims:/usr/bin:/bin".to_string()),
+            ..spec()
+        };
+        let text = plist(&with_path);
+        assert!(text.contains("<key>PATH</key>"), "{text}");
+        assert!(text.contains("/Users/test/.asdf/shims:/usr/bin:/bin"), "{text}");
+        // And it sits inside `EnvironmentVariables`, not loose in the dictionary.
+        let environment = text
+            .split("<key>EnvironmentVariables</key>")
+            .nth(1)
+            .expect("the plist has an EnvironmentVariables dict");
+        assert!(environment.contains("<key>PATH</key>"), "{environment}");
+    }
+
+    #[test]
+    fn a_spec_without_a_path_names_no_path_key() {
+        // `None` must mean "let the manager decide", not "set PATH to the empty string": an empty
+        // PATH is a daemon that cannot find `git`, and `git` is how the whole run works.
+        let text = plist(&spec());
+        assert!(!text.contains("<key>PATH</key>"), "{text}");
+    }
+
+    #[test]
+    fn a_path_with_xml_characters_is_escaped_in_the_environment_too() {
+        // The same escaping rule as `ProgramArguments`; a PATH is a string from a shell and can
+        // contain the same characters.
+        let odd = ServiceSpec {
+            path: Some("/Users/a&b/bin:/usr/bin".to_string()),
+            ..spec()
+        };
+        let text = plist(&odd);
+        assert!(text.contains("/Users/a&amp;b/bin:/usr/bin"), "{text}");
+        assert!(!text.contains("a&b/bin"), "an unescaped `&` reached the plist");
     }
 }

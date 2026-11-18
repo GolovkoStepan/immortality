@@ -40,6 +40,7 @@ pub mod planner;
 pub mod protocol;
 pub mod recover;
 pub mod registry;
+pub mod reset;
 pub mod restart;
 pub mod scheduler;
 pub mod time;

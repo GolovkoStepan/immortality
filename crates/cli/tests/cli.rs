@@ -314,3 +314,126 @@ fn empty_goal_is_rejected() {
         .failure()
         .stderr(predicate::str::contains("goal must not be empty"));
 }
+
+// ── reset ──────────────────────────────────────────────────────────────────────────────
+
+/// A state root with a registry, a token and an artifact, plus a repository with a task branch.
+fn reset_fixture() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let state = fresh_state_dir();
+    std::fs::create_dir_all(&state).expect("state");
+    std::fs::write(state.join("daemon.token"), "token\n").expect("token");
+    std::fs::create_dir_all(state.join("artifacts")).expect("artifacts");
+    std::fs::write(state.join("artifacts").join("body"), "x").expect("body");
+
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("repo");
+    for args in [
+        vec!["init", "-q", "-b", "main"],
+        vec!["config", "user.email", "t@example.com"],
+        vec!["config", "user.name", "t"],
+    ] {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(&args)
+            .output()
+            .expect("git");
+        assert!(output.status.success(), "{args:?}");
+    }
+    std::fs::write(repo.join("a.txt"), "a\n").expect("write");
+    for args in [vec!["add", "."], vec!["commit", "-q", "-m", "first"]] {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(&args)
+            .output()
+            .expect("git");
+        assert!(output.status.success(), "{args:?}");
+    }
+    std::fs::create_dir_all(repo.join(".agent")).expect("agent");
+    let mut registry =
+        immortality_core::registry::Registry::open(state.join("registry.json")).expect("registry");
+    registry.register(&repo, None).expect("register");
+
+    (dir, state, repo)
+}
+
+#[test]
+fn reset_without_yes_lists_and_deletes_nothing() {
+    // The whole safety story of the command: the first invocation is a list. A reset that acted
+    // on its first run would be unusable, because the machine it is meant to clean is often one
+    // the human is in the middle of debugging.
+    let (_dir, state, repo) = reset_fixture();
+    let request = std::process::Command::new(env!("CARGO_BIN_EXE_immortality"))
+        .env("IMMORTALITY_STATE_DIR", &state)
+        .arg("reset")
+        .output()
+        .expect("run");
+    assert!(request.status.success(), "{request:?}");
+    let stdout = String::from_utf8(request.stdout).expect("utf8");
+    assert!(stdout.contains("would remove"), "{stdout}");
+    assert!(stdout.contains("--yes"), "{stdout}");
+
+    // Everything is where it was.
+    assert!(
+        state.join("registry.json").exists(),
+        "the registry survived a dry run"
+    );
+    assert!(state.join("artifacts").join("body").exists());
+    assert!(repo.join(".agent").exists());
+}
+
+#[test]
+fn reset_yes_removes_the_agent_directory_and_the_registry_but_keeps_the_token() {
+    let (_dir, state, repo) = reset_fixture();
+    let request = std::process::Command::new(env!("CARGO_BIN_EXE_immortality"))
+        .env("IMMORTALITY_STATE_DIR", &state)
+        .arg("reset")
+        .arg("--yes")
+        .output()
+        .expect("run");
+    assert!(request.status.success(), "{request:?}");
+
+    assert!(!repo.join(".agent").exists(), ".agent/ must be gone");
+    assert!(!state.join("registry.json").exists(), "the registry must be gone");
+    assert!(!state.join("artifacts").exists(), "artifacts must be gone");
+    // The token stays by default: a running daemon without one refuses every client, and that is
+    // a worse state than the file being there.
+    assert!(
+        state.join("daemon.token").exists(),
+        "the token must survive without --token"
+    );
+    // The human's own commits and branches are untouched.
+    assert!(repo.join("a.txt").exists());
+    let branches = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["branch", "--format=%(refname:short)"])
+        .output()
+        .expect("branch");
+    let text = String::from_utf8_lossy(&branches.stdout);
+    assert!(text.contains("main"), "{text}");
+}
+
+#[test]
+fn reset_token_removes_the_token_too_and_a_second_run_is_a_noop() {
+    let (_dir, state, _repo) = reset_fixture();
+    for _ in 0..2 {
+        let request = std::process::Command::new(env!("CARGO_BIN_EXE_immortality"))
+            .env("IMMORTALITY_STATE_DIR", &state)
+            .args(["reset", "--yes", "--token"])
+            .output()
+            .expect("run");
+        assert!(request.status.success(), "{request:?}");
+    }
+    assert!(!state.join("daemon.token").exists(), "the token must be gone");
+
+    let again = std::process::Command::new(env!("CARGO_BIN_EXE_immortality"))
+        .env("IMMORTALITY_STATE_DIR", &state)
+        .arg("reset")
+        .output()
+        .expect("run");
+    let stdout = String::from_utf8(again.stdout).expect("utf8");
+    assert!(stdout.contains("zero state"), "{stdout}");
+}

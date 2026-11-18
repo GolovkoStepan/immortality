@@ -60,7 +60,7 @@ Documentation=https://github.com/immortality/immortality
 [Service]
 Type=simple
 ExecStart="{program}" {subcommand}
-Environment="IMMORTALITY_STATE_DIR={state}"
+Environment="IMMORTALITY_STATE_DIR={state}"{path}
 Restart=on-failure
 RestartSec={restart}
 StandardOutput=append:{log}
@@ -73,8 +73,20 @@ WantedBy=default.target
         subcommand = SUBCOMMAND,
         state = quote_escape(&spec.state_root.display().to_string()),
         log = quote_escape(&spec.log_path.display().to_string()),
+        path = path_environment(spec.path.as_deref()),
         restart = RESTART_SECONDS,
     )
+}
+
+/// The `PATH` environment line for the unit, or nothing.
+///
+/// A separate `Environment=` line rather than a second variable inside one: systemd assigns
+/// variables one at a time, and a value containing a space — a path with a space in it — would
+/// split into two assignments inside a shared line.
+fn path_environment(path: Option<&str>) -> String {
+    path.map_or_else(String::new, |path| {
+        format!("\nEnvironment=\"PATH={}\"", quote_escape(path))
+    })
 }
 
 /// Escape what systemd's quoting needs inside a double-quoted string.
@@ -391,6 +403,7 @@ mod tests {
             program: PathBuf::from("/home/test/.cargo/bin/immortality"),
             state_root: PathBuf::from("/home/test/.local/state/immortality"),
             log_path: PathBuf::from("/home/test/.local/state/immortality/logs/daemon.log"),
+            path: None,
         }
     }
 
@@ -447,6 +460,31 @@ mod tests {
         };
         let text = unit(&odd);
         assert!(text.contains(r#"/home/a\"b/immortality"#), "{text}");
+    }
+
+    #[test]
+    fn the_unit_carries_the_path_it_was_installed_with() {
+        // `systemd --user` does not read `.zprofile` or `.bashrc`, so a service manager never sees
+        // an asdf/mise shim directory. Capturing PATH at install time is the same fix as the
+        // plist's; on Linux the value has to be a separate `Environment=` line because a PATH
+        // containing a space would otherwise split one assignment into two.
+        let with_path = ServiceSpec {
+            path: Some("/home/test/.asdf/shims:/usr/bin:/bin".to_string()),
+            ..spec()
+        };
+        let text = unit(&with_path);
+        assert!(
+            text.contains(r#"Environment="PATH=/home/test/.asdf/shims:/usr/bin:/bin""#),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_unit_without_a_path_sets_no_path_variable() {
+        // An empty `PATH=` is worse than none: systemd would hand the daemon a PATH that finds
+        // nothing, and `git` is what the whole run is built on.
+        let text = unit(&spec());
+        assert!(!text.contains("PATH="), "{text}");
     }
 
     #[test]
