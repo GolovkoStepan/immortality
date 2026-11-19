@@ -102,6 +102,7 @@ impl Fixture {
             state_root: self.dir.path().join("state"),
             log_path: self.dir.path().join("state").join("logs").join("daemon.log"),
             path: None,
+            lang: None,
         }
     }
 }

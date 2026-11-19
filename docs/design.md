@@ -701,6 +701,12 @@ state-and-recovery.md).
 состояния и лога. На Linux — `systemd --user`-юнит с `Restart=on-failure` и `RestartSec=10` в
 `$XDG_CONFIG_HOME/systemd/user/`, включённый симлинком в `default.target.wants`.
 
+Менеджер не читает профиль шелла, поэтому в определение попадает всё, без чего демон — не тот
+процесс, что у человека: `PATH` (D-147) и локаль `LANG` (D-153). Локаль свёрнута из
+`LC_ALL`/`LC_CTYPE`/`LANG` по приоритету libc, потому что без неё Ruby, Python и Node берут
+`US-ASCII` и превращают любой не-ASCII байт в выводе теста в `?`. Обе переменные —
+`Option<String>`: `None` значит «пусть решает менеджер», а не «пустое значение».
+
 Обе определены в `daemon::service`, общее (`LABEL`, задержка рестарта, `ServiceSpec`, `Status`,
 `Installed`) вынесено в `mod.rs`, различие — в `launchd.rs` и `systemd.rs`. Оба модуля
 компилируются всегда; `pub use` выбирает один.

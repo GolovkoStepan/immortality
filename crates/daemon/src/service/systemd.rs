@@ -60,7 +60,7 @@ Documentation=https://github.com/immortality/immortality
 [Service]
 Type=simple
 ExecStart="{program}" {subcommand}
-Environment="IMMORTALITY_STATE_DIR={state}"{path}
+Environment="IMMORTALITY_STATE_DIR={state}"{path}{lang}
 Restart=on-failure
 RestartSec={restart}
 StandardOutput=append:{log}
@@ -74,6 +74,7 @@ WantedBy=default.target
         state = quote_escape(&spec.state_root.display().to_string()),
         log = quote_escape(&spec.log_path.display().to_string()),
         path = path_environment(spec.path.as_deref()),
+        lang = lang_environment(spec.lang.as_deref()),
         restart = RESTART_SECONDS,
     )
 }
@@ -86,6 +87,17 @@ WantedBy=default.target
 fn path_environment(path: Option<&str>) -> String {
     path.map_or_else(String::new, |path| {
         format!("\nEnvironment=\"PATH={}\"", quote_escape(path))
+    })
+}
+
+/// The `LANG` environment line, or nothing.
+///
+/// Its own `Environment=` line for the same reason as [`path_environment`], and because the value
+/// can contain `@` and `.` — `en_US.UTF-8@euro` is a legal locale name — which no shell in the way
+/// here would touch, but systemd still assigns per line.
+fn lang_environment(lang: Option<&str>) -> String {
+    lang.map_or_else(String::new, |lang| {
+        format!("\nEnvironment=\"LANG={}\"", quote_escape(lang))
     })
 }
 
@@ -404,6 +416,7 @@ mod tests {
             state_root: PathBuf::from("/home/test/.local/state/immortality"),
             log_path: PathBuf::from("/home/test/.local/state/immortality/logs/daemon.log"),
             path: None,
+            lang: None,
         }
     }
 
@@ -485,6 +498,46 @@ mod tests {
         // nothing, and `git` is what the whole run is built on.
         let text = unit(&spec());
         assert!(!text.contains("PATH="), "{text}");
+    }
+
+    #[test]
+    fn the_unit_carries_the_lang_it_was_installed_with() {
+        // The same measured defect as the plist's (D-153): `systemd --user` gives a unit no locale
+        // either, and a language runtime with no `LANG` reports `US-ASCII` — which turns every
+        // non-ASCII byte in a test failure into `?`.
+        let with_lang = ServiceSpec {
+            lang: Some("en_US.UTF-8".to_string()),
+            ..spec()
+        };
+        let text = unit(&with_lang);
+        assert!(text.contains(r#"Environment="LANG=en_US.UTF-8""#), "{text}");
+    }
+
+    #[test]
+    fn a_unit_without_a_lang_sets_no_lang_variable() {
+        // `LANG=` with nothing after it is a locale that does not exist; libc would silently fall
+        // back to `C` and the unit would claim a value it does not have.
+        let text = unit(&spec());
+        assert!(!text.contains("LANG="), "{text}");
+    }
+
+    #[test]
+    fn the_lang_is_a_separate_environment_line_from_the_path() {
+        // systemd assigns one variable per `Environment=` when they are written this way; a shared
+        // line is the shape that splits a value containing a space into two assignments.
+        let both = ServiceSpec {
+            path: Some("/usr/bin:/bin".to_string()),
+            lang: Some("en_US.UTF-8@euro".to_string()),
+            ..spec()
+        };
+        let text = unit(&both);
+        assert!(text.contains(r#"Environment="PATH=/usr/bin:/bin""#), "{text}");
+        assert!(text.contains(r#"Environment="LANG=en_US.UTF-8@euro""#), "{text}");
+        let lines: Vec<&str> = text
+            .lines()
+            .filter(|line| line.starts_with("Environment="))
+            .collect();
+        assert_eq!(lines.len(), 3, "state dir, PATH and LANG: {lines:?}");
     }
 
     #[test]

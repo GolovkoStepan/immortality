@@ -72,7 +72,7 @@ pub fn plist(spec: &ServiceSpec) -> String {
   <key>EnvironmentVariables</key>
   <dict>
     <key>IMMORTALITY_STATE_DIR</key>
-    <string>{state}</string>{path}
+    <string>{state}</string>{path}{lang}
   </dict>
   <key>RunAtLoad</key>
   <true/>
@@ -95,6 +95,7 @@ pub fn plist(spec: &ServiceSpec) -> String {
         state = escape(&spec.state_root.display().to_string()),
         log = escape(&spec.log_path.display().to_string()),
         path = path_entry(spec.path.as_deref()),
+        lang = lang_entry(spec.lang.as_deref()),
         throttle = RESTART_SECONDS,
     )
 }
@@ -107,6 +108,16 @@ pub fn plist(spec: &ServiceSpec) -> String {
 fn path_entry(path: Option<&str>) -> String {
     path.map_or_else(String::new, |path| {
         format!("\n    <key>PATH</key>\n    <string>{}</string>", escape(path))
+    })
+}
+
+/// The `LANG` entry, or nothing.
+///
+/// Same shape as [`path_entry`] and for the same reason: a second key in the same dictionary, not
+/// a value appended to the state directory's string.
+fn lang_entry(lang: Option<&str>) -> String {
+    lang.map_or_else(String::new, |lang| {
+        format!("\n    <key>LANG</key>\n    <string>{}</string>", escape(lang))
     })
 }
 
@@ -362,6 +373,7 @@ mod tests {
             state_root: PathBuf::from("/Users/test/Library/Application Support/immortality"),
             log_path: PathBuf::from("/Users/test/Library/Application Support/immortality/logs/daemon.log"),
             path: None,
+            lang: None,
         }
     }
 
@@ -468,5 +480,84 @@ mod tests {
         let text = plist(&odd);
         assert!(text.contains("/Users/a&amp;b/bin:/usr/bin"), "{text}");
         assert!(!text.contains("a&b/bin"), "an unescaped `&` reached the plist");
+    }
+
+    #[test]
+    fn the_plist_carries_the_lang_it_was_installed_with() {
+        // Measured on the third `black_jack` run: launchd gives an agent no locale at all, so
+        // Ruby's `Encoding.default_external` was `US-ASCII` and RSpec's failure messages came back
+        // as `????` in 48 journal records. Nothing crashed; the one failure the model had to read
+        // was replaced by question marks. The locale is the same kind of fact as PATH: it exists in
+        // the installing shell and nowhere else.
+        let with_lang = ServiceSpec {
+            lang: Some("en_US.UTF-8".to_string()),
+            ..spec()
+        };
+        let text = plist(&with_lang);
+        assert!(text.contains("<key>LANG</key>"), "{text}");
+        assert!(text.contains("<string>en_US.UTF-8</string>"), "{text}");
+        // Inside `EnvironmentVariables`, not loose in the outer dictionary: a `LANG` beside
+        // `Label` is valid XML and does nothing.
+        let environment = text
+            .split("<key>EnvironmentVariables</key>")
+            .nth(1)
+            .expect("the plist has an EnvironmentVariables dict");
+        assert!(environment.contains("<key>LANG</key>"), "{environment}");
+        // And it is a sibling of PATH, not a suffix on the state directory's value: two keys in
+        // one dictionary, each with its own `<key>`/`<string>` pair.
+        assert!(
+            environment.contains("<key>IMMORTALITY_STATE_DIR</key>"),
+            "{environment}"
+        );
+    }
+
+    #[test]
+    fn a_changed_lang_is_a_changed_document_so_the_daemon_restarts_with_it() {
+        // `install` compares the generated text, so a locale that differs makes the file differ and
+        // the job reload. That is the point — a daemon installed before the fix keeps `US-ASCII`
+        // until it is restarted — and it is also the cost: a `service install` run from a shell
+        // with another locale kills an in-flight attempt, exactly as a changed PATH already does.
+        // The alternative, ignoring LANG in the comparison, would write a file that says one thing
+        // and leave a process doing another.
+        let one = plist(&ServiceSpec {
+            lang: Some("en_US.UTF-8".to_string()),
+            ..spec()
+        });
+        let two = plist(&ServiceSpec {
+            lang: Some("ru_RU.UTF-8".to_string()),
+            ..spec()
+        });
+        assert_ne!(one, two);
+        assert_eq!(
+            one,
+            plist(&ServiceSpec {
+                lang: Some("en_US.UTF-8".to_string()),
+                ..spec()
+            })
+        );
+    }
+
+    #[test]
+    fn a_spec_without_a_lang_names_no_lang_key() {
+        // Same rule as PATH: `None` means "let the manager decide". Writing `LANG=` with an empty
+        // value would be worse than silence — it is a locale whose name does not exist, and libc
+        // would fall back to `C` while the plist claimed otherwise.
+        let text = plist(&spec());
+        assert!(!text.contains("<key>LANG</key>"), "{text}");
+    }
+
+    #[test]
+    fn the_lang_and_the_path_do_not_run_into_each_other() {
+        // Both entries are appended with a leading newline; a missing one would produce
+        // `</string><key>LANG</key>`, which parses and reads as a typo a human would then "fix".
+        let both = ServiceSpec {
+            path: Some("/usr/bin:/bin".to_string()),
+            lang: Some("en_US.UTF-8".to_string()),
+            ..spec()
+        };
+        let text = plist(&both);
+        assert!(text.contains("<key>PATH</key>"), "{text}");
+        assert!(text.contains("<key>LANG</key>"), "{text}");
+        assert!(!text.contains("</string><key>"), "{text}");
     }
 }
