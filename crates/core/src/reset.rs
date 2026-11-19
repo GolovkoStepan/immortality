@@ -64,6 +64,35 @@ pub struct Inventory {
     pub files: Vec<PathBuf>,
     /// Repositories that are registered but no longer exist on disk.
     pub missing: Vec<PathBuf>,
+    /// Directories outside the state root that a project's own configuration named.
+    ///
+    /// Listed always, deleted only with `--outside`: see [`OutsideEntry`]. They are not part of
+    /// [`Self::is_empty`] or [`Self::all_paths`], because a machine whose only leftover is one of
+    /// these is at the zero state *for this program* — the directory may be where the human's own
+    /// `bundle install` puts gems, and only they can decide it is garbage.
+    pub outside: Vec<OutsideEntry>,
+}
+
+/// A directory outside the state root that a project's own configuration named.
+///
+/// # Why this is not "everything the run wrote"
+///
+/// Measured on `black_jack`: `bundle install` inside the task worktree wrote gems into
+/// `~/.gem/shared`, and nothing about that path says "immortality" — a `.bundle/config` in the
+/// repository said it. `reset` therefore cannot find these by looking at its own state, and it must
+/// not find them by guessing: the directory a project names is one the human's own tools also
+/// write to, so deleting it silently would throw away work `reset` never created.
+///
+/// The entry carries the config that named it for the same reason: an unexplained path in a list
+/// of things about to be deleted is a path a human has to go and investigate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutsideEntry {
+    /// The directory, with a leading `~` expanded.
+    pub path: PathBuf,
+    /// The config file that named it.
+    pub named_by: PathBuf,
+    /// The key in that file: `BUNDLE_PATH`.
+    pub key: String,
 }
 
 /// One worktree that belongs to a task.
@@ -87,7 +116,12 @@ pub struct BranchEntry {
 }
 
 impl Inventory {
-    /// Whether there is nothing to remove.
+    /// Whether this program's own footprint is gone.
+    ///
+    /// [`Self::outside`] deliberately does not count: a directory a project's configuration named
+    /// may be where the human's own `bundle install` puts gems, so a machine whose only leftover is
+    /// one of those is at the zero state *for immortality*. `reset` still prints the list — that is
+    /// the whole point of finding it — but it is not work this program owes anyone.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.worktrees.is_empty()
@@ -98,6 +132,9 @@ impl Inventory {
     }
 
     /// Every path this reset would visit, for a report.
+    ///
+    /// Not including [`Self::outside`]: those are visited only under an explicit flag, and a report
+    /// that folded them in would print `paths` a plain `--yes` does not touch.
     #[must_use]
     pub fn all_paths(&self) -> Vec<PathBuf> {
         let mut paths: Vec<PathBuf> = self.worktrees.iter().map(|entry| entry.path.clone()).collect();
@@ -119,6 +156,14 @@ pub struct Report {
     pub branches_deleted: usize,
     /// Directories and files removed.
     pub paths_removed: usize,
+    /// Directories outside the state root removed, under an explicit `--outside`.
+    pub outside_removed: usize,
+    /// Directories outside the state root that were listed and left alone.
+    ///
+    /// Carried in the report rather than only printed by the CLI, so the `--json` answer says the
+    /// same thing the human-readable one does: a machine that asked for a reset and got one still
+    /// has these, and a script that only read `noop` would not know.
+    pub outside_kept: Vec<PathBuf>,
     /// Things that could not be removed, with the reason.
     pub failures: Vec<String>,
 }
@@ -155,6 +200,16 @@ pub enum ResetError {
         message: String,
     },
 }
+
+/// The key in a project's `.bundle/config` that names a directory outside the repository.
+///
+/// One key, named here rather than derived, because the list of "config keys that mean a path" is a
+/// decision and not a discovery: a `BUNDLE_FROZEN: "true"` is a setting, and reading every value as
+/// a path would list `true` as a directory to delete.
+const BUNDLE_PATH_KEY: &str = "BUNDLE_PATH";
+
+/// The config file a project writes when `bundle config set --local` is used.
+const BUNDLE_CONFIG: &str = ".bundle/config";
 
 /// Work out everything a reset of this machine would remove, without removing it.
 ///
@@ -222,9 +277,95 @@ pub fn inventory(state: &StatePaths) -> Result<Inventory, ResetError> {
         if agent.is_dir() {
             inventory.agent_dirs.push(agent);
         }
+
+        // Directories a project's own configuration named, outside the state root. The worktree is
+        // consulted too, and not just the main checkout: `bundle install` inside a task worktree
+        // writes the config it was handed, and the measured `black_jack` worktree had its own copy
+        // of `.bundle/config` with the same `BUNDLE_PATH`.
+        let mut roots = vec![project.path.clone()];
+        roots.extend(
+            inventory
+                .worktrees
+                .iter()
+                .filter(|entry| entry.repository == project.path)
+                .map(|entry| entry.path.clone()),
+        );
+        for root in roots {
+            for entry in outside_paths(&root) {
+                if !entry.path.exists() || inventory.outside.contains(&entry) {
+                    continue;
+                }
+                inventory.outside.push(entry);
+            }
+        }
     }
 
     Ok(inventory)
+}
+
+/// The directories `root`'s `.bundle/config` names and that sit outside `root` itself.
+///
+/// Only paths that leave the repository are reported: a `BUNDLE_PATH: vendor/bundle` is inside the
+/// worktree, which the worktree entry already removes, and repeating it here would be a second
+/// report line for one directory.
+///
+/// # Why this parses the file by hand
+///
+/// The format is YAML, and the two keys it holds here are `KEY: "value"` lines written by bundler
+/// itself. A YAML dependency for that is a parser this program would have to keep in step with a
+/// schema that also allows anchors, multi-line scalars and flow mappings — none of which bundler
+/// writes, and all of which a real parser would accept and then produce a *different* path from.
+/// A line-based reader that only accepts the shape bundler writes and silently ignores everything
+/// else is the honest size of the job: the failure mode is a missing entry in a list, never a wrong
+/// directory deleted.
+fn outside_paths(root: &Path) -> Vec<OutsideEntry> {
+    let config = root.join(BUNDLE_CONFIG);
+    let Ok(text) = std::fs::read_to_string(&config) else {
+        return Vec::new();
+    };
+    let mut entries = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        if key.trim() != BUNDLE_PATH_KEY {
+            continue;
+        }
+        let value = value.trim().trim_matches('"').trim_matches('\'');
+        if value.is_empty() {
+            continue;
+        }
+        let path = resolve_config_path(value, root);
+        if path.starts_with(root) {
+            // Inside the repository: the worktree entry covers it, and calling it "outside" would
+            // make `--outside` a flag that also changes what `--yes` already does.
+            continue;
+        }
+        entries.push(OutsideEntry {
+            path,
+            named_by: config.clone(),
+            key: BUNDLE_PATH_KEY.to_string(),
+        });
+    }
+    entries
+}
+
+/// Turn a config value into a path, expanding `~` and resolving a relative value against `root`.
+///
+/// A relative `BUNDLE_PATH` is relative to the project, which is how bundler reads it; expanding
+/// `~` by hand is what bundler does too, and the literal string is not a path a human recognizes as
+/// their home directory.
+fn resolve_config_path(value: &str, root: &Path) -> PathBuf {
+    if let Some(rest) = value.strip_prefix("~/") {
+        let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("/nonexistent"), PathBuf::from);
+        return home.join(rest);
+    }
+    let path = PathBuf::from(value);
+    if path.is_absolute() { path } else { root.join(path) }
 }
 
 /// The task ids this program has run in `repository`, from the journals.
@@ -300,11 +441,17 @@ fn branch_names(repo: &GitRepo, repository: &Path, prefix: &str) -> Result<Vec<S
 
 /// Remove everything in `inventory`, in the order that leaves a consistent machine.
 ///
+/// `outside` is the `--outside` flag and nothing else: when it is `false`, the entries in
+/// [`Inventory::outside`] are recorded in [`Report::outside_kept`] and left on disk. The parameter
+/// is a `bool` rather than a field of the inventory because the inventory is the *fact* — what was
+/// found — and the flag is the *decision*; folding the decision into the fact would make the same
+/// inventory mean two different things at the two call sites that print it.
+///
 /// # Errors
 /// A worktree cannot be removed by git, or a branch cannot be deleted. Both stop the reset: the
 /// remaining steps assume the earlier ones succeeded, and continuing past a worktree git refused
 /// would delete the `.agent/` that still describes it.
-pub fn execute(state: &StatePaths, inventory: &Inventory) -> Result<Report, ResetError> {
+pub fn execute(state: &StatePaths, inventory: &Inventory, outside: bool) -> Result<Report, ResetError> {
     let mut report = Report {
         inventory: inventory.clone(),
         ..Report::default()
@@ -380,6 +527,24 @@ pub fn execute(state: &StatePaths, inventory: &Inventory) -> Result<Report, Rese
             Err(error) => report
                 .failures
                 .push(format!("cannot remove {}: {error}", path.display())),
+        }
+    }
+
+    // 4. Directories a project's own configuration named, outside the state root. Last, and only
+    // when asked: they may be where the human's own `bundle install` puts gems, and the flag is
+    // what separates "this is mine to delete" from "this program wrote through it once".
+    for entry in &inventory.outside {
+        if !outside {
+            report.outside_kept.push(entry.path.clone());
+            continue;
+        }
+        match remove_path(&entry.path) {
+            Ok(()) => report.outside_removed += 1,
+            Err(error) => report.failures.push(format!(
+                "cannot remove {} (named by {}): {error}",
+                entry.path.display(),
+                entry.named_by.display()
+            )),
         }
     }
 
@@ -531,7 +696,7 @@ mod tests {
             std::fs::canonicalize(&path).expect("canonical")
         );
 
-        let report = execute(&state, &inventory).expect("execute");
+        let report = execute(&state, &inventory, false).expect("execute");
         assert_eq!(report.worktrees_removed, 1, "{report:?}");
         assert!(!path.exists(), "the worktree directory must be gone");
         // No prunable entry is left: git no longer lists it, so the same path is usable again.
@@ -550,7 +715,7 @@ mod tests {
         git(&repo, &["branch", "agent/tsk_01ARZ3NDEKTSV4RRFFQ69G5FAV"]);
 
         let inventory = inventory(&state).expect("inventory");
-        let report = execute(&state, &inventory).expect("execute");
+        let report = execute(&state, &inventory, false).expect("execute");
         assert_eq!(report.failures, Vec::<String>::new(), "{report:?}");
         assert!(!repo.join(AGENT_DIR).exists());
         assert!(!state.registry().exists());
@@ -581,7 +746,7 @@ mod tests {
                 .any(|path| path == Path::new("/nonexistent/immortality/nope")),
             "{inventory:?}"
         );
-        execute(&state, &inventory).expect("execute");
+        execute(&state, &inventory, false).expect("execute");
     }
 
     #[test]
@@ -594,5 +759,244 @@ mod tests {
             remote: None,
         };
         assert_eq!(project.path, PathBuf::from("/tmp/repo"));
+    }
+
+    #[test]
+    fn a_bundle_path_outside_the_repository_is_listed_with_the_config_that_named_it() {
+        // The measured `black_jack` case: `.bundle/config` said `BUNDLE_PATH: "~/.gem/shared"`, so
+        // `bundle install` in the task worktree wrote gems there. Nothing about the directory says
+        // "immortality", and reset cannot find it by looking at its own state — the project named
+        // it. It must be listed, and it must say which file named it: a path in a delete-list that
+        // a human cannot trace is a path they have to go and investigate.
+        let (dir, repo, state) = fixture();
+        let gems = dir.path().join("gems");
+        std::fs::create_dir_all(&gems).expect("gems");
+        std::fs::create_dir_all(repo.join(".bundle")).expect("bundle dir");
+        std::fs::write(
+            repo.join(".bundle").join("config"),
+            format!(
+                "---\nBUNDLE_PATH: \"{}\"\nBUNDLE_CLEAN: \"true\"\n",
+                gems.display()
+            ),
+        )
+        .expect("config");
+
+        let inventory = inventory(&state).expect("inventory");
+        assert_eq!(inventory.outside.len(), 1, "{inventory:?}");
+        assert_eq!(inventory.outside[0].path, gems);
+        assert_eq!(inventory.outside[0].key, "BUNDLE_PATH");
+        // The registry stores the canonical path, so on macOS the `/var` → `/private/var`
+        // difference shows up here too.
+        assert_eq!(
+            inventory.outside[0].named_by,
+            std::fs::canonicalize(&repo)
+                .expect("canonical repo")
+                .join(".bundle")
+                .join("config")
+        );
+        // Listed but not part of this program's own footprint: a machine whose only leftover is a
+        // gem directory the human's own `bundle install` writes to is at the zero state here.
+        let only_outside = Inventory {
+            outside: inventory.outside,
+            ..Inventory::default()
+        };
+        assert!(
+            only_outside.is_empty(),
+            "an outside path is a note, not this program's garbage: {only_outside:?}"
+        );
+        assert!(
+            !only_outside.all_paths().contains(&gems),
+            "`--yes` alone must not touch it"
+        );
+    }
+
+    #[test]
+    fn a_bundle_path_inside_the_repository_is_not_outside() {
+        // `BUNDLE_PATH: vendor/bundle` lives in the worktree, which the worktree entry already
+        // removes. Reporting it again would give one directory two lines and make `--outside` a
+        // flag that also changes what `--yes` does.
+        let (_dir, repo, state) = fixture();
+        // The directory exists, so the only thing that can keep it out of `outside` is the
+        // inside-the-repository rule itself — an absent path would pass this test for the wrong
+        // reason, and that is how the first version of it did.
+        std::fs::create_dir_all(repo.join("vendor").join("bundle")).expect("vendor dir");
+        std::fs::create_dir_all(repo.join(".bundle")).expect("bundle dir");
+        std::fs::write(
+            repo.join(".bundle").join("config"),
+            "---\nBUNDLE_PATH: \"vendor/bundle\"\n",
+        )
+        .expect("config");
+
+        let inventory = inventory(&state).expect("inventory");
+        assert!(inventory.outside.is_empty(), "{inventory:?}");
+    }
+
+    #[test]
+    fn a_bundle_path_with_a_tilde_is_expanded_to_the_home_directory() {
+        // `~/.gem/shared` is what bundler writes and what the human recognizes; the literal string
+        // is not a directory. A reset that took it at face value would report `./~/.gem/shared`
+        // inside the repository and delete nothing at all.
+        let (_dir, repo, state) = fixture();
+        std::fs::create_dir_all(repo.join(".bundle")).expect("bundle dir");
+        std::fs::write(
+            repo.join(".bundle").join("config"),
+            "---\nBUNDLE_PATH: \"~/.gem/shared\"\n",
+        )
+        .expect("config");
+
+        let inventory = inventory(&state).expect("inventory");
+        let home = std::env::var_os("HOME").expect("HOME");
+        assert_eq!(inventory.outside.len(), 1, "{inventory:?}");
+        assert_eq!(
+            inventory.outside[0].path,
+            PathBuf::from(home).join(".gem").join("shared")
+        );
+        assert!(
+            !inventory.outside[0].path.starts_with(&repo),
+            "an unexpanded `~` would read as a path inside the repository"
+        );
+    }
+
+    #[test]
+    fn an_outside_directory_survives_yes_and_is_removed_only_with_outside() {
+        // The safety property the whole flag exists for: the directory may hold gems the human
+        // installed themselves, so `--yes` — which means "delete what this program created" — is
+        // not permission to delete it. Only the separate flag is.
+        let (dir, repo, state) = fixture();
+        let gems = dir.path().join("gems");
+        std::fs::create_dir_all(gems.join("ruby")).expect("gems");
+        std::fs::write(gems.join("ruby").join("a.gem"), "gem").expect("gem");
+        std::fs::create_dir_all(repo.join(".bundle")).expect("bundle dir");
+        std::fs::write(
+            repo.join(".bundle").join("config"),
+            format!("---\nBUNDLE_PATH: \"{}\"\n", gems.display()),
+        )
+        .expect("config");
+
+        let inventory = inventory(&state).expect("inventory");
+        let report = execute(&state, &inventory, false).expect("execute");
+        assert_eq!(report.outside_removed, 0);
+        assert_eq!(report.outside_kept, vec![gems.clone()]);
+        assert!(gems.join("ruby").join("a.gem").exists(), "`--yes` deleted it");
+
+        // The same inventory, run again with the flag: `execute` is a function of the plan and the
+        // decision, so the second half is the same call with `outside: true`. Not a fresh
+        // `inventory()` — see `the_registry_a_plain_yes_deleted_is_why_outside_must_ride_along`
+        // for why that would find nothing.
+        let report = execute(&state, &inventory, true).expect("execute");
+        assert_eq!(report.outside_removed, 1);
+        assert_eq!(report.outside_kept, Vec::<PathBuf>::new());
+        assert!(!gems.exists(), "--outside must delete it");
+    }
+
+    #[test]
+    fn the_bundler_config_is_read_as_lines_and_only_for_the_key_it_names() {
+        // `BUNDLE_CLEAN: "true"` is a setting, not a directory. A reader that took every value as a
+        // path would list `true` in a delete-list, and a real YAML parser would accept anchors and
+        // multi-line scalars bundler never writes and produce a different path from them.
+        //
+        // `BUNDLE_APP_CONFIG` is the case that keeps this test honest. It is a real bundler setting
+        // whose value *is* a directory outside the repository, so a reader that accepted any
+        // `BUNDLE_*` key would list it — and the `BUNDLE_CLEAN: "true"` line alone would not have
+        // caught that, because `true` is relative and gets filtered as "inside the repository" by
+        // an unrelated rule. Named keys, not a prefix, is the property being pinned.
+        let (dir, repo, state) = fixture();
+        let gems = dir.path().join("gems");
+        let app_config = dir.path().join("bundle-app-config");
+        std::fs::create_dir_all(&gems).expect("gems");
+        std::fs::create_dir_all(&app_config).expect("app config");
+        std::fs::create_dir_all(repo.join(".bundle")).expect("bundle dir");
+        std::fs::write(
+            repo.join(".bundle").join("config"),
+            format!(
+                "---\nBUNDLE_CLEAN: \"true\"\nBUNDLE_APP_CONFIG: \"{}\"\nBUNDLE_PATH: \"{}\"\n# BUNDLE_PATH: \"{}\"\n",
+                app_config.display(),
+                gems.display(),
+                dir.path().join("commented").display()
+            ),
+        )
+        .expect("config");
+
+        let inventory = inventory(&state).expect("inventory");
+        assert_eq!(inventory.outside.len(), 1, "{inventory:?}");
+        assert_eq!(inventory.outside[0].path, gems);
+        assert!(
+            !inventory.outside[0].path.ends_with("commented"),
+            "a commented-out key is not a path: {inventory:?}"
+        );
+    }
+
+    #[test]
+    fn a_worktrees_bundle_config_names_paths_too() {
+        // Measured: the `black_jack` worktree had its own `.bundle/config` with the same
+        // `BUNDLE_PATH`, because `bundle install` ran there. Reading only the main checkout would
+        // miss the directory the run actually wrote to.
+        let (dir, repo, state) = fixture();
+        let task = "tsk_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let path = crate::worktree::WorktreeManager::new(&repo).path_for(task);
+        crate::worktree::WorktreeManager::new(&repo)
+            .ensure(task, &format!("agent/{task}"), None)
+            .expect("worktree");
+        let gems = dir.path().join("worktree-gems");
+        std::fs::create_dir_all(&gems).expect("gems");
+        std::fs::create_dir_all(path.join(".bundle")).expect("bundle dir");
+        std::fs::write(
+            path.join(".bundle").join("config"),
+            format!("---\nBUNDLE_PATH: \"{}\"\n", gems.display()),
+        )
+        .expect("config");
+
+        let inventory = inventory(&state).expect("inventory");
+        assert_eq!(inventory.outside.len(), 1, "{inventory:?}");
+        assert_eq!(inventory.outside[0].path, gems);
+        assert_eq!(
+            inventory.outside[0].named_by,
+            std::fs::canonicalize(path.join(".bundle").join("config"))
+                .unwrap_or_else(|_| { path.join(".bundle").join("config") })
+        );
+    }
+
+    #[test]
+    fn the_registry_a_plain_yes_deleted_is_why_outside_must_ride_along() {
+        // The trap the first version of the flag walked into, found by running the test that
+        // deletes twice. The outside entry is discovered *through* `registry.json`, and
+        // `reset --yes` deletes that registry. So a `--yes` without `--outside` leaves an orphan
+        // directory that no later `reset --outside` can find, and the CLI would truthfully report
+        // "zero state" while `~/.gem/shared` is still on disk holding every gem the run installed.
+        //
+        // The fix is not to keep the registry: reaching the zero state is the command's whole
+        // point, and a registry kept alive only to name gems would be a second state root. The fix
+        // is to say so — the dry run tells a human to pass both flags together, and this test
+        // pins the fact they have to.
+        let (dir, repo, state) = fixture();
+        let gems = dir.path().join("gems");
+        std::fs::create_dir_all(&gems).expect("gems");
+        std::fs::create_dir_all(repo.join(".bundle")).expect("bundle dir");
+        std::fs::write(
+            repo.join(".bundle").join("config"),
+            format!("---\nBUNDLE_PATH: \"{}\"\n", gems.display()),
+        )
+        .expect("config");
+
+        let inventory = inventory(&state).expect("inventory");
+        assert_eq!(inventory.outside.len(), 1, "{inventory:?}");
+        execute(&state, &inventory, false).expect("execute");
+        assert!(gems.exists(), "a plain --yes deleted it");
+
+        // The second run has nothing to consult, and says so by finding nothing at all.
+        let after = super::inventory(&state).expect("second inventory");
+        assert!(
+            after.outside.is_empty(),
+            "the entry cannot survive the registry it was found through: {after:?}"
+        );
+    }
+
+    #[test]
+    fn a_project_with_no_bundle_config_adds_no_outside_entry() {
+        // The negative control for every test above: this fixture has no `.bundle/`, and the
+        // inventory must not invent one.
+        let (_dir, _repo, state) = fixture();
+        let inventory = inventory(&state).expect("inventory");
+        assert!(inventory.outside.is_empty(), "{inventory:?}");
     }
 }

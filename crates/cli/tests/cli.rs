@@ -437,3 +437,146 @@ fn reset_token_removes_the_token_too_and_a_second_run_is_a_noop() {
     let stdout = String::from_utf8(again.stdout).expect("utf8");
     assert!(stdout.contains("zero state"), "{stdout}");
 }
+
+/// A `.bundle/config` in the fixture's repository naming `dir`, plus `dir` itself.
+fn with_bundle_path(repo: &std::path::Path, dir: &std::path::Path) {
+    std::fs::create_dir_all(dir).expect("gems dir");
+    std::fs::create_dir_all(repo.join(".bundle")).expect("bundle dir");
+    std::fs::write(
+        repo.join(".bundle").join("config"),
+        format!("---\nBUNDLE_PATH: \"{}\"\n", dir.display()),
+    )
+    .expect("config");
+}
+
+#[test]
+fn reset_lists_an_outside_directory_and_names_the_config_that_named_it() {
+    // Measured on the `black_jack` run: `bundle install` wrote gems into `~/.gem/shared` because the
+    // project's own `.bundle/config` said so. Nothing about that path says "immortality", so the
+    // report has to name both the directory and the file that named it — a path in a delete-list a
+    // human cannot trace is a path they have to go and investigate.
+    let (dir, state, repo) = reset_fixture();
+    let gems = dir.path().join("shared-gems");
+    with_bundle_path(&repo, &gems);
+
+    let request = std::process::Command::new(env!("CARGO_BIN_EXE_immortality"))
+        .env("IMMORTALITY_STATE_DIR", &state)
+        .arg("reset")
+        .output()
+        .expect("run");
+    assert!(request.status.success(), "{request:?}");
+    let stdout = String::from_utf8(request.stdout).expect("utf8");
+    assert!(stdout.contains("Outside the state root"), "{stdout}");
+    assert!(stdout.contains("shared-gems"), "{stdout}");
+    assert!(stdout.contains("BUNDLE_PATH"), "{stdout}");
+    assert!(
+        stdout.contains(".bundle/config") || stdout.contains(".bundle") && stdout.contains("config"),
+        "the report must name the config: {stdout}"
+    );
+    assert!(stdout.contains("--outside"), "{stdout}");
+    assert!(gems.exists(), "a dry run deleted it");
+}
+
+#[test]
+fn reset_yes_leaves_the_outside_directory_alone() {
+    // `--yes` means "delete what this program created". The gem directory is one the human's own
+    // `bundle install` also writes to, so deleting it on `--yes` would throw away work immortality
+    // did not do.
+    let (dir, state, repo) = reset_fixture();
+    let gems = dir.path().join("shared-gems");
+    with_bundle_path(&repo, &gems);
+    std::fs::write(gems.join("a.gem"), "gem").expect("gem");
+
+    let request = std::process::Command::new(env!("CARGO_BIN_EXE_immortality"))
+        .env("IMMORTALITY_STATE_DIR", &state)
+        .args(["reset", "--yes"])
+        .output()
+        .expect("run");
+    assert!(request.status.success(), "{request:?}");
+    let stdout = String::from_utf8(request.stdout).expect("utf8");
+    assert!(
+        stdout.contains("kept"),
+        "the report must say the directory is still there: {stdout}"
+    );
+    assert!(gems.join("a.gem").exists(), "--yes deleted it");
+    // And the reset did happen: the things it owns are gone.
+    assert!(!repo.join(".agent").exists());
+}
+
+#[test]
+fn reset_yes_outside_removes_the_directory_too() {
+    let (dir, state, repo) = reset_fixture();
+    let gems = dir.path().join("shared-gems");
+    with_bundle_path(&repo, &gems);
+    std::fs::write(gems.join("a.gem"), "gem").expect("gem");
+
+    let request = std::process::Command::new(env!("CARGO_BIN_EXE_immortality"))
+        .env("IMMORTALITY_STATE_DIR", &state)
+        .args(["reset", "--yes", "--outside"])
+        .output()
+        .expect("run");
+    assert!(request.status.success(), "{request:?}");
+    assert!(!gems.exists(), "--outside must delete it");
+    assert!(!repo.join(".agent").exists());
+}
+
+#[test]
+fn a_reset_whose_only_leftover_is_an_outside_directory_still_says_so() {
+    // The state a human reaches after `reset --yes`: everything immortality created is gone, and
+    // the one remaining thing is a directory the project's config named. Printing "zero state"
+    // there would be a lie about the machine, so the outside section comes first and the zero-state
+    // sentence after it.
+    let (dir, state, repo) = reset_fixture();
+    let gems = dir.path().join("shared-gems");
+    with_bundle_path(&repo, &gems);
+
+    let first = std::process::Command::new(env!("CARGO_BIN_EXE_immortality"))
+        .env("IMMORTALITY_STATE_DIR", &state)
+        .args(["reset", "--yes", "--token"])
+        .output()
+        .expect("run");
+    assert!(first.status.success(), "{first:?}");
+
+    let second = std::process::Command::new(env!("CARGO_BIN_EXE_immortality"))
+        .env("IMMORTALITY_STATE_DIR", &state)
+        .arg("reset")
+        .output()
+        .expect("run");
+    let stdout = String::from_utf8(second.stdout).expect("utf8");
+    // The registry is gone, so the directory can no longer be found — and the report says exactly
+    // that rather than claiming the machine is clean.
+    assert!(stdout.contains("zero state"), "{stdout}");
+    assert!(gems.exists());
+}
+
+#[test]
+fn the_json_dry_run_carries_the_outside_section() {
+    let (dir, state, repo) = reset_fixture();
+    let gems = dir.path().join("shared-gems");
+    with_bundle_path(&repo, &gems);
+
+    let request = std::process::Command::new(env!("CARGO_BIN_EXE_immortality"))
+        .env("IMMORTALITY_STATE_DIR", &state)
+        .args(["reset", "--json"])
+        .output()
+        .expect("run");
+    assert!(request.status.success(), "{request:?}");
+    let value: serde_json::Value = serde_json::from_slice(&request.stdout).expect("a JSON dry run");
+    let outside = value["outside"].as_array().expect("an outside array");
+    assert_eq!(outside.len(), 1, "{value}");
+    assert_eq!(outside[0]["key"], "BUNDLE_PATH");
+    assert!(
+        outside[0]["path"]
+            .as_str()
+            .expect("path")
+            .ends_with("shared-gems"),
+        "{value}"
+    );
+    assert!(
+        outside[0]["named_by"]
+            .as_str()
+            .expect("named_by")
+            .ends_with(".bundle/config"),
+        "{value}"
+    );
+}
