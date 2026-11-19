@@ -186,6 +186,10 @@ impl BriefRunner {
             // `delegate` call, which is the next thing that happens and which drains into the
             // journal a human actually reads.
             escalations: Vec::new(),
+            // Deliberately none: a brief shares the parent's registry and works in the parent's
+            // tree, so a sweep here would stop a server the parent started and still expects.
+            // The parent's own attempt end is where the cleanup belongs.
+            processes: None,
         }
     }
 }

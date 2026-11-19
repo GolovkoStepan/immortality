@@ -211,6 +211,13 @@ impl Sim {
             // The simulator's registry has no `escalate`, so there is nothing to collect and
             // nothing to drain.
             escalations: Vec::new(),
+            // A scenario that starts a process needs the sweep to see it, so the registry is the
+            // scenario's own directory and not the default. Every other scenario starts nothing
+            // and pays one `open` on an empty directory.
+            processes: Some(Arc::new(
+                immortality_tools::ProcessRegistry::open(self.root.join("processes"))
+                    .expect("process registry"),
+            )),
         }
     }
 }

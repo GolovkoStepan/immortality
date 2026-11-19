@@ -136,7 +136,7 @@ pub fn check_command(&self, command: &str) -> Verdict
 | `git` с `subcommand` = `add`/`commit`/`branch`/`worktree`/`stash` | `args`, `message`, `path`, `reason` | commit → Unknown (probe по `Immortality-Call` trailer); остальные подкоманды — Idempotent |
 | `update_state` | `file`, `content`, `replace` | ByContent; `NOTES.md`/`DECISIONS.md` создаются, план-документы — нет; урезать вдвое без `replace` нельзя (D-065, D-103) |
 | `shell` | `command`, `cwd`, `timeout_secs`, `env` | Unknown **всегда**: `cargo test` пишет в `target/`, упавший вызов неотличим от несостоявшегося (D-026) |
-| `start_process` | `command`, `cwd`, `env`, `name` | Unknown (probe по маркеру в командной строке, D-061) |
+| `start_process` | `command`, `cwd`, `env`, `name` | Unknown (probe по маркеру в командной строке, D-061). Переживает вызов, но не попытку: в её конце `stop_all` останавливает запущенное, а завершившийся ребёнок репается тайм-потоком (D-152) |
 | `kill_process` | `handle` | Idempotent |
 | `delegate` | `brief`, `scope`, `max_steps` | Unknown (probe по файлу отчёта, D-068); подключён к настоящему субагенту — см. ниже |
 

@@ -550,7 +550,8 @@ fn execute(run: Run) -> Result<TaskState, String> {
     };
     let judge = judged(&config, &project, &task, Arc::clone(&model))?;
     let deps = deps.with_judge(judge, &goal);
-    let registry = toolset::build(&deps).map_err(|error| format!("cannot build the tools: {error}"))?;
+    let (registry, processes) =
+        toolset::build_with_processes(&deps).map_err(|error| format!("cannot build the tools: {error}"))?;
 
     let gate = Arc::clone(&deps.gate);
     let runner = Runner {
@@ -597,6 +598,9 @@ fn execute(run: Run) -> Result<TaskState, String> {
         // The same collector the registry's `escalate` holds: the tool could not write the
         // journal, and this runner is the only thing holding it (D-117).
         escalations: vec![Arc::clone(&deps.escalations)],
+        // The same registry the process tools hold, so a sweep addresses the handles the model
+        // was given. A second registry over one directory would allocate the same `proc_1` twice.
+        processes: Some(processes),
     };
 
     wire_delegation(&runner, &deps.sub_agent);

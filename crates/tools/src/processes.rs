@@ -292,10 +292,17 @@ impl ProcessRegistry {
             .spawn()
             .map_err(|error| ToolError::io(directory, &error))?;
         let pid = child.id();
-        // Deliberately not stored and never `wait`ed: dropping the handle leaves the child
-        // running, which is what "long-lived" means. Zombies cannot accumulate because the
-        // process is reparented to launchd when the daemon exits.
-        drop(child);
+        // Dropping the handle leaves the child running, which is what "long-lived" means — but a
+        // dropped `Child` is also an *unreaped* one, and the previous version of this comment
+        // claimed otherwise ("reparented to launchd when the daemon exits"). That is true only
+        // once the daemon dies. While it lives, an exited child stays a zombie until its parent
+        // waits for it: measured on the daemon that ran the third `black_jack` task, which had
+        // accumulated two permanent `Z` entries after two `start_process` commands finished.
+        //
+        // So one small detached thread per process does nothing but wait. It is not a watcher and
+        // it holds no lock: `wait` is exactly the syscall that removes the zombie, and it returns
+        // the moment the child exits however it exits — including SIGKILL from `kill_process`.
+        reap_in_background(child);
 
         let record = ProcessRecord {
             handle,
@@ -312,11 +319,71 @@ impl ProcessRegistry {
         self.save(&record)?;
         Ok(record)
     }
+
+    /// Stop every tracked process that is still ours, and return the ones that were stopped.
+    ///
+    /// # The defect this exists for
+    ///
+    /// A `start_process` child outlives the call by design, and nothing outlived the *attempt*
+    /// that started it. Measured on the daemon that ran the third `black_jack` task: an `rspec`
+    /// started through `start_process` was still running 23 minutes after its attempt had been
+    /// rolled back, writing into a file the rollback had already unlinked — an inode no
+    /// `git status` will ever show. A rollback moves the tree out from under the process, so the
+    /// process is not "long-lived", it is writing to a deleted file.
+    ///
+    /// # Why only `Running`
+    ///
+    /// The same rule as `kill_process`: a pid we cannot identify as ours may be a stranger that
+    /// inherited the number, and a bulk cleanup is not a reason to lower that bar. A `Dead` record
+    /// needs nothing and an `Unknown` one is left alone — its handle is still there for a human.
+    ///
+    /// # Errors
+    /// The registry directory cannot be read. A process that could not be signalled is not an
+    /// error: the returned list says which were stopped, because the alternative is a cleanup that
+    /// fails the run it was cleaning up after.
+    pub fn stop_all(&self) -> Result<Vec<ProcessRecord>, ToolError> {
+        let mut stopped = Vec::new();
+        for handle in self.handles()? {
+            // A record that cannot be parsed names a process by a pid that may be gone. Skipping
+            // it is the same rule the tools follow: do not guess about a pid.
+            let Ok(record) = self.load(&handle) else {
+                continue;
+            };
+            if is_running(&record) != Liveness::Running {
+                continue;
+            }
+            terminate(&record);
+            stopped.push(record);
+        }
+        Ok(stopped)
+    }
 }
 
 /// The numeric part of a handle, for ordering.
 fn handle_number(handle: &str) -> Option<u64> {
     handle.strip_prefix("proc_")?.parse().ok()
+}
+
+/// Wait for a spawned child on a thread nobody joins, so it never becomes a zombie.
+///
+/// The daemon's complaint that started this: two `Z` rows under the daemon pid, both
+/// `start_process` commands that had long finished. A `Child` that is dropped is not reaped — the
+/// kernel keeps the exit status until the parent asks, and the parent here is a daemon that lives
+/// for days.
+///
+/// A thread rather than a reaper list because the cost is one stack per live command and the
+/// alternative is a second mechanism the daemon has to drive: the kernel already tells `wait` when
+/// the child is done, so the thread parks in the syscall and returns. `wait` returning `Err` is
+/// ignored — after a successful reap the pid is gone and there is nothing left to report to.
+fn reap_in_background(mut child: std::process::Child) {
+    // A failed spawn of the thread would leave the child unreaped, which is the defect this
+    // function exists to remove; there is nothing better to do than the `drop` that was already
+    // there, so the failure is not propagated.
+    let _ = std::thread::Builder::new()
+        .name("immortality-reaper".to_string())
+        .spawn(move || {
+            let _ = child.wait();
+        });
 }
 
 /// The highest handle number already on disk, or 0.
@@ -930,18 +997,27 @@ impl Tool for KillProcess {
 
         // The group, not the pid: a dev server that spawned a watcher must not leave the watcher
         // behind. `-pid` addresses the group started by `process_group(0)`.
-        signal_group(record.pid, "-TERM");
-        let deadline = Instant::now() + KILL_GRACE;
-        while Instant::now() < deadline {
-            if matches!(is_running(&record), Liveness::Dead) {
-                return Ok(killed(&record));
-            }
-            std::thread::sleep(Duration::from_millis(25));
-        }
-        signal_group(record.pid, "-KILL");
+        terminate(&record);
 
         Ok(killed(&record))
     }
+}
+
+/// Signal a running process's group and wait for it to go, escalating to `KILL` after the grace.
+///
+/// Shared with [`ProcessRegistry::terminate_all`] so that a bulk stop at the end of an attempt
+/// behaves exactly like the model's own `kill_process`: `TERM` first, so a well-behaved child can
+/// flush and remove its temp files, and `KILL` only for one that ignored it.
+fn terminate(record: &ProcessRecord) {
+    signal_group(record.pid, "-TERM");
+    let deadline = Instant::now() + KILL_GRACE;
+    while Instant::now() < deadline {
+        if matches!(is_running(record), Liveness::Dead) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    signal_group(record.pid, "-KILL");
 }
 
 fn killed(record: &ProcessRecord) -> ToolResult {
@@ -1384,6 +1460,80 @@ mod tests {
             "reading stderr must not advance the stdout cursor"
         );
         let _ = kill(dir.path(), &registry, json!({"handle": handle}));
+    }
+
+    /// The process state column for `pid`, or `None` when it is gone.
+    fn stat_of(pid: u32) -> Option<String> {
+        let output = std::process::Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "stat="])
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let stat = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        (!stat.is_empty()).then_some(stat)
+    }
+
+    #[test]
+    fn a_finished_process_is_reaped_instead_of_staying_a_zombie() {
+        // The daemon's own defect: two `Z` rows under the daemon's pid, both `start_process`
+        // commands that had finished long before. A dropped `Child` is not reaped, and a daemon
+        // that lives for days accumulates one entry per start — the kernel keeps the status of
+        // every unreaped child forever.
+        //
+        // `true` exits immediately, and the reaper thread is what collects it. The assertion is
+        // `stat` turning non-zombie: a pid that is gone from `ps` counts, because that is what a
+        // successful reap produces. A `Z` row is the failure and it persists, so this does not
+        // race in the direction that hides the bug.
+        let (dir, registry) = fixture();
+        let result = start(dir.path(), &registry, json!({"command": "true"})).unwrap();
+        let handle = handle_of(&result);
+        let pid = registry.load(&handle).unwrap().pid;
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let stat = stat_of(pid);
+            let zombie = stat.as_deref().is_some_and(|stat| stat.starts_with('Z'));
+            if !zombie {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the finished process stayed a zombie: {stat:?}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    #[test]
+    fn stop_all_takes_every_running_process_and_leaves_the_dead_alone() {
+        // What an attempt end does. The point is not "kill works" — `kill_process` covers that —
+        // but that the registry can sweep without the model naming each handle, because a
+        // process whose attempt was rolled back cannot name anything useful any more.
+        let (dir, registry) = fixture();
+        let live = handle_of(&start(dir.path(), &registry, json!({"command": "sleep 60"})).unwrap());
+        let gone = handle_of(&start(dir.path(), &registry, json!({"command": "true"})).unwrap());
+        // Let `true` exit and be reaped, so the sweep sees a `Dead` record rather than a live pid.
+        std::thread::sleep(Duration::from_millis(500));
+
+        let stopped = registry.stop_all().unwrap();
+        let handles: Vec<&str> = stopped.iter().map(|record| record.handle.as_str()).collect();
+        assert_eq!(handles, vec![live.as_str()], "only the live one is stopped");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if is_running(&registry.load(&live).unwrap()) != Liveness::Running {
+                break;
+            }
+            assert!(Instant::now() < deadline, "stop_all did not stop {live}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // The dead one is still readable afterwards: the record is what `read_process` uses to
+        // return the last output, and a sweep is not a deletion.
+        assert!(registry.load(&gone).is_ok());
     }
 
     #[test]

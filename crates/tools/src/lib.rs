@@ -37,8 +37,8 @@ pub use judge::{Judge, Judgement};
 pub use notify::{MacNotifier, Notifier, Silent, system};
 pub use policy::{Denial, Escalation, PathUse, PolicyGate, Verdict};
 pub use processes::{
-    KillProcess, Liveness, ProcessRecord, ProcessRegistry, ReadProcess, StartProcess, probe_started,
-    start_digest as process_start_digest,
+    KillProcess, Liveness, ProcessRecord, ProcessRegistry, ReadProcess, StartProcess, is_running,
+    probe_started, start_digest as process_start_digest,
 };
 pub use read::{ReadFile, looks_binary};
 pub use search::Grep;

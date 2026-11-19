@@ -547,6 +547,14 @@ pub struct Runner {
     /// A `Vec` rather than one queue because a sub-agent's brief writes to its own journal: the
     /// records must follow the writer, not the task.
     pub escalations: Vec<Arc<immortality_tools::JournalQueue>>,
+    /// The processes `start_process` started for this task, so the attempt can stop them.
+    ///
+    /// `None` for a caller with no process tools — the loop fixtures and the sub-agent's brief
+    /// runner, which shares the parent's registry and must not sweep the parent's processes.
+    /// A sweep is the difference between "a long-lived process" and "a process writing into an
+    /// inode the rollback already unlinked": measured on the third `black_jack` run, where a
+    /// `start_process` rspec outlived its rolled-back attempt by 23 minutes (D-152).
+    pub processes: Option<Arc<immortality_tools::ProcessRegistry>>,
 }
 
 impl std::fmt::Debug for Runner {
@@ -626,7 +634,9 @@ impl Runner {
         let base = attempt.base_checkpoint.clone();
         let mut report = state.report(&ending);
         if ending == Ending::Claimed {
-            return self.settle_claim(subtask, attempt, report, state.steps, base, journal);
+            let outcome = self.settle_claim(subtask, attempt, report, state.steps, base, journal)?;
+            self.stop_processes(journal)?;
+            return Ok(outcome);
         }
         // The step budget running out is not the same thing as the work not being done, and the
         // difference is not hypothetical: measured on the third live `black_jack` run, an attempt
@@ -637,7 +647,10 @@ impl Runner {
         // every step would double the cost of the cheapest attempt to make the rarest one work.
         if ending == Ending::Steps {
             match self.settle_exhausted(subtask, attempt, report, state.steps, base.clone(), journal)? {
-                Settlement::Settled(outcome) => return Ok(outcome),
+                Settlement::Settled(outcome) => {
+                    self.stop_processes(journal)?;
+                    return Ok(outcome);
+                }
                 Settlement::NotSettled {
                     attempt: back,
                     report: back_report,
@@ -691,6 +704,10 @@ impl Runner {
             payload,
             &Scope::attempt(subtask.id.clone(), attempt_number),
         )?;
+        // After the attempt is closed, never before: a sweep that ran first would be one more
+        // thing a failed attempt could die in the middle of, and the attempt's own ending is the
+        // record recovery needs most.
+        self.stop_processes(journal)?;
 
         Ok(RunOutcome {
             attempt,
@@ -700,6 +717,51 @@ impl Runner {
             gates: None,
             base_checkpoint: base,
         })
+    }
+
+    /// Stop every process this task's `start_process` started, and journal what was stopped.
+    ///
+    /// # Why at attempt end, and not only at task end
+    ///
+    /// The attempt is the unit whose tree a rollback moves. A process that is still running when
+    /// its attempt is rolled back is writing into an inode the rollback already unlinked — the
+    /// 23-minute `rspec` measured on the third `black_jack` run, invisible to `git status` and to
+    /// every gate. A task-level sweep would still leave that window open for every restart, and the
+    /// restart is exactly when the tree moves.
+    ///
+    /// # Why the record names each process
+    ///
+    /// "the attempt stopped two processes" is not something a human can check. The record carries
+    /// the handle, the command and the pid, because the model's own plan may have written a handle
+    /// down and its next attempt deserves to know why the server it started is gone.
+    ///
+    /// # Errors
+    /// The journal cannot be written, which is the caller's to surface. A process the registry
+    /// could not read is skipped rather than failing the attempt: the sweep must never be the
+    /// reason an attempt fails.
+    fn stop_processes(&self, journal: &mut Journal) -> immortality_core::Result<()> {
+        let Some(registry) = self.processes.as_deref() else {
+            return Ok(());
+        };
+        let Ok(stopped) = registry.stop_all() else {
+            // The registry directory is unreadable, so there is nothing to sweep and no honest
+            // record to write. The attempt's own outcome is more important than this failure.
+            return Ok(());
+        };
+        for record in stopped {
+            journal.append_scoped(
+                self.clock.now(),
+                Kind::ProcessStopped,
+                serde_json::json!({
+                    "handle": record.handle,
+                    "pid": record.pid,
+                    "command": record.command,
+                    "why": "the attempt ended, so the process it started was stopped",
+                }),
+                &Scope::task(),
+            )?;
+        }
+        Ok(())
     }
 
     /// A session that runs attempts at `subtask` until one ends it.
@@ -2855,6 +2917,9 @@ mod tests {
             // No collector by default: a test that wants an escalation in the journal builds its
             // own and asserts on it, rather than every loop test carrying a queue it never uses.
             escalations: Vec::new(),
+            // No process registry either: most loop tests start no process, and the one that does
+            // builds its own so the sweep's records can be asserted on.
+            processes: None,
         };
         (dir, runner)
     }
@@ -5361,6 +5426,53 @@ mod tests {
                 .map_err(|error| immortality_tools::ToolError::Refused(error.to_string()))?;
             Ok(immortality_tools::ToolResult::new("asked", serde_json::json!({})))
         }
+    }
+
+    #[test]
+    fn an_attempt_that_ends_stops_the_processes_it_started() {
+        // The measured defect (D-152): a `start_process` rspec outlived its attempt by 23 minutes
+        // and kept writing into a file the rollback had already unlinked. The window is the
+        // attempt, not the task: the rollback is what moves the tree out from under the process.
+        //
+        // The assertion is on the effect and on the record. A journal that said "stopped" while
+        // the pid lived would be exactly the "molnchalivaya lzh" the design forbids, so the pid is
+        // checked through the registry's own liveness probe.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let processes = Arc::new(
+            immortality_tools::ProcessRegistry::open(dir.path().join("processes")).expect("registry"),
+        );
+        // A real tool set is not needed for the *sweep*: `start_process` is exercised by its own
+        // tests, and this test is about the runner calling the registry at the right moment.
+        let started = processes
+            .start("sleep 60", dir.path(), &[], &format!("sha256:{}", "a".repeat(64)))
+            .expect("a long-lived process");
+        let pid = started.pid;
+
+        let model = Scripted::new(looping_replies(2));
+        let (_dir, mut runner) = runner(model, registry(vec![Arc::new(Touch)]));
+        runner.limits.max_steps = 1;
+        runner.processes = Some(Arc::clone(&processes));
+        let mut journal = journal(&dir);
+        let outcome = runner.run(&subtask(), 1, "", &mut journal).expect("attempt");
+
+        assert!(matches!(outcome.ending, Ending::Steps), "{:?}", outcome.ending);
+        // Stopped, and stopped for the right reason: the process the attempt started is gone.
+        assert_eq!(
+            immortality_tools::is_running(&processes.load(&started.handle).expect("record")),
+            immortality_tools::Liveness::Dead,
+            "the process started during the attempt must not outlive it (pid {pid})"
+        );
+        let records = journal_records(&dir);
+        let stopped: Vec<&immortality_core::journal::JournalRecord> = records
+            .iter()
+            .filter(|record| record.fields.kind == Kind::ProcessStopped)
+            .collect();
+        assert_eq!(stopped.len(), 1, "{:?}", stopped.len());
+        assert_eq!(
+            stopped[0].event.payload["handle"],
+            serde_json::json!(started.handle),
+        );
+        assert_eq!(stopped[0].event.payload["pid"], serde_json::json!(pid));
     }
 
     #[test]
