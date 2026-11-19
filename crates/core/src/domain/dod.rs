@@ -24,7 +24,26 @@ pub struct DodCheck {
     /// (`cargo outdated`), which is why the flag is explicit rather than implied.
     #[serde(default = "default_true")]
     pub required: bool,
+    /// How long this check may run, overriding the configured gate default.
+    ///
+    /// # The defect this replaces
+    ///
+    /// The timeout used to be one number for every check, `shell::DEFAULT_TIMEOUT_SECS` (120 s),
+    /// with no way to change it. A live `black_jack` run had a suite that legitimately took
+    /// 6 m 39 s: `bundle exec rspec` timed out on every single attempt, the subtask blocked, and
+    /// the task ended `failed_gates` — with the work actually done. The check was not slow, the
+    /// gate was too short, and the plan had no way to say so.
+    ///
+    /// `None` keeps the configured default, so an existing `TASKS.json` is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
 }
+
+/// The longest a single check may run.
+///
+/// The same cap the `shell` tool enforces, re-exported so a plan cannot ask for a deadline the
+/// runner would silently clamp: a validation error at plan time beats a timeout at gate time.
+pub const MAX_CHECK_TIMEOUT_SECS: u64 = 600;
 
 const fn default_true() -> bool {
     true
@@ -72,6 +91,12 @@ pub enum DodInvalid {
 
     #[error("no checks and no review: nothing would gate this subtask")]
     NoGate,
+
+    #[error("check `{id}` asks for a {timeout_secs} s deadline, above the {max} s maximum")]
+    TimeoutTooLong { id: String, timeout_secs: u64, max: u64 },
+
+    #[error("check `{id}` asks for a zero-second deadline, which no command can meet")]
+    ZeroTimeout { id: String },
 }
 
 /// Whether `command` contains an unquoted single `|`, which makes its exit code the wrong number.
@@ -169,6 +194,18 @@ impl Dod {
                     command: check.command.trim().to_string(),
                 });
             }
+            if let Some(timeout_secs) = check.timeout_secs {
+                if timeout_secs == 0 {
+                    return Err(DodInvalid::ZeroTimeout { id: check.id.clone() });
+                }
+                if timeout_secs > MAX_CHECK_TIMEOUT_SECS {
+                    return Err(DodInvalid::TimeoutTooLong {
+                        id: check.id.clone(),
+                        timeout_secs,
+                        max: MAX_CHECK_TIMEOUT_SECS,
+                    });
+                }
+            }
         }
         Ok(())
     }
@@ -229,11 +266,13 @@ mod tests {
                     id: "test".into(),
                     command: "cargo test".into(),
                     required: true,
+                    timeout_secs: None,
                 },
                 DodCheck {
                     id: "test".into(),
                     command: "cargo nextest".into(),
                     required: true,
+                    timeout_secs: None,
                 },
             ],
             review: false,
@@ -252,6 +291,7 @@ mod tests {
                 id: "build".into(),
                 command: "  ".into(),
                 required: true,
+                timeout_secs: None,
             }],
             review: false,
         };
@@ -270,6 +310,7 @@ mod tests {
                     id: id.into(),
                     command: "true".into(),
                     required: true,
+                    timeout_secs: None,
                 }],
                 review: false,
             };
@@ -286,16 +327,19 @@ mod tests {
                     id: "build".into(),
                     command: "cargo build".into(),
                     required: true,
+                    timeout_secs: None,
                 },
                 DodCheck {
                     id: "outdated".into(),
                     command: "cargo outdated".into(),
                     required: false,
+                    timeout_secs: None,
                 },
                 DodCheck {
                     id: "test".into(),
                     command: "cargo test".into(),
                     required: true,
+                    timeout_secs: None,
                 },
             ],
             review: false,
@@ -318,6 +362,15 @@ mod tests {
         assert!(err.to_string().contains("cheks"), "{err}");
     }
 
+    /// A `DoD` whose only check is the one under test.
+    fn dod_with(check: DodCheck) -> Dod {
+        Dod {
+            statement: "s".into(),
+            checks: vec![check],
+            review: false,
+        }
+    }
+
     fn one_check(command: &str) -> Dod {
         Dod {
             statement: "s".into(),
@@ -325,6 +378,7 @@ mod tests {
                 id: "test".into(),
                 command: command.into(),
                 required: true,
+                timeout_secs: None,
             }],
             review: false,
         }
@@ -371,5 +425,58 @@ mod tests {
         // The scan must not be talked out of a real pipeline by an unbalanced or closed quote.
         assert!(one_check("echo 'done' | tee log").validate().is_err());
         assert!(one_check("echo \"x\" | tee log").validate().is_err());
+    }
+
+    #[test]
+    fn a_deadline_above_the_cap_is_a_planning_error_not_a_silent_clamp() {
+        // `run_command` clamps to `MAX_TIMEOUT_SECS`. If a plan could ask for 3600 s and the runner
+        // quietly ran it for 600, the author would read "the check timed out at its deadline" and be
+        // wrong about a number they wrote themselves. The refusal happens at plan time instead.
+        let mut check = DodCheck {
+            id: "test".into(),
+            command: "cargo test".into(),
+            required: true,
+            timeout_secs: Some(MAX_CHECK_TIMEOUT_SECS + 1),
+        };
+        assert_eq!(
+            dod_with(check.clone()).validate().unwrap_err(),
+            DodInvalid::TimeoutTooLong {
+                id: "test".into(),
+                timeout_secs: MAX_CHECK_TIMEOUT_SECS + 1,
+                max: MAX_CHECK_TIMEOUT_SECS,
+            }
+        );
+        // The cap itself is allowed: a plan may use all of it.
+        check.timeout_secs = Some(MAX_CHECK_TIMEOUT_SECS);
+        assert!(dod_with(check).validate().is_ok());
+    }
+
+    #[test]
+    fn a_zero_second_deadline_is_refused_because_no_command_can_meet_it() {
+        let check = DodCheck {
+            id: "test".into(),
+            command: "true".into(),
+            required: true,
+            timeout_secs: Some(0),
+        };
+        assert_eq!(
+            dod_with(check).validate().unwrap_err(),
+            DodInvalid::ZeroTimeout { id: "test".into() }
+        );
+    }
+
+    #[test]
+    fn a_declared_deadline_survives_a_json_round_trip_and_an_absent_one_stays_absent() {
+        // The field is `Option` with `skip_serializing_if`, so an old `TASKS.json` keeps loading and
+        // a new one does not grow a `"timeout_secs": null` on every check.
+        let with = r#"{"statement":"s","checks":[{"id":"t","command":"c","timeout_secs":540}]}"#;
+        let dod: Dod = serde_json::from_str(with).unwrap();
+        assert_eq!(dod.checks[0].timeout_secs, Some(540));
+
+        let without = r#"{"statement":"s","checks":[{"id":"t","command":"c"}]}"#;
+        let dod: Dod = serde_json::from_str(without).unwrap();
+        assert_eq!(dod.checks[0].timeout_secs, None);
+        let written = serde_json::to_string(&dod).unwrap();
+        assert!(!written.contains("timeout_secs"), "{written}");
     }
 }

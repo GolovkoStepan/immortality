@@ -194,6 +194,69 @@ fn a_quoted_strategy_is_one_line_and_bounded() {
 }
 
 #[test]
+fn a_rejected_idea_keeps_the_end_where_the_failure_is() {
+    // Measured on the live `black_jack` journal. The gate's verdict on a 192-example `rspec` run
+    // is 1304 characters long, and the sentence that names the failing example sits at character
+    // 960 because forty lines of progress dots come first. Cutting at 400 showed the next attempt
+    //
+    //   `rspec_after_add` (exit 1) … 267 earlier line(s) not shown #comp_move_msg outputs the …
+    //
+    // — a table of contents with no failure in it — and the run lost another attempt to the same
+    // one example. The tail is the evidence; the head only says which attempt it was.
+    let progress = (0..267)
+        .map(|n| format!("#comp_move_msg outputs message {n}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let idea = format!(
+        "the claim was rejected: `rspec_after_add` (exit 1) … 267 earlier line(s) not shown \
+         {progress} \
+         1) BlackJack::Interface#wait_and_clean clears the screen via Kernel.system \
+         Failure/Error: expect(Kernel).to receive(:system).with('clear') \
+         received: 0 times \
+         # ./spec/lib/black_jack/interface_edge_spec.rb:100 \
+         Finished in 0.03 seconds \
+         192 examples, 1 failure"
+    );
+    let text = strategy(&Cause::Stalled, "", &[idea]);
+    assert!(
+        text.contains("received: 0 times"),
+        "the failure itself must reach the next attempt's brief: {text}"
+    );
+    assert!(
+        text.contains("interface_edge_spec.rb:100"),
+        "the file and line must reach it: {text}"
+    );
+    assert!(
+        text.contains("`rspec_after_add` (exit 1)"),
+        "and the head still says which check: {text}"
+    );
+    // Still one bounded line per idea: the brief is re-sent on every step. The budget covers the
+    // two halves plus `" … "` and the `"- "` bullet prefix.
+    let bullet = text
+        .lines()
+        .find(|line| line.starts_with("- the claim was rejected"))
+        .expect("the bullet");
+    assert!(
+        bullet.chars().count() <= IDEA_HEAD_CHARS + IDEA_TAIL_CHARS + 5,
+        "{}",
+        bullet.chars().count()
+    );
+    assert!(
+        bullet.contains(" … "),
+        "the cut is marked, so the halves are not read as adjacent: {bullet}"
+    );
+}
+
+#[test]
+fn a_short_rejected_idea_is_not_cut_at_all() {
+    // The marker exists for what was dropped. An idea that fits must not carry one, or every brief
+    // would claim an omission that never happened.
+    let text = strategy(&Cause::Stalled, "", &["rewriting the lexer".to_string()]);
+    assert!(text.contains("- rewriting the lexer"), "{text}");
+    assert!(!text.contains('…'), "{text}");
+}
+
+#[test]
 fn budget_causes_point_at_the_budget_that_ran_out() {
     // Steps, tokens and time ask for different corrections: a restart that told a token-bound
     // attempt to "take smaller steps" would change the wrong thing.

@@ -87,6 +87,19 @@ pub struct ServerState {
 }
 
 impl ServerState {
+    /// The task running now in `project`, if any.
+    ///
+    /// A read-only view of the same map [`crate::start::RunSlot`] claims. A command that writes
+    /// into `.agent/` asks this first: the plan on disk is what the live run is executing, and
+    /// rewriting it under a running task is the same class of mistake as starting a second run.
+    #[must_use]
+    pub fn running_in(&self, project: &str) -> Option<TaskId> {
+        self.running
+            .lock()
+            .ok()
+            .and_then(|running| running.get(project).cloned())
+    }
+
     /// State reading its token from `state_root`.
     ///
     /// # Errors

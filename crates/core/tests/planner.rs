@@ -25,6 +25,7 @@ fn dod() -> Dod {
             id: "test".to_string(),
             command: "cargo test".to_string(),
             required: true,
+            timeout_secs: None,
         }],
         review: false,
     }
@@ -379,6 +380,18 @@ fn the_system_message_forbids_ids_and_demands_a_gate() {
     assert!(planner::SYSTEM.contains("names"), "{}", planner::SYSTEM);
     assert!(planner::SYSTEM.contains("gate"), "{}", planner::SYSTEM);
     assert!(planner::SYSTEM.contains("have no tools") || planner::SYSTEM.contains("do not have tools"));
+}
+
+#[test]
+fn the_system_message_teaches_the_per_check_deadline() {
+    // The `black_jack` post-mortem: the planner was never told a check could declare more time, so
+    // every plan it wrote inherited the 120 s default and a 6 m 39 s suite could only ever time out.
+    // Telling the model about the field is the half of the fix that lives in the prompt; the other
+    // half is `Dod::validate` refusing a deadline the runner would clamp.
+    assert!(planner::SYSTEM.contains("timeout_secs"), "{}", planner::SYSTEM);
+    assert!(planner::SYSTEM.contains("600"), "{}", planner::SYSTEM);
+    // And it must still forbid the pipeline shortcut the timeout invites ("just pipe it to tail").
+    assert!(planner::SYSTEM.contains("pipeline"), "{}", planner::SYSTEM);
 }
 
 #[test]

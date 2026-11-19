@@ -37,6 +37,7 @@ use std::time::Duration;
 
 use immortality_core::config::Config;
 use immortality_core::domain::Subtask;
+use immortality_core::ids::TaskId;
 use immortality_core::plan::{Plan, PlanError};
 use immortality_core::planner::{self, Proposal};
 use immortality_llm::Backend;
@@ -192,6 +193,26 @@ pub async fn write_plan(state: &ServerState, params: &Value) -> Result<Value, Rp
         return Err(bad_params(format!(
             "a plan is already here ({}); edit it by hand, or pass --force to replace it",
             present.names().join(", ")
+        )));
+    }
+    // A live run is executing the plan on disk. Replacing it would swap the tree out from under
+    // a task that already read it, and the run would keep going with subtasks that no longer
+    // exist — `--force` is not permission to collide with it. `start --force` claims the project's
+    // slot before it plans (D-142), so the caller it names in `caller` is the one legitimate
+    // holder: allowing exactly that id is what lets `start` plan at all, without opening a second
+    // door onto the same collision for anyone else.
+    let caller = params
+        .get("caller")
+        .and_then(Value::as_str)
+        .and_then(|caller| TaskId::parse(caller).ok());
+    if let Some(holder) = state
+        .running_in(&project.id)
+        .filter(|holder| caller.as_ref() != Some(holder))
+    {
+        return Err(bad_params(format!(
+            "a task is running in this project ({holder}), and it is executing the plan this \
+             would replace. Wait for it or watch it with `immortality attach {holder}`; \
+             `immortality status` lists it."
         )));
     }
 

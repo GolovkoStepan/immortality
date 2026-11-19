@@ -42,6 +42,7 @@
 //! the attempt `Succeeded`; a red one closes it `Failed` with the gate's reason, and the report
 //! carries what the gate said so the next attempt can act on it instead of re-guessing.
 
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -546,6 +547,14 @@ pub struct Runner {
     /// A `Vec` rather than one queue because a sub-agent's brief writes to its own journal: the
     /// records must follow the writer, not the task.
     pub escalations: Vec<Arc<immortality_tools::JournalQueue>>,
+    /// The processes `start_process` started for this task, so the attempt can stop them.
+    ///
+    /// `None` for a caller with no process tools — the loop fixtures and the sub-agent's brief
+    /// runner, which shares the parent's registry and must not sweep the parent's processes.
+    /// A sweep is the difference between "a long-lived process" and "a process writing into an
+    /// inode the rollback already unlinked": measured on the third `black_jack` run, where a
+    /// `start_process` rspec outlived its rolled-back attempt by 23 minutes (D-152).
+    pub processes: Option<Arc<immortality_tools::ProcessRegistry>>,
 }
 
 impl std::fmt::Debug for Runner {
@@ -625,7 +634,9 @@ impl Runner {
         let base = attempt.base_checkpoint.clone();
         let mut report = state.report(&ending);
         if ending == Ending::Claimed {
-            return self.settle_claim(subtask, attempt, report, state.steps, base, journal);
+            let outcome = self.settle_claim(subtask, attempt, report, state.steps, base, journal)?;
+            self.stop_processes(journal)?;
+            return Ok(outcome);
         }
         // The step budget running out is not the same thing as the work not being done, and the
         // difference is not hypothetical: measured on the third live `black_jack` run, an attempt
@@ -636,7 +647,10 @@ impl Runner {
         // every step would double the cost of the cheapest attempt to make the rarest one work.
         if ending == Ending::Steps {
             match self.settle_exhausted(subtask, attempt, report, state.steps, base.clone(), journal)? {
-                Settlement::Settled(outcome) => return Ok(outcome),
+                Settlement::Settled(outcome) => {
+                    self.stop_processes(journal)?;
+                    return Ok(outcome);
+                }
                 Settlement::NotSettled {
                     attempt: back,
                     report: back_report,
@@ -690,6 +704,10 @@ impl Runner {
             payload,
             &Scope::attempt(subtask.id.clone(), attempt_number),
         )?;
+        // After the attempt is closed, never before: a sweep that ran first would be one more
+        // thing a failed attempt could die in the middle of, and the attempt's own ending is the
+        // record recovery needs most.
+        self.stop_processes(journal)?;
 
         Ok(RunOutcome {
             attempt,
@@ -699,6 +717,51 @@ impl Runner {
             gates: None,
             base_checkpoint: base,
         })
+    }
+
+    /// Stop every process this task's `start_process` started, and journal what was stopped.
+    ///
+    /// # Why at attempt end, and not only at task end
+    ///
+    /// The attempt is the unit whose tree a rollback moves. A process that is still running when
+    /// its attempt is rolled back is writing into an inode the rollback already unlinked — the
+    /// 23-minute `rspec` measured on the third `black_jack` run, invisible to `git status` and to
+    /// every gate. A task-level sweep would still leave that window open for every restart, and the
+    /// restart is exactly when the tree moves.
+    ///
+    /// # Why the record names each process
+    ///
+    /// "the attempt stopped two processes" is not something a human can check. The record carries
+    /// the handle, the command and the pid, because the model's own plan may have written a handle
+    /// down and its next attempt deserves to know why the server it started is gone.
+    ///
+    /// # Errors
+    /// The journal cannot be written, which is the caller's to surface. A process the registry
+    /// could not read is skipped rather than failing the attempt: the sweep must never be the
+    /// reason an attempt fails.
+    fn stop_processes(&self, journal: &mut Journal) -> immortality_core::Result<()> {
+        let Some(registry) = self.processes.as_deref() else {
+            return Ok(());
+        };
+        let Ok(stopped) = registry.stop_all() else {
+            // The registry directory is unreadable, so there is nothing to sweep and no honest
+            // record to write. The attempt's own outcome is more important than this failure.
+            return Ok(());
+        };
+        for record in stopped {
+            journal.append_scoped(
+                self.clock.now(),
+                Kind::ProcessStopped,
+                serde_json::json!({
+                    "handle": record.handle,
+                    "pid": record.pid,
+                    "command": record.command,
+                    "why": "the attempt ended, so the process it started was stopped",
+                }),
+                &Scope::task(),
+            )?;
+        }
+        Ok(())
     }
 
     /// A session that runs attempts at `subtask` until one ends it.
@@ -976,7 +1039,25 @@ fn record_gate(
 ) -> immortality_core::Result<()> {
     let payload =
         serde_json::to_value(record).map_err(|error| immortality_core::Error::Protocol(error.to_string()))?;
-    journal.append_scoped(at, Kind::GateResult, payload, scope)?;
+    // A red check's whole output is an artifact, and the **record's** `artifact` field is what
+    // `gc` reads to decide the body is live (`gc::referenced_artifacts`). Leaving the digest only
+    // inside `payload` would make a failed gate's evidence collectable while the task is still
+    // running — which is the one case the live set exists to protect (D-156).
+    match record.artifact() {
+        Some(digest) => {
+            let digest = immortality_core::journal::parse_digest(digest)
+                .map_err(|error| immortality_core::Error::Protocol(error.to_string()))?;
+            journal.append_full_scoped(
+                at,
+                Kind::GateResult,
+                immortality_core::journal::JournalEvent::spilled(payload, digest),
+                scope,
+            )?;
+        }
+        None => {
+            journal.append_scoped(at, Kind::GateResult, payload, scope)?;
+        }
+    }
     Ok(())
 }
 
@@ -1115,6 +1196,43 @@ impl<'a> AttemptSession<'a> {
                 // Nothing is started, so nothing is written: the stop is the caller's to act on,
                 // and the scheduler owns what a subtask becomes.
                 Decision::Stop(stop) => {
+                    // One stop does leave work behind, and it is the one the scheduler answers by
+                    // starting *another* subtask: an exhausted subtask becomes `blocked`, the task
+                    // runs its next independent subtask, and that subtask's base checkpoint would
+                    // be this one's dirty tree. Measured on `black_jack`: a blocked subtask's
+                    // hanging spec stayed on disk, every later subtask started from it, and no
+                    // rollback could ever remove it because each base contained it already.
+                    //
+                    // So the spent subtask's work is set aside — snapshotted, named in the
+                    // journal, then removed from the tree — before the caller moves on.
+                    if matches!(stop, Stop::Exhausted(_)) {
+                        match self.discard(outcome.attempt.number, journal)? {
+                            Discard::Done { discarded } => {
+                                if let Some(sha) = discarded {
+                                    // The blocked subtask's report is what a human reopens it
+                                    // from, so it has to say where the work went: "your work was
+                                    // discarded" without a name is the loss the branch exists to
+                                    // prevent.
+                                    let _ = write!(
+                                        self.report.outcome,
+                                        "\nThe work of attempt {} was set aside in checkpoint {sha} \
+                                         and the tree was returned to the subtask's base, so the next \
+                                         subtask does not start on it.",
+                                        outcome.attempt.number
+                                    );
+                                }
+                            }
+                            // A tree that could not be put back is not a tree to build on, and the
+                            // stop says git's words rather than pretending the rollback happened.
+                            Discard::Blocked(reason) => {
+                                return Ok(SessionEnd {
+                                    outcome,
+                                    stop: Stop::Blocked(reason),
+                                    report: self.report.clone(),
+                                });
+                            }
+                        }
+                    }
                     return Ok(SessionEnd {
                         outcome,
                         stop,
@@ -1385,6 +1503,106 @@ impl<'a> AttemptSession<'a> {
         )?;
         Ok(RollBack::Done)
     }
+
+    /// Set a blocked subtask's work aside and return the tree to its base.
+    ///
+    /// # The defect this exists for
+    ///
+    /// `blocked` is a *settled* state: [`immortality_core::scheduler::next`] moves the task on to
+    /// its next independent subtask, and [`AttemptSession::drive`] of that subtask takes its own
+    /// base from whatever is on disk. Nothing in between puts the tree back — a `Retry` and a
+    /// restore both leave the work where it is, and an `Exhausted` stop never rolls back at all.
+    /// So a blocked subtask's half-finished, wrong, or actively harmful work became the next
+    /// subtask's starting point.
+    ///
+    /// Measured on the third live `black_jack` run: a spec file that hangs forever was committed
+    /// into the base checkpoint at 05:57, every later subtask's base contained it, and no rollback
+    /// could remove it because rolling back to a base that holds it is not removal. The run was
+    /// unrecoverable from that point and no gate could have said so, because the poison was in the
+    /// starting tree rather than in any diff.
+    ///
+    /// # Why the work is snapshotted first
+    ///
+    /// The same rule as an L3 restart, and for the same reason: the work is about to disappear
+    /// from the tree, and the subtask's report is what a human reopens it from. A human told
+    /// "your blocked subtask's work was set aside" has to be able to find it.
+    ///
+    /// # Why no `rollback` marker
+    ///
+    /// `role: "rollback"` promises a following `attempt_restarted`, and recovery treats one
+    /// without it as an interrupted restart to finish. This discard happens *after* the attempt is
+    /// closed, so there is no restart to confirm; it writes `role: "settled"` instead, which names
+    /// where the tree now is without claiming a rollback is in flight.
+    fn discard(&self, closed: u32, journal: &mut Journal) -> immortality_core::Result<Discard> {
+        // A caller with no checkpoint world is a test, not a run: there is no base and no git.
+        if self.runner.checkpoints.is_none() {
+            return Ok(Discard::Done { discarded: None });
+        }
+        let Some(base) = self.base.clone() else {
+            // No base means the tree cannot be put back (a repository with no commits, or a
+            // first-attempt snapshot that failed). The work stays, and the report says so rather
+            // than letting the next subtask inherit it in silence.
+            return Ok(Discard::Done { discarded: None });
+        };
+        let checkpoints = self
+            .runner
+            .checkpoints
+            .as_deref()
+            .ok_or_else(|| immortality_core::Error::Protocol("no checkpoint world".to_string()))?;
+        let reason = format!(
+            "the work of `{}`, blocked after attempt {closed}, set aside so the next subtask \
+             starts from its own base",
+            self.subtask.title
+        );
+        let taken = match checkpoint_snapshot(checkpoints, &reason) {
+            Ok(taken) => taken,
+            // A snapshot that could not be taken is not a reason to leave the tree alone: the
+            // work stays and is named as unset-aside, which is worse than a lost SHA but still
+            // better than claiming the discard happened.
+            Err(why) => return Ok(Discard::Blocked(why)),
+        };
+        let discarded = match taken {
+            Some(safety) => {
+                record_checkpoint(
+                    self.runner.clock.now(),
+                    journal,
+                    &self.subtask.id,
+                    closed,
+                    &safety,
+                    "discarded",
+                )?;
+                Some(safety.sha)
+            }
+            None => None,
+        };
+        if let Err(why) = checkpoints.restore(&base.sha) {
+            return Ok(Discard::Blocked(why));
+        }
+        journal.append_scoped(
+            self.runner.clock.now(),
+            Kind::CheckpointCreated,
+            serde_json::json!({
+                "sha": base.sha,
+                "branch": base.branch,
+                "role": "settled",
+                "attempt": closed,
+                "why": reason,
+            }),
+            &Scope::attempt(self.subtask.id.clone(), closed),
+        )?;
+        Ok(Discard::Done { discarded })
+    }
+}
+
+/// What setting a blocked subtask's work aside produced.
+enum Discard {
+    /// The tree is back at the base; the SHA of the set-aside work, when there was any.
+    Done {
+        /// The checkpoint the discarded work was written to, or `None` for a clean tree.
+        discarded: Option<String>,
+    },
+    /// The tree could not be put back, and the string is why.
+    Blocked(String),
 }
 
 /// What a session stopped on.
@@ -2717,6 +2935,9 @@ mod tests {
             // No collector by default: a test that wants an escalation in the journal builds its
             // own and asserts on it, rather than every loop test carrying a queue it never uses.
             escalations: Vec::new(),
+            // No process registry either: most loop tests start no process, and the one that does
+            // builds its own so the sweep's records can be asserted on.
+            processes: None,
         };
         (dir, runner)
     }
@@ -2798,7 +3019,11 @@ mod tests {
             Ok(())
         }
 
-        fn run(&self, command: &str) -> Result<immortality_core::gate::CommandRun, String> {
+        fn run(
+            &self,
+            command: &str,
+            _timeout: Option<Duration>,
+        ) -> Result<immortality_core::gate::CommandRun, String> {
             if let Ok(mut runs) = self.runs.lock() {
                 runs.push(command.to_string());
             }
@@ -2810,7 +3035,14 @@ mod tests {
                 exit_code: Some(i32::from(failed)),
                 timed_out: false,
                 duration_ms: 1,
-                output_tail: if failed { "boom".to_string() } else { String::new() },
+                output_tail: if failed {
+                    "boom: 192 examples, 1 failure".to_string()
+                } else {
+                    String::new()
+                },
+                stdout_lines: usize::from(failed),
+                stderr_lines: 0,
+                artifact: None,
             })
         }
     }
@@ -2965,6 +3197,7 @@ mod tests {
                 id: "build".to_string(),
                 command: "cargo build".to_string(),
                 required: true,
+                timeout_secs: None,
             }],
             review: false,
         };
@@ -3010,11 +3243,13 @@ mod tests {
                     id: "outdated".to_string(),
                     command: "cargo outdated".to_string(),
                     required: false,
+                    timeout_secs: None,
                 },
                 immortality_core::domain::DodCheck {
                     id: "build".to_string(),
                     command: "cargo build".to_string(),
                     required: true,
+                    timeout_secs: None,
                 },
             ],
             review: false,
@@ -3044,6 +3279,7 @@ mod tests {
                 id: "test".to_string(),
                 command: "sudo cargo test".to_string(),
                 required: true,
+                timeout_secs: None,
             }],
             review: false,
         };
@@ -3119,6 +3355,7 @@ mod tests {
                 id: "build".to_string(),
                 command: "cargo build".to_string(),
                 required: true,
+                timeout_secs: None,
             }],
             review: true,
         };
@@ -4153,6 +4390,7 @@ mod tests {
                 id: "build".to_string(),
                 command: "cargo build".to_string(),
                 required: true,
+                timeout_secs: None,
             }],
             review: false,
         };
@@ -5216,6 +5454,53 @@ mod tests {
     }
 
     #[test]
+    fn an_attempt_that_ends_stops_the_processes_it_started() {
+        // The measured defect (D-152): a `start_process` rspec outlived its attempt by 23 minutes
+        // and kept writing into a file the rollback had already unlinked. The window is the
+        // attempt, not the task: the rollback is what moves the tree out from under the process.
+        //
+        // The assertion is on the effect and on the record. A journal that said "stopped" while
+        // the pid lived would be exactly the "molnchalivaya lzh" the design forbids, so the pid is
+        // checked through the registry's own liveness probe.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let processes = Arc::new(
+            immortality_tools::ProcessRegistry::open(dir.path().join("processes")).expect("registry"),
+        );
+        // A real tool set is not needed for the *sweep*: `start_process` is exercised by its own
+        // tests, and this test is about the runner calling the registry at the right moment.
+        let started = processes
+            .start("sleep 60", dir.path(), &[], &format!("sha256:{}", "a".repeat(64)))
+            .expect("a long-lived process");
+        let pid = started.pid;
+
+        let model = Scripted::new(looping_replies(2));
+        let (_dir, mut runner) = runner(model, registry(vec![Arc::new(Touch)]));
+        runner.limits.max_steps = 1;
+        runner.processes = Some(Arc::clone(&processes));
+        let mut journal = journal(&dir);
+        let outcome = runner.run(&subtask(), 1, "", &mut journal).expect("attempt");
+
+        assert!(matches!(outcome.ending, Ending::Steps), "{:?}", outcome.ending);
+        // Stopped, and stopped for the right reason: the process the attempt started is gone.
+        assert_eq!(
+            immortality_tools::is_running(&processes.load(&started.handle).expect("record")),
+            immortality_tools::Liveness::Dead,
+            "the process started during the attempt must not outlive it (pid {pid})"
+        );
+        let records = journal_records(&dir);
+        let stopped: Vec<&immortality_core::journal::JournalRecord> = records
+            .iter()
+            .filter(|record| record.fields.kind == Kind::ProcessStopped)
+            .collect();
+        assert_eq!(stopped.len(), 1, "{:?}", stopped.len());
+        assert_eq!(
+            stopped[0].event.payload["handle"],
+            serde_json::json!(started.handle),
+        );
+        assert_eq!(stopped[0].event.payload["pid"], serde_json::json!(pid));
+    }
+
+    #[test]
     fn a_record_for_another_task_is_not_written_to_this_journal() {
         // The collector is per task in production, so a record for someone else's task is a bug
         // rather than a routine case. Writing it anyway would put another task's question into
@@ -5320,6 +5605,7 @@ mod tests {
                 id: "build".to_string(),
                 command: "cargo build".to_string(),
                 required: true,
+                timeout_secs: None,
             }],
             review: false,
         };
@@ -5348,6 +5634,112 @@ mod tests {
         assert_eq!(outcome.attempt.state, AttemptState::Failed);
         assert_eq!(outcome.attempt.failure, Some(FailureReason::GateFailed));
         assert_eq!(outcome.ended(), Ended::Failed(Cause::Limit(Limit::Steps)));
+    }
+
+    #[test]
+    fn a_red_checks_artifact_is_in_the_records_own_field_so_gc_keeps_it() {
+        // The digest of a failed check's whole output is what makes the bounded excerpt honest.
+        // `gc` decides what is live from `record.event.artifact`, never from a key inside
+        // `payload` (`gc::referenced_artifacts`), so a digest left only in the payload is
+        // collectable while the task still runs — and that artifact is the only copy of the
+        // output, since gate output has no observation to fall back on (D-156).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut journal = journal(&dir);
+        let scope = Scope::attempt(SubtaskId::from_suffix("01ARZ3NDEKTSV4RRFFQ69G5FAV"), 1);
+        let record = GateRecord::Check {
+            check: "rspec_after_add".to_string(),
+            command: "bundle exec rspec".to_string(),
+            exit_code: Some(1),
+            duration_ms: 1200,
+            passed: false,
+            required: true,
+            why: Some("`rspec_after_add` (exit 1)\n192 examples, 1 failure".to_string()),
+            artifact: Some(immortality_core::journal::digest_text(
+                &immortality_core::artifacts::digest_of(b"192 examples, 1 failure\n"),
+            )),
+        };
+        record_gate(chrono::Local::now().into(), &mut journal, &scope, &record).expect("record");
+
+        let read = immortality_core::journal::JournalReader::open(journal.dir(), journal.task())
+            .expect("reader")
+            .read()
+            .expect("read");
+        let live = immortality_core::gc::referenced_artifacts(&read.records);
+        assert_eq!(
+            live.len(),
+            1,
+            "the artifact must be live, or gc deletes the only copy of the failure: {live:?}"
+        );
+
+        // And the payload still carries the digest, so a reader of the record can find the body.
+        let check = read
+            .records
+            .iter()
+            .find(|record| record.fields.kind == Kind::GateResult)
+            .expect("the gate record");
+        assert_eq!(
+            check.event.payload.get("artifact").and_then(|it| it.as_str()),
+            record.artifact(),
+            "the payload and the field name the same artifact"
+        );
+    }
+
+    #[test]
+    fn a_red_check_after_the_step_budget_tells_the_next_attempt_what_failed() {
+        // The end of the chain the whole `black_jack` investigation is about. That run's attempt 4
+        // was told, verbatim, `rspec_after_add` timed out after 120239 ms — and nothing else. The
+        // gate had measured what the command printed and dropped it, the verdict carried only a
+        // one-line summary, and the strategy that reaches the next brief then cut that summary to
+        // 400 characters from the start. So the failing example's name, which is what the model
+        // had to fix, never arrived.
+        //
+        // This asserts the chain end to end: the fake check's output is derivable from the real
+        // journal's, and the string the *next attempt's strategy* carries must contain the failure.
+        let mut subtask = subtask();
+        subtask.dod = Dod {
+            statement: "the build is green".to_string(),
+            checks: vec![immortality_core::domain::DodCheck {
+                id: "build".to_string(),
+                command: "cargo build".to_string(),
+                required: true,
+                timeout_secs: None,
+            }],
+            review: false,
+        };
+        let mut diff = immortality_core::gate::Diff::default();
+        diff.files.push(immortality_core::gate::ChangedFile {
+            path: PathBuf::from("src/parser.rs"),
+            status: immortality_core::gate::FileStatus::Modified,
+            binary: false,
+            added_lines: vec!["still broken".to_string()],
+        });
+        let model = Scripted::new(looping_replies(5));
+        let (dir, mut runner) = runner(model, registry(vec![Arc::new(Touch)]));
+        runner.limits.max_steps = 2;
+        let gates = FakeGates::with_diff(diff);
+        gates
+            .failing
+            .lock()
+            .expect("lock")
+            .push("cargo build".to_string());
+        runner.gates = Some(Arc::new(gates));
+        let mut journal = journal(&dir);
+        let outcome = runner.run(&subtask, 1, "", &mut journal).expect("run");
+
+        // What the attempt report remembers, which is what a restart quotes.
+        let remembered = outcome.report.rejected_ideas.join("\n");
+        assert!(
+            remembered.contains("192 examples, 1 failure"),
+            "the gate's output must reach the report, not only its exit code: {remembered}"
+        );
+
+        // And the strategy written for the next attempt keeps it.
+        let cause = Cause::Limit(Limit::Steps);
+        let next = immortality_core::restart::strategy(&cause, "", &outcome.report.rejected_ideas);
+        assert!(
+            next.contains("192 examples, 1 failure"),
+            "the next attempt's brief must say what actually failed: {next}"
+        );
     }
 
     #[test]
@@ -5789,10 +6181,22 @@ mod tests {
             .expect("session");
 
         assert_eq!(end.outcome.attempt.number, 2, "{:?}", end.outcome.attempt);
+        // A rejected claim is a `Retry`, not a `Restart`: no rollback record, and the second
+        // attempt started on the first one's work. That is the property this test is about — the
+        // tree between two attempts is kept.
+        let restarts = journal_records(&dir)
+            .into_iter()
+            .filter(|record| record.fields.kind == Kind::AttemptRestarted)
+            .count();
+        assert_eq!(restarts, 0, "a rejected claim must not roll back");
+        // The one restore that does happen is the *discard* of the exhausted subtask's work, after
+        // the last attempt closed: a blocked subtask's unverified tree may not become the next
+        // subtask's base, and a reviewer's rejection is the clearest case of "unverified".
         assert_eq!(
             checkpoints.restored(),
-            Vec::<String>::new(),
-            "a rejected claim must not roll back"
+            vec!["ckpt-0".to_string()],
+            "{:?}",
+            checkpoints.calls()
         );
         // The second attempt's brief quotes the gate's own words.
         assert_eq!(end.outcome.attempt.failure, Some(FailureReason::ReviewRejected));
@@ -5820,6 +6224,86 @@ mod tests {
         assert!(reason.contains("locked"), "{reason}");
         // The failed attempt is the last one that ran; nothing was started on top of it.
         assert_eq!(end.outcome.attempt.number, 1);
+    }
+
+    #[test]
+    fn an_exhausted_subtask_returns_the_tree_to_its_base_before_the_next_one_starts() {
+        // The `black_jack` poisoning. A blocked subtask is settled: the task moves on to its next
+        // independent subtask, which takes its own base from whatever is on disk. Nothing used to
+        // put the tree back, so the blocked subtask's half-finished work became the next subtask's
+        // starting point — and no rollback could remove it, because each later base contained it.
+        //
+        // The assertion is on the *restore target*: it must be the base, and the work that was
+        // there must first be named in a `discarded` checkpoint, so a human can find it.
+        let checkpoints = FakeCheckpoints::new();
+        let (dir, mut runner) = runner(Scripted::new(looping_replies(6)), registry(vec![Arc::new(Touch)]));
+        // One step per attempt, and no restarts left: the first failure is the last attempt, so the
+        // only restore this test can see is the discard's own.
+        runner.limits.max_steps = 1;
+        runner = with_checkpoints(runner, Arc::clone(&checkpoints));
+        let mut journal = journal(&dir);
+        let end = runner
+            .session(&subtask(), 1)
+            .drive(allowance(3, 0), &mut journal)
+            .expect("session");
+
+        assert!(matches!(end.stop, Stop::Exhausted(_)), "{:?}", end.stop);
+        // The base is the first snapshot; the discard restored to it rather than leaving the tree
+        // as the spent attempts left it.
+        assert_eq!(
+            checkpoints.restored(),
+            vec!["ckpt-0".to_string()],
+            "a blocked subtask's tree must be returned to its base: {:?}",
+            checkpoints.calls()
+        );
+        // And the work that was thrown away is named before it is thrown away.
+        let discarded = journal_records(&dir)
+            .into_iter()
+            .filter(|record| record.fields.kind == Kind::CheckpointCreated)
+            .filter(|record| record.event.payload["role"] == serde_json::json!("discarded"))
+            .count();
+        assert_eq!(
+            discarded,
+            1,
+            "the discarded work must be findable: {:?}",
+            checkpoints.calls()
+        );
+        // The settlement marker names where the tree now is, and it is not a `rollback`: that role
+        // promises a following `attempt_restarted`, which recovery would then try to finish.
+        let settled = journal_records(&dir)
+            .into_iter()
+            .filter(|record| record.fields.kind == Kind::CheckpointCreated)
+            .any(|record| record.event.payload["role"] == serde_json::json!("settled"));
+        assert!(settled, "the journal must say the tree was settled");
+        // The report says where the work went, because a report is what a human reopens it from.
+        assert!(
+            end.report.outcome.contains("ckpt-1"),
+            "the report must name the set-aside work: {}",
+            end.report.outcome
+        );
+    }
+
+    #[test]
+    fn a_verified_subtask_keeps_its_work_because_it_is_committed_not_discarded() {
+        // The other half of the rule, and the reason the discard is scoped to `Exhausted`: a
+        // `done` subtask's work is committed by the cycle and must survive the session. A
+        // session that discarded on every stop would delete exactly the work that passed.
+        let checkpoints = FakeCheckpoints::new();
+        let (dir, mut runner) = runner(Scripted::new(vec![Ok(finish())]), registry(vec![Arc::new(Touch)]));
+        runner.gates = Some(Arc::new(FakeGates::green()));
+        runner = with_checkpoints(runner, Arc::clone(&checkpoints));
+        let mut journal = journal(&dir);
+        let end = runner
+            .session(&subtask(), 1)
+            .drive(allowance(3, 2), &mut journal)
+            .expect("session");
+
+        assert_eq!(end.stop, Stop::Done);
+        assert_eq!(
+            checkpoints.restored(),
+            Vec::<String>::new(),
+            "a closed subtask's tree is the work, not something to roll away"
+        );
     }
 
     #[test]

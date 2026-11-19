@@ -37,12 +37,12 @@ pub use judge::{Judge, Judgement};
 pub use notify::{MacNotifier, Notifier, Silent, system};
 pub use policy::{Denial, Escalation, PathUse, PolicyGate, Verdict};
 pub use processes::{
-    KillProcess, Liveness, ProcessRecord, ProcessRegistry, ReadProcess, StartProcess, probe_started,
-    start_digest as process_start_digest,
+    KillProcess, Liveness, ProcessRecord, ProcessRegistry, ReadProcess, StartProcess, is_running,
+    probe_started, start_digest as process_start_digest,
 };
 pub use read::{ReadFile, looks_binary};
 pub use search::Grep;
-pub use shell::{CommandOutput, run_command};
+pub use shell::{CommandOutput, run_command, run_command_spooled};
 pub use shell::{Shell, ShellState};
 pub use state::{GrepJournal, ReadState, StateFile, UpdateState};
 pub use tool::{OutputBudget, Registry, RegistryError, Tool, ToolCtx, ToolError, ToolResult};

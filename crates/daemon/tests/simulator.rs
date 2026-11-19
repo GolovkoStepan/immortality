@@ -53,7 +53,7 @@ use std::time::{Duration, Instant};
 use immortality_core::artifacts::ArtifactStore;
 use immortality_core::config::{Detectors, Policy};
 use immortality_core::context::{Budget, CharsCounter};
-use immortality_core::domain::{Dod, DodCheck, Subtask, TaskState, Timestamp};
+use immortality_core::domain::{Dod, DodCheck, Subtask, SubtaskState, TaskState, Timestamp};
 use immortality_core::gate::{ChangedFile, Diff, FileStatus, Gates, ReviewRequest, Reviewer};
 use immortality_core::ids::{SubtaskId, TaskId};
 use immortality_core::journal::{Journal, JournalReader, JournalRecord, Kind, ReadOutcome};
@@ -156,7 +156,11 @@ impl Sim {
     }
 
     /// The runner the daemon would build, with the seams a test can control.
-    fn runner(&self, model: Arc<dyn Model>) -> Runner {
+    ///
+    /// The gate world is a parameter rather than a field on [`Sim`]: most scenarios are about the
+    /// loop, and one that cares which commands ran must be able to say so without every other
+    /// scenario carrying the recorder.
+    fn runner(&self, model: Arc<dyn Model>, gates: Arc<dyn Gates + Send + Sync>) -> Runner {
         let gate = PolicyGate::with_defaults(
             &self.worktree,
             Policy {
@@ -200,13 +204,20 @@ impl Sim {
             },
             max_subtask_depth: 2,
             delegation_depth: 0,
-            gates: Some(Arc::new(FakeGates::green())),
+            gates: Some(gates),
             reviewer: Some(Arc::new(FakeReviewer)),
             checkpoints: Some(Arc::new(FakeCheckpoints::default())),
             clock: Arc::clone(&self.clock) as Arc<dyn immortality_core::time::Clock>,
             // The simulator's registry has no `escalate`, so there is nothing to collect and
             // nothing to drain.
             escalations: Vec::new(),
+            // A scenario that starts a process needs the sweep to see it, so the registry is the
+            // scenario's own directory and not the default. Every other scenario starts nothing
+            // and pays one `open` on an empty directory.
+            processes: Some(Arc::new(
+                immortality_tools::ProcessRegistry::open(self.root.join("processes"))
+                    .expect("process registry"),
+            )),
         }
     }
 }
@@ -225,11 +236,13 @@ fn parser_subtask() -> Subtask {
                     id: "build".to_string(),
                     command: "cargo build".to_string(),
                     required: true,
+                    timeout_secs: None,
                 },
                 DodCheck {
                     id: "test".to_string(),
                     command: "cargo test".to_string(),
                     required: true,
+                    timeout_secs: None,
                 },
             ],
             review: true,
@@ -310,12 +323,19 @@ impl Gates for FakeGates {
         Ok(())
     }
 
-    fn run(&self, _command: &str) -> std::result::Result<immortality_core::gate::CommandRun, String> {
+    fn run(
+        &self,
+        _command: &str,
+        _timeout: Option<std::time::Duration>,
+    ) -> std::result::Result<immortality_core::gate::CommandRun, String> {
         Ok(immortality_core::gate::CommandRun {
             exit_code: Some(0),
             timed_out: false,
             duration_ms: 1_500,
             output_tail: "ok".to_string(),
+            stdout_lines: 1,
+            stderr_lines: 0,
+            artifact: None,
         })
     }
 }
@@ -398,8 +418,27 @@ struct CycleEnd {
 /// `scheduler::next`, `AttemptSession::drive`, `Plan::set_state` and `core::gate::evaluate`, and
 /// the only thing this function adds is the *order* the design fixes — tree first, journal second.
 fn run_cycle(sim: &Sim, script: Vec<Reply>) -> CycleEnd {
+    run_cycle_with(
+        sim,
+        script,
+        Arc::new(FakeGates::green()),
+        cycle::Limits {
+            attempts: 3,
+            restarts: 2,
+            max_depth: 2,
+        },
+    )
+}
+
+/// The same driver, with the gate world and the budgets the caller chooses.
+fn run_cycle_with(
+    sim: &Sim,
+    script: Vec<Reply>,
+    gates: Arc<dyn Gates + Send + Sync>,
+    limits: cycle::Limits,
+) -> CycleEnd {
     let model = Script::new(script, Arc::clone(&sim.clock));
-    let runner = sim.runner(Arc::clone(&model) as Arc<dyn Model>);
+    let runner = sim.runner(Arc::clone(&model) as Arc<dyn Model>, gates);
     let mut journal = sim.journal();
     let mut plan = sim.plan();
 
@@ -413,11 +452,7 @@ fn run_cycle(sim: &Sim, script: Vec<Reply>) -> CycleEnd {
         &mut plan,
         &mut journal,
         &cycle::Start::resuming(TaskState::Queued, "extend the existing parser", None),
-        cycle::Limits {
-            attempts: 3,
-            restarts: 2,
-            max_depth: 2,
-        },
+        limits,
     )
     .expect("the cycle writes its own records");
     journal.close().expect("close journal");
@@ -605,6 +640,188 @@ fn recover_now(dir: &Path, task: &TaskId, probe: ProbeAnswer) -> recover::Recove
 }
 
 // ── tests ──────────────────────────────────────────────────────────────────────────────
+
+/// A gate world that records every command it was asked to run and answers as told.
+#[derive(Debug)]
+struct Recording {
+    answer: std::result::Result<i32, String>,
+    ran: Mutex<Vec<(String, Option<std::time::Duration>)>>,
+}
+
+impl Recording {
+    fn refuse(command_marker: &str) -> Arc<Self> {
+        Arc::new(Self {
+            answer: Err(format!("refused: {command_marker}")),
+            ran: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn ran(&self) -> Vec<String> {
+        self.ran
+            .lock()
+            .map(|ran| ran.iter().map(|(command, _)| command.clone()).collect())
+            .unwrap_or_default()
+    }
+}
+
+impl Gates for Recording {
+    fn diff(&self, _base: Option<&str>) -> std::result::Result<Diff, String> {
+        FakeGates.diff(None)
+    }
+
+    fn authorise(&self, command: &str) -> std::result::Result<(), String> {
+        if self.answer.is_err() && command.contains("cannot-be-run") {
+            return Err("the policy refused this command".to_string());
+        }
+        Ok(())
+    }
+
+    fn run(
+        &self,
+        command: &str,
+        timeout: Option<std::time::Duration>,
+    ) -> std::result::Result<immortality_core::gate::CommandRun, String> {
+        if let Ok(mut ran) = self.ran.lock() {
+            ran.push((command.to_string(), timeout));
+        }
+        self.answer.as_ref().map_or_else(
+            |why| Err(why.clone()),
+            |code| {
+                Ok(immortality_core::gate::CommandRun {
+                    exit_code: Some(*code),
+                    timed_out: false,
+                    duration_ms: 1,
+                    output_tail: "recorded".to_string(),
+                    stdout_lines: 1,
+                    stderr_lines: 0,
+                    artifact: None,
+                })
+            },
+        )
+    }
+}
+
+/// A plan with one achieved subtask and one that runs out of attempts.
+///
+/// `cargo test` is declared by the achieved subtask and `bundle exec rspec` by the one that
+/// blocks, so "the blocked subtask's command never ran" is a single inequality on a recorded list
+/// rather than a claim about which command was first.
+fn blocked_second_subtask() -> [Subtask; 2] {
+    let at = FixedClock::fixture().now();
+    let mut achieved = Subtask::new(
+        1,
+        "parse trailing commas",
+        "accept a trailing comma",
+        Dod {
+            statement: "the unit tests pass".to_string(),
+            checks: vec![DodCheck {
+                id: "test".to_string(),
+                command: "cargo test".to_string(),
+                required: true,
+                timeout_secs: None,
+            }],
+            review: false,
+        },
+        at,
+    );
+    achieved.id = SubtaskId::from_suffix(SUBTASK);
+    achieved.state = SubtaskState::Pending;
+
+    let mut failing = Subtask::new(
+        1,
+        "verify the whole suite",
+        "the suite is green",
+        Dod {
+            statement: "rspec passes".to_string(),
+            checks: vec![DodCheck {
+                id: "rspec".to_string(),
+                command: "bundle exec rspec".to_string(),
+                required: true,
+                timeout_secs: None,
+            }],
+            review: false,
+        },
+        at,
+    );
+    failing.id = SubtaskId::from_suffix("01ARZ3NDEKTSV4RRFFQ69G5FAB");
+    failing.state = SubtaskState::Pending;
+    [achieved, failing]
+}
+
+#[test]
+fn a_blocked_subtask_fails_the_task_by_name_and_its_command_never_runs() {
+    // The third `black_jack` run. Two subtasks were `blocked`, their work had been discarded, and
+    // the task-level bar still ran the first `done` subtask's `rspec_pass` — so the verdict a
+    // human read was `rspec_pass timed out after 120070 ms`, a deadline for a suite that had
+    // nothing to do with what was missing. After D-150 the dead subtask's work is not even in the
+    // tree, which made the command a judgement of somebody else's code under its id.
+    //
+    // Two properties, and both are the point: the task does not reach `ready_for_review`, and the
+    // record that says why names the subtask instead of a command.
+    let sim = Sim::new();
+    let plan = blocked_second_subtask();
+    sim.write_plan(&plan);
+    let gates = Recording::refuse("the suite cannot pass");
+
+    // One attempt writes and claims; the second subtask is refused by the gate every time, so it
+    // spends its budget and blocks.
+    let script = vec![
+        Reply::call(
+            "call_write",
+            "write_file",
+            r#"{"path":"src/parser.rs","content":"pub fn parse() {}\n"}"#,
+        ),
+        Reply::call("call_finish", FINISH_SUBTASK, r#"{"summary":"done"}"#),
+        Reply::call("call_finish_2", FINISH_SUBTASK, r#"{"summary":"done"}"#),
+    ];
+    let end = run_cycle_with(
+        &sim,
+        script,
+        gates.clone(),
+        cycle::Limits {
+            attempts: 1,
+            restarts: 0,
+            max_depth: 2,
+        },
+    );
+
+    assert_eq!(end.state, TaskState::FailedGates, "stop was {:?}", end.stop);
+    // The blocked subtask's check legitimately ran during its own attempt — that is how it was
+    // found red and blocked. What must not happen is a second run at task level, against a tree
+    // its work was discarded from: exactly one occurrence, not two.
+    let ran = gates.ran();
+    let rspec = ran.iter().filter(|command| command.contains("rspec")).count();
+    assert_eq!(
+        rspec, 1,
+        "the blocked subtask's check must not run again at task level: {ran:?}"
+    );
+    // The whole task-level bar was refused before it ran anything, not only the blocked subtask's
+    // line: a bar that judged the achieved subtask's command while the plan was incomplete would
+    // report a green on the part that was done, and `evaluate` stopping at the first red check is
+    // exactly why the *reason* was a deadline instead of the missing subtask.
+    assert_eq!(
+        ran.len(),
+        2,
+        "one attempt-level run per subtask and no task-level bar at all: {ran:?}"
+    );
+    let records = records(&sim.journal_dir(), &sim.task);
+    let verdict = records
+        .records
+        .iter()
+        .rev()
+        .find(|record| {
+            record.fields.kind == Kind::GateResult
+                && record.event.payload["gate"] == serde_json::json!("verdict")
+                && record.fields.subtask.is_none()
+        })
+        .expect("a task-level verdict");
+    let why = verdict.event.payload["why"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(why.contains("verify the whole suite"), "{why}");
+    assert!(why.contains("blocked"), "{why}");
+}
 
 #[test]
 fn a_whole_task_reaches_ready_for_review_and_the_journal_is_the_golden_one() {

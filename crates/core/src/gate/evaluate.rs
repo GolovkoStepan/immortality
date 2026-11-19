@@ -14,6 +14,8 @@
 //! evaluation — is testable in microseconds and without a repository. The daemon supplies the real
 //! implementations; the rules stay here.
 
+use std::time::Duration;
+
 use super::{CheckOutcome, Diff, Finding, GateReport, ReviewRequest, ReviewVerdict, sanity};
 use crate::domain::{Dod, DodCheck};
 
@@ -26,6 +28,16 @@ pub struct CommandRun {
     pub duration_ms: u64,
     /// The tail of stdout and stderr, already combined and bounded.
     pub output_tail: String,
+    /// Total stdout lines, before the tail was cut.
+    pub stdout_lines: usize,
+    /// Total stderr lines, before the tail was cut.
+    pub stderr_lines: usize,
+    /// Where the whole output lives, when the caller could keep it.
+    ///
+    /// A gate command's tail is bounded and its stdout dies with the process, so without this a
+    /// red check leaves nothing a human can open. `None` when no artifact store was wired, which
+    /// is the honest answer for a test or a read-only session.
+    pub artifact: Option<String>,
 }
 
 impl CommandRun {
@@ -58,7 +70,13 @@ pub trait Gates {
     fn authorise(&self, command: &str) -> Result<(), String>;
 
     /// Run one command. Called only after `authorise` said yes.
-    fn run(&self, command: &str) -> Result<CommandRun, String>;
+    ///
+    /// `timeout` is the check's own deadline when its `DoD` declared one, and the configured
+    /// default otherwise. It is passed per call rather than held by the implementation because it
+    /// is a property of the *check*: one plan can legitimately contain a two-second `grep` and a
+    /// nine-minute `cargo test`, and a runner that decided their deadline once would either cut
+    /// the test short or wait nine minutes for the grep.
+    fn run(&self, command: &str, timeout: Option<Duration>) -> Result<CommandRun, String>;
 }
 
 /// The reviewer, which is one model call with no tools.
@@ -135,7 +153,7 @@ fn run_check(gates: &dyn Gates, check: &DodCheck) -> CheckOutcome {
             format!("the policy refused this command: {why}"),
         );
     }
-    match gates.run(&check.command) {
+    match gates.run(&check.command, check.timeout_secs.map(Duration::from_secs)) {
         Ok(run) => CheckOutcome {
             id: check.id.clone(),
             command: check.command.clone(),
@@ -145,6 +163,9 @@ fn run_check(gates: &dyn Gates, check: &DodCheck) -> CheckOutcome {
             duration_ms: run.duration_ms,
             passed: run.passed(),
             output_tail: run.output_tail,
+            stdout_lines: run.stdout_lines,
+            stderr_lines: run.stderr_lines,
+            artifact: run.artifact,
         },
         Err(why) => CheckOutcome::not_run(
             check.id.clone(),

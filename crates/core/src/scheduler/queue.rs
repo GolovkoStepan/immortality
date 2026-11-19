@@ -73,6 +73,20 @@ pub enum Ineligible {
     /// `Hold::WaitingBackend`, in answer to the *inference* question. The task is still eligible
     /// for offline work — that is the whole point of the hold being orthogonal to the lifecycle.
     Backend,
+    /// The task's own gates failed: the tree is finished, the verdict is red, and only a human can
+    /// move it — by reopening a subtask, changing the plan, or `start --task` to retry.
+    ///
+    /// Distinct from [`Ineligible::NoWork`] because the two send a person to different places. "No
+    /// subtask left to run" over a task that ended `failed_gates` is the report measured on
+    /// `black_jack`: five subtasks done, two blocked, the task-level `rspec_pass` timed out, and
+    /// `status` said the task had nothing left to do. It had nothing left to *run*; it was waiting
+    /// for a human, which is the fact that was missing.
+    FailedGates,
+    /// A subtask is `blocked` and nothing independent is left: L5's escalation, parked until a
+    /// human reopens the subtask or adds one to the plan.
+    Blocked,
+    /// Every subtask is settled and the gates were green: the task waits for a human to merge.
+    ReadyForReview,
 }
 
 /// One task, as the queue sees it.
@@ -111,6 +125,13 @@ impl Candidate {
         if self.state.is_terminal() {
             return Some(Ineligible::Finished);
         }
+        // The task's own verdict before the system's condition: a `failed_gates` task does not
+        // start when the disk frees up or the backend returns, so reporting the outage would name
+        // a fix that does not fix it. The system's condition is reported by the other tasks on the
+        // line, and it is not this task's answer to "what do I do about it".
+        if let Some(parked) = self.parked_reason() {
+            return Some(parked);
+        }
         match self.hold {
             Some(Hold::PausedDisk) => return Some(Ineligible::Disk),
             Some(Hold::WaitingBackend) => return Some(Ineligible::Backend),
@@ -137,6 +158,9 @@ impl Candidate {
         if self.state.is_terminal() {
             return Some(Ineligible::Finished);
         }
+        if let Some(parked) = self.parked_reason() {
+            return Some(parked);
+        }
         if matches!(self.hold, Some(Hold::PausedDisk)) {
             return Some(Ineligible::Disk);
         }
@@ -150,6 +174,31 @@ impl Candidate {
             });
         }
         None
+    }
+
+    /// The reason a task that has stopped on its own account is not started again.
+    ///
+    /// Three lifecycle states leave nothing for a worker to do and everything for a human: the
+    /// gates are red, a subtask is blocked and nothing independent is left, or the verdict is green
+    /// and the branch awaits a merge. All three produced "no subtask left to run" — literally true
+    /// and useless, because it names the symptom a person can already see and not the thing to do.
+    /// Measured on the `black_jack` task that ended `failed_gates`: `status` said "1 with no
+    /// subtask left to run" while the task was waiting for exactly one action, a human reading a
+    /// timeout and reopening a subtask.
+    ///
+    /// `failed_gates` and `ready_for_review` are parked whether or not the tree has work. Both are
+    /// verdicts about a run that finished, and a verdict is not something a fresh attempt may
+    /// quietly overturn: resuming is `start --task`, which takes the `retry` edge on purpose. A
+    /// `blocked` task is different — L5 blocks it only when nothing independent is left, and a
+    /// human who adds a subtask makes it runnable again without touching its state, so that one is
+    /// parked only when the tree really has nothing to offer.
+    const fn parked_reason(&self) -> Option<Ineligible> {
+        match self.state {
+            TaskState::FailedGates => Some(Ineligible::FailedGates),
+            TaskState::ReadyForReview => Some(Ineligible::ReadyForReview),
+            TaskState::Blocked if !self.has_work => Some(Ineligible::Blocked),
+            _ => None,
+        }
     }
 }
 
@@ -258,6 +307,9 @@ pub fn summarise(rejected: &[(&TaskId, Ineligible)]) -> String {
     let mut finished = 0_usize;
     let mut waiting_gates = 0_usize;
     let mut in_flight = 0_usize;
+    let mut failed_gates = 0_usize;
+    let mut blocked = 0_usize;
+    let mut ready_for_review = 0_usize;
     for (_, reason) in rejected {
         match reason {
             Ineligible::Backend => waiting_backend += 1,
@@ -265,6 +317,9 @@ pub fn summarise(rejected: &[(&TaskId, Ineligible)]) -> String {
             Ineligible::Finished => finished += 1,
             Ineligible::NoWork => waiting_gates += 1,
             Ineligible::InFlight => in_flight += 1,
+            Ineligible::FailedGates => failed_gates += 1,
+            Ineligible::Blocked => blocked += 1,
+            Ineligible::ReadyForReview => ready_for_review += 1,
         }
     }
     let mut parts: Vec<String> = Vec::new();
@@ -276,6 +331,18 @@ pub fn summarise(rejected: &[(&TaskId, Ineligible)]) -> String {
     }
     if in_flight > 0 {
         parts.push(format!("{in_flight} running now"));
+    }
+    // Parked tasks come before the generic "no subtask" line: a count of them names an action, and
+    // a task that ended red is not waiting for a gate to finish. Ordering them first also keeps the
+    // sentence a human reads about a finished run at the front of the line.
+    if failed_gates > 0 {
+        parts.push(format!("{failed_gates} waiting for a human after failed gates"));
+    }
+    if blocked > 0 {
+        parts.push(format!("{blocked} blocked, waiting for a human"));
+    }
+    if ready_for_review > 0 {
+        parts.push(format!("{ready_for_review} ready for review"));
     }
     if waiting_gates > 0 {
         parts.push(format!("{waiting_gates} with no subtask left to run"));

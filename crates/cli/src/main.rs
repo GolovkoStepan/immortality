@@ -149,6 +149,35 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Remove everything immortality ever created on this machine.
+    ///
+    /// Worktrees, `agent/*` and `agent-ckpt/*` branches, every `.agent/` directory, the state
+    /// directory, artifacts, logs, the registry and the daemon token. The repositories' own
+    /// commits and branches are never touched. Without `--yes` this only lists what it would
+    /// remove, because there is no undo.
+    ///
+    /// Directories outside the state root that a project's own configuration named — a
+    /// `BUNDLE_PATH` in `.bundle/config`, for example — are always listed, and removed only with
+    /// `--outside`, which has to travel with `--yes`: the registry that names them is itself
+    /// removed by `--yes`.
+    Reset {
+        /// Actually delete, instead of listing what would go.
+        #[arg(long)]
+        yes: bool,
+        /// Remove the daemon token too. Off by default: a running daemon with no token refuses
+        /// every client, so the flag is what separates "clean slate" from "clean slate and no
+        /// way to talk to a daemon I forgot was running".
+        #[arg(long)]
+        token: bool,
+        /// Also remove directories outside the state root that a project's own configuration
+        /// named (`BUNDLE_PATH` in `.bundle/config`).
+        ///
+        /// Listed by the dry run either way, and off by default even with `--yes`: such a
+        /// directory is one the human's own tools also write to, so `--yes` means "delete what
+        /// immortality created" and this means "and this too".
+        #[arg(long)]
+        outside: bool,
+    },
     /// Run the daemon in the foreground until killed.
     Serve,
     /// Manage the background daemon: a launchd agent on macOS, a systemd user unit on Linux.
@@ -188,6 +217,9 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Doctor => doctor_command(&loaded, cli.json).await,
         Command::Gc { dry_run } => gc_command(dry_run, cli.json).await,
+        Command::Reset { yes, token, outside } => {
+            reset_command(ResetOptions { yes, token, outside }, cli.json)
+        }
         Command::Escalations { task } => escalations_command(task, cli.json).await,
         Command::Approve { id, answer } => approve_command(&id, &answer, cli.json).await,
         Command::Init => init_command(&loaded, cli.json),
@@ -502,6 +534,190 @@ async fn gc_command(dry_run: bool, json: bool) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&result)?);
     } else {
         print!("{}", render::gc_report(&result, style()));
+    }
+    Ok(())
+}
+
+/// `reset`: remove everything this program created, on purpose, with a report first.
+///
+/// Local rather than an RPC, unlike `gc`: the point of a reset is that it works when the daemon
+/// is not running, is misconfigured, or is the thing being cleaned up. A command whose only job
+/// is to reach a zero state must not depend on the process that owns that state.
+/// What `immortality reset` was asked to do.
+///
+/// A struct rather than four positional `bool`s: `reset(true, false, false, true)` is a call whose
+/// every argument is indistinguishable at the call site, and swapping two of them turns "list and
+/// delete nothing" into "delete everything including the directory your gems live in".
+#[derive(Debug, Clone, Copy)]
+struct ResetOptions {
+    /// Delete, instead of listing what would go.
+    yes: bool,
+    /// Remove `daemon.token` too.
+    token: bool,
+    /// Remove directories outside the state root that a project's config named.
+    outside: bool,
+}
+
+/// `reset`: remove everything this program created, on purpose, with a report first.
+///
+/// Local rather than an RPC, unlike `gc`: the point of a reset is that it works when the daemon
+/// is not running, is misconfigured, or is the thing being cleaned up. A command whose only job
+/// is to reach a zero state must not depend on the process that owns that state.
+fn reset_command(options: ResetOptions, json: bool) -> Result<()> {
+    let state = StatePaths::discover();
+    let mut inventory =
+        immortality_core::reset::inventory(&state).map_err(|error| anyhow::anyhow!("{error}"))?;
+    if !options.token {
+        // The default keeps `daemon.token`. A running daemon that lost its token would refuse
+        // every client, and "my CLI says unauthorized and nothing explains it" is a worse outcome
+        // than a leftover file. `--token` is the explicit "I know the daemon is stopped".
+        inventory.files.retain(|path| path != &state.daemon_token());
+    }
+
+    if !options.yes {
+        return reset_list(&state, &inventory, options, json);
+    }
+    reset_apply(&state, &inventory, options, json)
+}
+
+/// The dry run: what would go, and what is deliberately left alone.
+fn reset_list(
+    state: &StatePaths,
+    inventory: &immortality_core::reset::Inventory,
+    options: ResetOptions,
+    json: bool,
+) -> Result<()> {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "dry_run": true,
+                "state_root": state.root().display().to_string(),
+                "worktrees": inventory.worktrees.iter().map(|entry| entry.path.display().to_string()).collect::<Vec<_>>(),
+                "branches": inventory.branches.iter().flat_map(|entry| entry.names.clone()).collect::<Vec<_>>(),
+                "paths": inventory.all_paths().iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
+                "missing": inventory.missing.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
+                "outside": inventory.outside.iter().map(|entry| serde_json::json!({
+                    "path": entry.path.display().to_string(),
+                    "named_by": entry.named_by.display().to_string(),
+                    "key": entry.key,
+                })).collect::<Vec<_>>(),
+                "empty": inventory.is_empty(),
+            }))?
+        );
+        return Ok(());
+    }
+    if !inventory.outside.is_empty() {
+        println!("\nOutside the state root, named by a project's own configuration:");
+        for entry in &inventory.outside {
+            println!(
+                "  outside   {}  ({} in {})",
+                entry.path.display(),
+                entry.key,
+                entry.named_by.display()
+            );
+        }
+        println!(
+            "These are left alone; add --outside to delete them as well. They may hold work your own tools put there."
+        );
+        println!(
+            "Pass --outside together with --yes: the registry that names these directories is itself removed by --yes."
+        );
+    }
+    if inventory.is_empty() {
+        println!("nothing to remove: this machine is already at the zero state");
+        return Ok(());
+    }
+    println!("This would remove:");
+    for entry in &inventory.worktrees {
+        println!("  worktree  {}", entry.path.display());
+    }
+    for entry in &inventory.branches {
+        for name in &entry.names {
+            println!("  branch    {name}  (in {})", entry.repository.display());
+        }
+    }
+    for path in inventory
+        .agent_dirs
+        .iter()
+        .chain(inventory.state_dirs.iter())
+        .chain(inventory.files.iter())
+    {
+        println!("  path      {}", path.display());
+    }
+    for path in &inventory.missing {
+        println!("  missing   {}  (registered, not on disk)", path.display());
+    }
+    println!("\nNothing has been removed. There is no undo: pass --yes to delete the list above.");
+    if !options.token && state.daemon_token().exists() {
+        println!("`daemon.token` is kept; add --token to remove it as well.");
+    }
+    Ok(())
+}
+
+/// The real run.
+fn reset_apply(
+    state: &StatePaths,
+    inventory: &immortality_core::reset::Inventory,
+    options: ResetOptions,
+    json: bool,
+) -> Result<()> {
+    let report = immortality_core::reset::execute(state, inventory, options.outside)
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "dry_run": false,
+                "worktrees_removed": report.worktrees_removed,
+                "branches_deleted": report.branches_deleted,
+                "paths_removed": report.paths_removed,
+                "outside_removed": report.outside_removed,
+                "outside_kept": report.outside_kept.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
+                "failures": report.failures,
+                "noop": report.is_noop(),
+            }))?
+        );
+        return Ok(());
+    }
+    println!(
+        "removed {} worktree(s), {} branch(es), {} path(s)",
+        report.worktrees_removed, report.branches_deleted, report.paths_removed
+    );
+    if report.outside_removed > 0 {
+        println!(
+            "and {} director(y/ies) outside the state root",
+            report.outside_removed
+        );
+    }
+    if !report.outside_kept.is_empty() {
+        // Said after the reset too, not only before it: a human who ran `--yes` and believes the
+        // machine is clean needs to know which paths are still there and why.
+        for path in &report.outside_kept {
+            println!(
+                "kept {} (outside the state root; add --outside to remove it)",
+                path.display()
+            );
+        }
+        // The trap a second run falls into: the entry was found through `registry.json`, and the
+        // reset above just deleted it. `--outside` is a decision, not a plan, so it has to travel
+        // with the `--yes` that removes the registry — otherwise the next run has nothing to
+        // consult and reports "zero state" while the directory is still there.
+        if !inventory.outside.is_empty() && !state.registry().exists() {
+            println!(
+                "a second `reset --outside` will not find them: the registry that named them is gone. \
+                 Pass both flags together next time."
+            );
+        }
+    }
+    if !report.failures.is_empty() {
+        // A failure is reported and the exit code stays zero only when nothing else went wrong:
+        // a script that reset a machine and ignored a half-deleted branch would find out at the
+        // next run, which is the wrong time.
+        for failure in &report.failures {
+            eprintln!("warning: {failure}");
+        }
+        anyhow::bail!("{} item(s) could not be removed", report.failures.len());
     }
     Ok(())
 }

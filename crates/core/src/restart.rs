@@ -53,6 +53,31 @@ pub const MAX_REJECTED_IDEAS: usize = 6;
 /// meant to save, and the first sentence is what names the approach.
 pub const MAX_QUOTE_CHARS: usize = 400;
 
+/// How much of a *rejected idea* is quoted from its beginning.
+///
+/// The head says which idea this was — `the claim was rejected: rspec_after_add (exit 1)` — and
+/// that is what the model must not propose again.
+const IDEA_HEAD_CHARS: usize = 160;
+
+/// How much of a *rejected idea* is quoted from its end.
+///
+/// # Why an idea keeps both ends and a strategy keeps only its start
+///
+/// A strategy is prose, so its first sentence names the approach. A rejected idea is often a
+/// verdict about a command, and its evidence is the *output*, which sits at the end: a failed
+/// `rspec` run puts `Failures:` in the middle and `192 examples, 1 failure` last.
+///
+/// Truncating to the first 400 characters was measured on the live `black_jack` journal. The gate's
+/// verdict — the reason the subtask must change course — begins at character 960 of 1304, because
+/// forty lines of `rspec` progress dots come first. The next attempt was therefore shown
+///
+/// > the claim was rejected: `rspec_after_add` (exit 1) … 267 earlier line(s) not shown
+/// > #comp_move_msg outputs the message with dealer prefix #inline_cards_render renders cards…
+///
+/// which names no failure, and the run went on to lose an attempt to the same one example. Keeping
+/// the tail is what makes the quote carry the answer instead of the table of contents.
+const IDEA_TAIL_CHARS: usize = 320;
+
 /// A budget that ran out.
 ///
 /// Kept apart from [`crate::context::Verdict`] because this is the *restart* vocabulary: what the
@@ -521,11 +546,29 @@ fn failed_before(rejected: &[String]) -> String {
     out.push('\n');
     let _ = writeln!(out, "These approaches already failed for this subtask:");
     for idea in rejected {
-        let _ = writeln!(out, "- {}", one_line(idea, MAX_QUOTE_CHARS));
+        let _ = writeln!(out, "- {}", quote_idea(idea));
     }
     out.push('\n');
     let _ = writeln!(out, "Do not propose them again.");
     out
+}
+
+/// One rejected idea as a single bullet, keeping the end as well as the start.
+///
+/// A rejected idea is not prose to be summarized, it is evidence to be acted on. The head names
+/// which attempt or which check failed; the tail is where a test runner puts the failure. Both are
+/// kept, and the marker between them says the middle was dropped so nobody reads the two halves as
+/// adjacent.
+fn quote_idea(idea: &str) -> String {
+    let collapsed = idea.split_whitespace().collect::<Vec<_>>().join(" ");
+    let total = collapsed.chars().count();
+    // `+ 3` for the ` … ` separator: a quote that fits is not cut at all.
+    if total <= IDEA_HEAD_CHARS + IDEA_TAIL_CHARS {
+        return collapsed;
+    }
+    let head: String = collapsed.chars().take(IDEA_HEAD_CHARS).collect();
+    let tail: String = collapsed.chars().skip(total - IDEA_TAIL_CHARS).collect();
+    format!("{head} … {tail}")
 }
 
 /// The strategy for a subtask resumed from a report, when this process has no cause yet.

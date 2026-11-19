@@ -300,6 +300,23 @@ impl Plan {
                 .all(|subtask| subtask.state.counts_as_settled())
     }
 
+    /// Every subtask in the tree, at every level, in file order.
+    ///
+    /// [`Self::subtasks`] returns only the roots, and a caller that iterated it during a split
+    /// would silently skip every child — which is exactly what the task-level acceptance bar did:
+    /// it collected the `DoD` of each root and never saw the children a split had created, so a
+    /// required check could be inherited from a parent that no longer runs anywhere.
+    ///
+    /// In file order, roots first, then each subtree: the order a human reads `TASKS.json` in.
+    #[must_use]
+    pub fn every_subtask(&self) -> Vec<&Subtask> {
+        let mut all = Vec::new();
+        for subtask in &self.subtasks {
+            collect(subtask, &mut all);
+        }
+        all
+    }
+
     /// Every subtask in the tree that is not settled, deepest first.
     ///
     /// Deepest first because the innermost unfinished work is what a human reading `status`
@@ -934,11 +951,13 @@ mod tests {
                     id: "test".to_string(),
                     command: "cargo test".to_string(),
                     required: true,
+                    timeout_secs: None,
                 },
                 DodCheck {
                     id: "test".to_string(),
                     command: "cargo build".to_string(),
                     required: true,
+                    timeout_secs: None,
                 },
             ],
             review: false,

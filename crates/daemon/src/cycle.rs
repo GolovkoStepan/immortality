@@ -588,6 +588,29 @@ fn accept(runner: &Runner, journal: &mut Journal, plan: &Plan) -> Result<bool, C
                 .to_string(),
         ));
     };
+    // Refused before a single command runs, and the verdict is the whole record: a `sanity` or a
+    // `check` here would claim a diff was scanned or a command was executed, and neither happened.
+    // The reason names the subtask, which is what a human acts on — unlike the deadline of a check
+    // whose subject is not in the tree any more.
+    let missing = unachieved(plan);
+    if !missing.is_empty() {
+        let why = format!(
+            "the task cannot be accepted while part of the plan was never achieved: {}. \
+             Reopen the subtask, or change the plan, and retry",
+            missing.join("; ")
+        );
+        let record = GateRecord::Verdict {
+            passed: false,
+            reason: Some(immortality_core::domain::FailureReason::GateFailed),
+            why: Some(why),
+        };
+        let payload = serde_json::to_value(&record)
+            .map_err(|error| CycleError::Store(format!("cannot encode a gate record: {error}")))?;
+        journal
+            .append_scoped(runner.clock.now(), Kind::GateResult, payload, &Scope::task())
+            .map_err(|error| CycleError::Store(error.to_string()))?;
+        return Ok(false);
+    }
     // Upcast explicitly: `evaluate` wants a plain `&dyn Reviewer`, and a `&dyn Reviewer +
     // Send + Sync` is a different trait object even though it is a superset.
     let reviewer: Option<&dyn Reviewer> = runner
@@ -606,18 +629,70 @@ fn accept(runner: &Runner, journal: &mut Journal, plan: &Plan) -> Result<bool, C
     Ok(report.is_green())
 }
 
+/// The task is not done: which subtasks of the approved plan were never achieved.
+///
+/// Not an error and not a gate verdict about the commands — a fact about the tree. It is checked
+/// before any command runs, because a `blocked` subtask's work was set aside by the discard of
+/// D-150: its `DoD` command would run against a tree that no longer holds what it was written to
+/// prove, and `evaluate` stops at the first red check, so the verdict a human read would be
+/// `rspec_pass timed out` instead of `subtask X is blocked`. Measured on the third `black_jack`
+/// run, where two subtasks were `blocked` and the task-level verdict named an rspec deadline.
+///
+/// `skipped` is deliberately not here: a split's parent is retired `skipped` by design, and its
+/// children carry its `DoD`, so holding the task open on it would make every split a failed task.
+#[must_use]
+fn unachieved(plan: &Plan) -> Vec<String> {
+    unachieved_of(&plan.every_subtask())
+}
+
+/// [`unachieved`] over an already-flattened tree, so the rule is testable without a repository.
+#[must_use]
+fn unachieved_of(tree: &[&Subtask]) -> Vec<String> {
+    tree.iter()
+        .filter(|subtask| subtask.state == SubtaskState::Blocked)
+        .map(|subtask| format!("`{}` ({}) is blocked", subtask.title, subtask.id))
+        .collect()
+}
+
 /// The definition of done the task as a whole is judged against.
 ///
 /// Built from the plan, which is the durable statement of what the task promised: every required
-/// check any subtask declared, deduplicated by id, plus one review. A fixed two-command list in
-/// the cycle would make "the task passed" mean "cargo build and cargo test passed" even when the
-/// plan asked for something else — and the plan is what a human approved.
+/// check of every subtask that actually ran, deduplicated by id and by command, plus one review. A
+/// fixed two-command list in the cycle would make "the task passed" mean "cargo build and cargo
+/// test passed" even when the plan asked for something else — and the plan is what a human
+/// approved.
+///
+/// Two filters, each from a measured defect:
+///
+/// * **Settled-as-achieved subtasks only.** A `blocked` subtask's work was discarded before the
+///   tree moved on (D-150), so its checks would run against somebody else's tree. [`unachieved`]
+///   is what reports it, and the caller refuses the task before this bar is even built.
+/// * **Deduplicated by command, not only by id.** The third `black_jack` plan declared
+///   `rspec_pass`, `rspec_all_pass` and `final_rspec`, all running `bundle exec rspec`; the task
+///   ran the same suite three times and paid three timeouts. Ids are labels a planner may vary
+///   freely; the command is what actually runs.
 fn acceptance(plan: &Plan) -> Dod {
+    acceptance_of(&plan.every_subtask())
+}
+
+/// [`acceptance`] over an already-flattened tree, so the rule is testable without a repository.
+fn acceptance_of(tree: &[&Subtask]) -> Dod {
     let mut checks = Vec::new();
-    let mut seen = std::collections::BTreeSet::new();
-    for subtask in plan.subtasks() {
+    let mut ids = std::collections::BTreeSet::new();
+    let mut commands = std::collections::BTreeSet::new();
+    for subtask in tree {
+        // `done` only. A `skipped` subtask is either a split's retired parent — whose children
+        // inherited the `DoD` and are visited in their own right — or a subtask a human retired
+        // without executing it; neither has work in the tree of its own.
+        if subtask.state != SubtaskState::Done {
+            continue;
+        }
         for check in &subtask.dod.checks {
-            if check.required && seen.insert(check.id.clone()) {
+            // Whitespace is the one thing a shell does not distinguish, so two checks that differ
+            // only in spacing are one command. Anything else stays distinct: `cargo test` and
+            // `cargo test --lib` are different guarantees.
+            let command = check.command.split_whitespace().collect::<Vec<_>>().join(" ");
+            if check.required && ids.insert(check.id.clone()) && commands.insert(command) {
                 checks.push(check.clone());
             }
         }
@@ -697,4 +772,130 @@ fn subtask_state(
         )
         .map(|_| ())
         .map_err(|error| CycleError::Store(error.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
+
+    use super::{acceptance_of, unachieved_of};
+    use immortality_core::domain::{Dod, DodCheck, Subtask, SubtaskState, Timestamp};
+
+    fn now() -> Timestamp {
+        chrono::TimeZone::timestamp_opt(&chrono::Utc, 1_700_000_000, 0)
+            .single()
+            .expect("a fixed timestamp")
+    }
+
+    fn subtask(title: &str, state: SubtaskState, checks: &[(&str, &str)]) -> Subtask {
+        let dod = Dod {
+            statement: format!("{title} is done"),
+            checks: checks
+                .iter()
+                .map(|(id, command)| DodCheck {
+                    id: (*id).to_string(),
+                    command: (*command).to_string(),
+                    required: true,
+                    timeout_secs: None,
+                })
+                .collect(),
+            review: false,
+        };
+        let mut subtask = Subtask::new(1, title, "do it", dod, now());
+        subtask.state = state;
+        subtask
+    }
+
+    fn tree(subtasks: &[Subtask]) -> Vec<&Subtask> {
+        subtasks.iter().collect()
+    }
+
+    #[test]
+    fn a_blocked_subtasks_checks_are_not_the_task_bar() {
+        // The subtask's work was discarded before the tree moved on (D-150), so running its
+        // command now would judge somebody else's tree under its id. Measured on `black_jack`:
+        // the task-level verdict ran `rspec_pass` (a `done` subtask's check) and reported a
+        // deadline, while two plan subtasks had never been achieved.
+        let done = subtask("analysis", SubtaskState::Done, &[("notes_exist", "test -f a.md")]);
+        let blocked = subtask("final", SubtaskState::Blocked, &[("rspec", "bundle exec rspec")]);
+        let bar = acceptance_of(&tree(&[done, blocked]));
+
+        let ids: Vec<&str> = bar.checks.iter().map(|check| check.id.as_str()).collect();
+        assert_eq!(ids, vec!["notes_exist"], "only achieved work is judged");
+    }
+
+    #[test]
+    fn the_same_command_under_three_ids_runs_once() {
+        // `black_jack` declared `rspec_pass`, `rspec_all_pass` and `final_rspec`, all
+        // `bundle exec rspec`: the task paid three 120-second timeouts for one suite. Ids are
+        // labels a planner varies; the command is what runs.
+        let first = subtask("pass", SubtaskState::Done, &[("rspec_pass", "bundle exec rspec")]);
+        let second = subtask(
+            "all",
+            SubtaskState::Done,
+            &[("rspec_all_pass", "bundle  exec rspec")],
+        );
+        let third = subtask(
+            "final",
+            SubtaskState::Done,
+            &[("final_rspec", "bundle exec rspec")],
+        );
+        let bar = acceptance_of(&tree(&[first, second, third]));
+
+        assert_eq!(bar.checks.len(), 1, "{:?}", bar.checks);
+    }
+
+    #[test]
+    fn a_different_command_under_a_known_id_is_still_a_different_guarantee() {
+        // Deduplication by command must not swallow a real second check: `cargo test` and
+        // `cargo test --offline` are different promises, and dropping the second would be the
+        // narrower gate the plan did not ask for.
+        let first = subtask("unit", SubtaskState::Done, &[("test", "cargo test")]);
+        let second = subtask(
+            "offline",
+            SubtaskState::Done,
+            &[("test_offline", "cargo test --offline")],
+        );
+        let bar = acceptance_of(&tree(&[first, second]));
+
+        assert_eq!(bar.checks.len(), 2, "{:?}", bar.checks);
+    }
+
+    #[test]
+    fn a_skipped_split_parent_is_not_a_failed_task() {
+        // A split retires the parent `skipped` by design and its children carry the `DoD`. Holding
+        // the task open on the parent would make every successful split a failed task, and reading
+        // its `DoD` twice would run the same command for the parent and each child.
+        let parent = subtask("parse", SubtaskState::Skipped, &[("test", "cargo test")]);
+        let child = subtask("lex", SubtaskState::Done, &[("test", "cargo test")]);
+        let both = [parent, child];
+        let flat = tree(&both);
+        assert!(
+            unachieved_of(&flat).is_empty(),
+            "a split parent is not unachieved"
+        );
+        assert_eq!(acceptance_of(&flat).checks.len(), 1);
+    }
+
+    #[test]
+    fn a_blocked_subtask_is_named_rather_than_left_to_a_command() {
+        // The reason a human reads. `evaluate` stops at the first red check, so without this the
+        // verdict would name an rspec deadline on a tree the blocked subtask no longer owns.
+        let blocked = subtask(
+            "final verification",
+            SubtaskState::Blocked,
+            &[("rspec", "bundle exec rspec")],
+        );
+        let done = subtask("analysis", SubtaskState::Done, &[("notes", "test -f a.md")]);
+        let missing = unachieved_of(&tree(&[done, blocked]));
+
+        assert_eq!(missing.len(), 1, "{missing:?}");
+        assert!(missing[0].contains("final verification"), "{missing:?}");
+        assert!(missing[0].contains("blocked"), "{missing:?}");
+    }
 }

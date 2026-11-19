@@ -314,3 +314,269 @@ fn empty_goal_is_rejected() {
         .failure()
         .stderr(predicate::str::contains("goal must not be empty"));
 }
+
+// ── reset ──────────────────────────────────────────────────────────────────────────────
+
+/// A state root with a registry, a token and an artifact, plus a repository with a task branch.
+fn reset_fixture() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let state = fresh_state_dir();
+    std::fs::create_dir_all(&state).expect("state");
+    std::fs::write(state.join("daemon.token"), "token\n").expect("token");
+    std::fs::create_dir_all(state.join("artifacts")).expect("artifacts");
+    std::fs::write(state.join("artifacts").join("body"), "x").expect("body");
+
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("repo");
+    for args in [
+        vec!["init", "-q", "-b", "main"],
+        vec!["config", "user.email", "t@example.com"],
+        vec!["config", "user.name", "t"],
+    ] {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(&args)
+            .output()
+            .expect("git");
+        assert!(output.status.success(), "{args:?}");
+    }
+    std::fs::write(repo.join("a.txt"), "a\n").expect("write");
+    for args in [vec!["add", "."], vec!["commit", "-q", "-m", "first"]] {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(&args)
+            .output()
+            .expect("git");
+        assert!(output.status.success(), "{args:?}");
+    }
+    std::fs::create_dir_all(repo.join(".agent")).expect("agent");
+    let mut registry =
+        immortality_core::registry::Registry::open(state.join("registry.json")).expect("registry");
+    registry.register(&repo, None).expect("register");
+
+    (dir, state, repo)
+}
+
+#[test]
+fn reset_without_yes_lists_and_deletes_nothing() {
+    // The whole safety story of the command: the first invocation is a list. A reset that acted
+    // on its first run would be unusable, because the machine it is meant to clean is often one
+    // the human is in the middle of debugging.
+    let (_dir, state, repo) = reset_fixture();
+    let request = std::process::Command::new(env!("CARGO_BIN_EXE_immortality"))
+        .env("IMMORTALITY_STATE_DIR", &state)
+        .arg("reset")
+        .output()
+        .expect("run");
+    assert!(request.status.success(), "{request:?}");
+    let stdout = String::from_utf8(request.stdout).expect("utf8");
+    assert!(stdout.contains("would remove"), "{stdout}");
+    assert!(stdout.contains("--yes"), "{stdout}");
+
+    // Everything is where it was.
+    assert!(
+        state.join("registry.json").exists(),
+        "the registry survived a dry run"
+    );
+    assert!(state.join("artifacts").join("body").exists());
+    assert!(repo.join(".agent").exists());
+}
+
+#[test]
+fn reset_yes_removes_the_agent_directory_and_the_registry_but_keeps_the_token() {
+    let (_dir, state, repo) = reset_fixture();
+    let request = std::process::Command::new(env!("CARGO_BIN_EXE_immortality"))
+        .env("IMMORTALITY_STATE_DIR", &state)
+        .arg("reset")
+        .arg("--yes")
+        .output()
+        .expect("run");
+    assert!(request.status.success(), "{request:?}");
+
+    assert!(!repo.join(".agent").exists(), ".agent/ must be gone");
+    assert!(!state.join("registry.json").exists(), "the registry must be gone");
+    assert!(!state.join("artifacts").exists(), "artifacts must be gone");
+    // The token stays by default: a running daemon without one refuses every client, and that is
+    // a worse state than the file being there.
+    assert!(
+        state.join("daemon.token").exists(),
+        "the token must survive without --token"
+    );
+    // The human's own commits and branches are untouched.
+    assert!(repo.join("a.txt").exists());
+    let branches = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["branch", "--format=%(refname:short)"])
+        .output()
+        .expect("branch");
+    let text = String::from_utf8_lossy(&branches.stdout);
+    assert!(text.contains("main"), "{text}");
+}
+
+#[test]
+fn reset_token_removes_the_token_too_and_a_second_run_is_a_noop() {
+    let (_dir, state, _repo) = reset_fixture();
+    for _ in 0..2 {
+        let request = std::process::Command::new(env!("CARGO_BIN_EXE_immortality"))
+            .env("IMMORTALITY_STATE_DIR", &state)
+            .args(["reset", "--yes", "--token"])
+            .output()
+            .expect("run");
+        assert!(request.status.success(), "{request:?}");
+    }
+    assert!(!state.join("daemon.token").exists(), "the token must be gone");
+
+    let again = std::process::Command::new(env!("CARGO_BIN_EXE_immortality"))
+        .env("IMMORTALITY_STATE_DIR", &state)
+        .arg("reset")
+        .output()
+        .expect("run");
+    let stdout = String::from_utf8(again.stdout).expect("utf8");
+    assert!(stdout.contains("zero state"), "{stdout}");
+}
+
+/// A `.bundle/config` in the fixture's repository naming `dir`, plus `dir` itself.
+fn with_bundle_path(repo: &std::path::Path, dir: &std::path::Path) {
+    std::fs::create_dir_all(dir).expect("gems dir");
+    std::fs::create_dir_all(repo.join(".bundle")).expect("bundle dir");
+    std::fs::write(
+        repo.join(".bundle").join("config"),
+        format!("---\nBUNDLE_PATH: \"{}\"\n", dir.display()),
+    )
+    .expect("config");
+}
+
+#[test]
+fn reset_lists_an_outside_directory_and_names_the_config_that_named_it() {
+    // Measured on the `black_jack` run: `bundle install` wrote gems into `~/.gem/shared` because the
+    // project's own `.bundle/config` said so. Nothing about that path says "immortality", so the
+    // report has to name both the directory and the file that named it — a path in a delete-list a
+    // human cannot trace is a path they have to go and investigate.
+    let (dir, state, repo) = reset_fixture();
+    let gems = dir.path().join("shared-gems");
+    with_bundle_path(&repo, &gems);
+
+    let request = std::process::Command::new(env!("CARGO_BIN_EXE_immortality"))
+        .env("IMMORTALITY_STATE_DIR", &state)
+        .arg("reset")
+        .output()
+        .expect("run");
+    assert!(request.status.success(), "{request:?}");
+    let stdout = String::from_utf8(request.stdout).expect("utf8");
+    assert!(stdout.contains("Outside the state root"), "{stdout}");
+    assert!(stdout.contains("shared-gems"), "{stdout}");
+    assert!(stdout.contains("BUNDLE_PATH"), "{stdout}");
+    assert!(
+        stdout.contains(".bundle/config") || stdout.contains(".bundle") && stdout.contains("config"),
+        "the report must name the config: {stdout}"
+    );
+    assert!(stdout.contains("--outside"), "{stdout}");
+    assert!(gems.exists(), "a dry run deleted it");
+}
+
+#[test]
+fn reset_yes_leaves_the_outside_directory_alone() {
+    // `--yes` means "delete what this program created". The gem directory is one the human's own
+    // `bundle install` also writes to, so deleting it on `--yes` would throw away work immortality
+    // did not do.
+    let (dir, state, repo) = reset_fixture();
+    let gems = dir.path().join("shared-gems");
+    with_bundle_path(&repo, &gems);
+    std::fs::write(gems.join("a.gem"), "gem").expect("gem");
+
+    let request = std::process::Command::new(env!("CARGO_BIN_EXE_immortality"))
+        .env("IMMORTALITY_STATE_DIR", &state)
+        .args(["reset", "--yes"])
+        .output()
+        .expect("run");
+    assert!(request.status.success(), "{request:?}");
+    let stdout = String::from_utf8(request.stdout).expect("utf8");
+    assert!(
+        stdout.contains("kept"),
+        "the report must say the directory is still there: {stdout}"
+    );
+    assert!(gems.join("a.gem").exists(), "--yes deleted it");
+    // And the reset did happen: the things it owns are gone.
+    assert!(!repo.join(".agent").exists());
+}
+
+#[test]
+fn reset_yes_outside_removes_the_directory_too() {
+    let (dir, state, repo) = reset_fixture();
+    let gems = dir.path().join("shared-gems");
+    with_bundle_path(&repo, &gems);
+    std::fs::write(gems.join("a.gem"), "gem").expect("gem");
+
+    let request = std::process::Command::new(env!("CARGO_BIN_EXE_immortality"))
+        .env("IMMORTALITY_STATE_DIR", &state)
+        .args(["reset", "--yes", "--outside"])
+        .output()
+        .expect("run");
+    assert!(request.status.success(), "{request:?}");
+    assert!(!gems.exists(), "--outside must delete it");
+    assert!(!repo.join(".agent").exists());
+}
+
+#[test]
+fn a_reset_whose_only_leftover_is_an_outside_directory_still_says_so() {
+    // The state a human reaches after `reset --yes`: everything immortality created is gone, and
+    // the one remaining thing is a directory the project's config named. Printing "zero state"
+    // there would be a lie about the machine, so the outside section comes first and the zero-state
+    // sentence after it.
+    let (dir, state, repo) = reset_fixture();
+    let gems = dir.path().join("shared-gems");
+    with_bundle_path(&repo, &gems);
+
+    let first = std::process::Command::new(env!("CARGO_BIN_EXE_immortality"))
+        .env("IMMORTALITY_STATE_DIR", &state)
+        .args(["reset", "--yes", "--token"])
+        .output()
+        .expect("run");
+    assert!(first.status.success(), "{first:?}");
+
+    let second = std::process::Command::new(env!("CARGO_BIN_EXE_immortality"))
+        .env("IMMORTALITY_STATE_DIR", &state)
+        .arg("reset")
+        .output()
+        .expect("run");
+    let stdout = String::from_utf8(second.stdout).expect("utf8");
+    // The registry is gone, so the directory can no longer be found — and the report says exactly
+    // that rather than claiming the machine is clean.
+    assert!(stdout.contains("zero state"), "{stdout}");
+    assert!(gems.exists());
+}
+
+#[test]
+fn the_json_dry_run_carries_the_outside_section() {
+    let (dir, state, repo) = reset_fixture();
+    let gems = dir.path().join("shared-gems");
+    with_bundle_path(&repo, &gems);
+
+    let request = std::process::Command::new(env!("CARGO_BIN_EXE_immortality"))
+        .env("IMMORTALITY_STATE_DIR", &state)
+        .args(["reset", "--json"])
+        .output()
+        .expect("run");
+    assert!(request.status.success(), "{request:?}");
+    let value: serde_json::Value = serde_json::from_slice(&request.stdout).expect("a JSON dry run");
+    let outside = value["outside"].as_array().expect("an outside array");
+    assert_eq!(outside.len(), 1, "{value}");
+    assert_eq!(outside[0]["key"], "BUNDLE_PATH");
+    assert!(
+        outside[0]["path"]
+            .as_str()
+            .expect("path")
+            .ends_with("shared-gems"),
+        "{value}"
+    );
+    assert!(
+        outside[0]["named_by"]
+            .as_str()
+            .expect("named_by")
+            .ends_with(".bundle/config"),
+        "{value}"
+    );
+}

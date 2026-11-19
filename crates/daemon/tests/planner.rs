@@ -181,6 +181,51 @@ fn a_goal_becomes_three_files_the_loader_accepts() {
 }
 
 #[test]
+fn a_plan_cannot_be_forced_over_a_running_project() {
+    // `plan --force` used to check only whether a plan was on disk, never whether a task was
+    // executing it. The planner would then rewrite `PLAN.md` and `TASKS.json` under a live run,
+    // and the run would continue against subtasks that no longer existed. `start --force` claims
+    // the project's slot first; this is the same rule on the other door.
+    let fixture = Fixture::new();
+    let model = std::sync::Arc::new(Script::answering(&good_answer()));
+    let state = fixture.state(&model);
+    let holder = TaskId::generate();
+    let project = Registry::open(fixture.state_root.join(immortality_core::registry::FILE_NAME))
+        .expect("registry")
+        .projects()
+        .first()
+        .expect("the fixture registers one project")
+        .id
+        .clone();
+    state
+        .running
+        .lock()
+        .expect("run set")
+        .insert(project, holder.clone());
+
+    let error = run_plan(
+        &state,
+        &fixture.params(&serde_json::json!({
+            "goal": "a brand new goal",
+            "force": true,
+        })),
+    )
+    .expect_err("a forced plan over a running project must be refused");
+
+    assert!(error.message.contains("running"), "{}", error.message);
+    assert!(
+        error.message.contains(&holder.to_string()),
+        "the refusal must name the holder: {}",
+        error.message
+    );
+    assert_eq!(model.calls(), 0, "the refusal must precede the model call");
+    assert!(
+        !fixture.repo.join(".agent").join("PLAN.md").exists(),
+        "nothing may be written when the refusal is about a live run"
+    );
+}
+
+#[test]
 fn the_planner_is_asked_with_the_goal_and_a_listing_of_the_repository() {
     // Two things the request must carry, and one it must not: the goal, enough of the repository
     // to know what kind of project it is, and no tools. The absence of tools is what makes the

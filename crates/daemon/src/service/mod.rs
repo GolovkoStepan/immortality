@@ -65,10 +65,37 @@ pub struct ServiceSpec {
     pub state_root: PathBuf,
     /// Where stdout and stderr go. Both managers append; neither rotates.
     pub log_path: PathBuf,
+    /// `PATH` to install the job with, captured from the shell that ran `service install`.
+    ///
+    /// `None` means "do not set one", and the manager supplies its own. Both managers give a
+    /// service a PATH that is not the human's: `launchd` hands an agent
+    /// `/usr/bin:/bin:/usr/sbin:/sbin` and `systemd --user` does not read `.zprofile` either. For
+    /// a project whose toolchain comes from a version manager (asdf, mise, nvm, pyenv) that means
+    /// the daemon runs a *different* interpreter than the human's shell — the tool is not found,
+    /// or an older one is found first. Capturing the PATH at install time is the only moment the
+    /// good value exists: the human is in the shell that has it, and the daemon is not.
+    pub path: Option<String>,
+    /// The character locale to install the job with, captured from the same shell as [`Self::path`].
+    ///
+    /// `None` means "do not set one", and the manager supplies its default — which on macOS is no
+    /// locale at all. A process with no `LANG` does not guess UTF-8: libc falls back to the `C`
+    /// locale, and a language runtime built on it picks `US-ASCII`. Measured on the third
+    /// `black_jack` run: Ruby's `Encoding.default_external` was `US-ASCII`, so `RSpec`'s failure
+    /// messages came back as `????` in 48 journal records, and the one failure the model had to
+    /// read — the poisoned `allow(sleep)` — was unreadable. Nothing crashed; the diagnosis was
+    /// just silently destroyed.
+    ///
+    /// A single value rather than three, collapsed by the precedence the C library itself uses
+    /// (`LC_ALL`, then `LC_CTYPE`, then `LANG`). That is what makes copying faithful instead of
+    /// approximate: a shell with `LC_ALL=C` gets a daemon that also sees `C`, and a shell with only
+    /// `LC_CTYPE=en_US.UTF-8` gets a daemon whose character locale is `en_US.UTF-8` — the same
+    /// encoding the shell's children had. It is about encoding, not message translation.
+    pub lang: Option<String>,
 }
 
 impl ServiceSpec {
-    /// The spec for this machine: the running binary, and the discovered state root.
+    /// The spec for this machine: the running binary, the discovered state root, and this process's
+    /// `PATH`.
     ///
     /// # Errors
     /// `current_exe` cannot be read, or `$HOME` is unusable.
@@ -83,8 +110,31 @@ impl ServiceSpec {
             log_path: state_root.join("logs").join("daemon.log"),
             program,
             state_root,
+            path: std::env::var("PATH").ok().filter(|path| !path.trim().is_empty()),
+            lang: character_locale(),
         })
     }
+}
+
+/// The locale that decides how this process's children encode text, or `None` if it is unset.
+fn character_locale() -> Option<String> {
+    character_locale_of(|name| std::env::var(name).ok())
+}
+
+/// [`character_locale`] over an arbitrary lookup, so the precedence is testable.
+///
+/// The order is the one glibc and Apple's libc use: `LC_ALL` overrides everything, `LC_CTYPE` names
+/// the character locale specifically, `LANG` is the fallback for both. Empty is unset — a `LANG=`
+/// in a shell profile is a variable a human cleared, not a locale whose name is the empty string.
+///
+/// The lookup is a parameter rather than `std::env::var` read inline because `set_var` is `unsafe`
+/// in edition 2024 and racy under parallel tests: a test that mutated the environment to exercise
+/// this would be changing every other test's `LANG` at the same time.
+fn character_locale_of(lookup: impl Fn(&str) -> Option<String>) -> Option<String> {
+    ["LC_ALL", "LC_CTYPE", "LANG"]
+        .iter()
+        .filter_map(|name| lookup(name))
+        .find(|value| !value.trim().is_empty())
 }
 
 /// The state root as an absolute path, from the same rule the daemon uses.
@@ -143,5 +193,52 @@ mod tests {
         // One number, two spellings: `ThrottleInterval` and `RestartSec`. A second literal in the
         // systemd unit would let the two platforms disagree about how hard a crash loop is.
         assert_eq!(RESTART_SECONDS, 10);
+    }
+
+    #[test]
+    fn the_character_locale_prefers_lc_all_then_lc_ctype_then_lang() {
+        // The precedence is not a preference: it is what libc does, so copying it is what makes the
+        // installed value the value the shell's own children had. A daemon with `LC_ALL=C` in the
+        // installing shell must not be handed `LANG=en_US.UTF-8` — that would be a locale the human
+        // explicitly overrode.
+        let with = |pairs: &'static [(&'static str, &'static str)]| {
+            character_locale_of(move |name| {
+                pairs
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| (*value).to_string())
+            })
+        };
+        assert_eq!(
+            with(&[("LC_ALL", "C"), ("LANG", "en_US.UTF-8")]),
+            Some("C".to_string())
+        );
+        assert_eq!(
+            with(&[("LC_CTYPE", "en_US.UTF-8"), ("LANG", "C")]),
+            Some("en_US.UTF-8".to_string())
+        );
+        assert_eq!(with(&[("LANG", "ru_RU.UTF-8")]), Some("ru_RU.UTF-8".to_string()));
+        assert_eq!(with(&[]), None);
+    }
+
+    #[test]
+    fn an_empty_locale_variable_is_unset_not_a_locale_named_empty() {
+        // `LANG=` in a profile is a variable a human cleared. Copying the empty string into the
+        // plist would install a locale whose name does not exist, and libc would fall back to `C`
+        // while the definition claimed otherwise — the silent `US-ASCII` bug with a paper trail.
+        let with = |pairs: &'static [(&'static str, &'static str)]| {
+            character_locale_of(move |name| {
+                pairs
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| (*value).to_string())
+            })
+        };
+        assert_eq!(with(&[("LANG", "")]), None);
+        assert_eq!(
+            with(&[("LC_ALL", ""), ("LANG", "en_US.UTF-8")]),
+            Some("en_US.UTF-8".to_string())
+        );
+        assert_eq!(with(&[("LANG", "   ")]), None);
     }
 }

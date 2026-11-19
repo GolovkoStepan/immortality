@@ -44,6 +44,13 @@ pub struct CheckRunner {
     pub worktree: PathBuf,
     /// Per-command deadline.
     pub timeout: Duration,
+    /// Where a check's whole output is kept, when one is wired.
+    ///
+    /// A gate check is the one command in the system whose output nothing else records: the tail
+    /// is bounded, the process exits, and a post-mortem has no way to ask what it printed. The
+    /// live `black_jack` run left two red `rspec` gates that nobody could inspect afterwards,
+    /// while the same command run through `shell` had a full artifact.
+    pub artifacts: Option<std::sync::Arc<immortality_core::artifacts::ArtifactStore>>,
 }
 
 impl CheckRunner {
@@ -53,7 +60,18 @@ impl CheckRunner {
         Self {
             worktree: worktree.into(),
             timeout: Duration::from_secs(immortality_tools::shell::DEFAULT_TIMEOUT_SECS),
+            artifacts: None,
         }
+    }
+
+    /// Keep every check's whole output in `artifacts`.
+    #[must_use]
+    pub fn spooling_to(
+        mut self,
+        artifacts: std::sync::Arc<immortality_core::artifacts::ArtifactStore>,
+    ) -> Self {
+        self.artifacts = Some(artifacts);
+        self
     }
 }
 
@@ -129,14 +147,32 @@ impl Gates for RealGates {
             .unwrap_or_else(|| "the command needs a human".to_string()))
     }
 
-    fn run(&self, command: &str) -> Result<CommandRun, String> {
-        let output = immortality_tools::run_command(command, &self.checks.worktree, self.checks.timeout)
-            .map_err(|error| error.to_string())?;
+    fn run(&self, command: &str, timeout: Option<Duration>) -> Result<CommandRun, String> {
+        // The check's own deadline wins: a plan that declares nine minutes for `cargo test` means
+        // it, and a runner that clamped it to the default would fail a check the author knowingly
+        // made slow. `run_command` applies the outer cap, so a plan cannot ask for an hour either.
+        let timeout = timeout.unwrap_or(self.checks.timeout);
+        let (output, artifact) = match &self.checks.artifacts {
+            Some(store) => {
+                let (output, digest) =
+                    immortality_tools::run_command_spooled(command, &self.checks.worktree, timeout, store)
+                        .map_err(|error| error.to_string())?;
+                (output, digest)
+            }
+            None => (
+                immortality_tools::run_command(command, &self.checks.worktree, timeout)
+                    .map_err(|error| error.to_string())?,
+                None,
+            ),
+        };
         Ok(CommandRun {
             exit_code: output.exit_code,
             timed_out: output.timed_out,
             duration_ms: u64::try_from(output.duration.as_millis()).unwrap_or(u64::MAX),
             output_tail: output.tail,
+            stdout_lines: output.stdout_lines,
+            stderr_lines: output.stderr_lines,
+            artifact,
         })
     }
 }
@@ -356,6 +392,9 @@ mod tests {
             CheckRunner {
                 worktree: worktree.to_path_buf(),
                 timeout: Duration::from_secs(10),
+                // No artifact store in a test: `None` is the honest answer, and the check still
+                // runs and reports its exit code.
+                artifacts: None,
             },
             None,
         )
@@ -476,9 +515,36 @@ mod tests {
     #[test]
     fn a_command_runs_in_the_worktree() {
         let (dir, _) = repo();
-        let run = gates(dir.path()).run("test -f a.txt && echo ok").expect("run");
+        let run = gates(dir.path())
+            .run("test -f a.txt && echo ok", None)
+            .expect("run");
         assert_eq!(run.exit_code, Some(0));
         assert!(run.output_tail.contains("ok"), "{run:?}");
+    }
+
+    #[test]
+    fn a_check_deadline_overrides_the_runner_default_for_that_command_only() {
+        // The `black_jack` defect end to end: the runner's default is the 120 s tool default, and a
+        // check that declares its own longer deadline has to get it while its neighbours keep the
+        // default. Here the direction is inverted on purpose — a one-second deadline against a
+        // command that sleeps — because a short deadline is observable in a test and a nine-minute
+        // one is not.
+        let (dir, _) = repo();
+        let runner = gates(dir.path());
+        let configured = runner.checks.timeout;
+        assert_eq!(configured, Duration::from_secs(10), "the fixture's default");
+
+        // No declared deadline: the configured default applies and a quick command passes.
+        let plain = runner.run("true", None).expect("run");
+        assert!(!plain.timed_out, "{plain:?}");
+        assert_eq!(plain.exit_code, Some(0));
+
+        // A declared deadline wins over the default, even when it is far shorter.
+        let run = runner.run("sleep 5", Some(Duration::from_secs(1))).expect("run");
+        assert!(run.timed_out, "{run:?}");
+        assert_eq!(run.exit_code, None);
+        // And the override did not mutate the runner: the next check gets the default back.
+        assert_eq!(runner.checks.timeout, configured);
     }
 
     #[test]

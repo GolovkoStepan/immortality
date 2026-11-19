@@ -27,6 +27,8 @@ fn spec() -> ServiceSpec {
         program: PathBuf::from("/Users/test/bin/immortality"),
         state_root: PathBuf::from("/Users/test/Library/Application Support/immortality"),
         log_path: PathBuf::from("/Users/test/Library/Application Support/immortality/logs/daemon.log"),
+        path: None,
+        lang: None,
     }
 }
 
@@ -82,6 +84,73 @@ fn the_plist_round_trips_through_plutil_with_the_expected_keys() {
         .expect("ProgramArguments is an array");
     assert_eq!(arguments[0], "/Users/test/bin/immortality");
     assert_eq!(arguments[1], "serve");
+}
+
+#[test]
+fn the_path_from_install_time_reaches_launchd_as_one_string() {
+    // The daemon inherits the *installed* environment, not the shell's. launchd's own default is
+    // `/usr/bin:/bin:/usr/sbin:/sbin`, which on a machine whose Ruby or Node comes from asdf finds
+    // an older system interpreter first — the run then either cannot find its toolchain or, worse,
+    // uses the wrong one. This asserts the PATH survives CoreFoundation's parser intact.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("agent.plist");
+    let with_path = ServiceSpec {
+        path: Some("/Users/test/.asdf/shims:/opt/homebrew/bin:/usr/bin:/bin".to_string()),
+        ..spec()
+    };
+    std::fs::write(&path, service::plist(&with_path)).expect("write");
+
+    let output = Command::new("plutil")
+        .args(["-convert", "json", "-o", "-"])
+        .arg(&path)
+        .output()
+        .expect("plutil");
+    assert!(
+        output.status.success(),
+        "launchd would refuse this plist: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("plutil emits JSON");
+    assert_eq!(
+        value["EnvironmentVariables"]["PATH"],
+        "/Users/test/.asdf/shims:/opt/homebrew/bin:/usr/bin:/bin"
+    );
+}
+
+#[test]
+fn the_lang_from_install_time_reaches_launchd_as_one_string() {
+    // The measured defect behind this (D-153): launchd gives an agent no locale, Ruby then reports
+    // `Encoding.default_external == US-ASCII`, and every non-ASCII byte in an RSpec failure becomes
+    // `?`. 48 journal records of the third `black_jack` run are that mojibake, including the one
+    // failure the model needed to read. Asserted through `plutil`, not as text in the file: what
+    // matters is the value launchd hands the process.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("agent.plist");
+    let with_lang = ServiceSpec {
+        path: Some("/opt/homebrew/bin:/usr/bin:/bin".to_string()),
+        lang: Some("ru_RU.UTF-8".to_string()),
+        ..spec()
+    };
+    std::fs::write(&path, service::plist(&with_lang)).expect("write");
+
+    let output = Command::new("plutil")
+        .args(["-convert", "json", "-o", "-"])
+        .arg(&path)
+        .output()
+        .expect("plutil");
+    assert!(
+        output.status.success(),
+        "launchd would refuse this plist: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("plutil emits JSON");
+    assert_eq!(value["EnvironmentVariables"]["LANG"], "ru_RU.UTF-8");
+    // Both variables coexist: a plist that lost PATH while gaining LANG would fix the mojibake
+    // and break the toolchain, which is a worse trade than either bug alone.
+    assert_eq!(
+        value["EnvironmentVariables"]["PATH"],
+        "/opt/homebrew/bin:/usr/bin:/bin"
+    );
 }
 
 #[test]

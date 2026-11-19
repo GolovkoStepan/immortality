@@ -194,6 +194,21 @@ impl ToolsetDeps {
 /// failing at construction is what makes them visible in `daemon doctor` rather than at the first
 /// call of the first run.
 pub fn build(deps: &ToolsetDeps) -> immortality_core::Result<Registry> {
+    build_with_processes(deps).map(|(registry, _)| registry)
+}
+
+/// [`build`], and the process registry the tools were built over.
+///
+/// The runner needs the same registry to sweep a task's processes when an attempt ends (D-152).
+/// Returning it here rather than opening a second one is the same reason the tools share one:
+/// two `ProcessRegistry` values over one directory would allocate `proc_1` twice, and a handle
+/// would then name two processes.
+///
+/// # Errors
+/// See [`build`].
+pub fn build_with_processes(
+    deps: &ToolsetDeps,
+) -> immortality_core::Result<(Registry, Arc<ProcessRegistry>)> {
     let shell = Arc::new(ShellState::new());
     // The registry's files live under the task directory; a failure here is the state root
     // being unwritable, which is a reason not to start rather than a reason to omit the process
@@ -202,7 +217,7 @@ pub fn build(deps: &ToolsetDeps) -> immortality_core::Result<Registry> {
         deps.processes()
             .map_err(|error| immortality_core::Error::Protocol(error.to_string()))?,
     );
-    Registry::new(vec![
+    let registry = Registry::new(vec![
         Arc::new(ReadFile),
         Arc::new(WriteFile),
         Arc::new(EditFile),
@@ -220,9 +235,10 @@ pub fn build(deps: &ToolsetDeps) -> immortality_core::Result<Registry> {
         Arc::new(Delegate::deferred(&deps.queue_root, Arc::clone(&deps.sub_agent))),
         Arc::new(StartProcess::new(Arc::clone(&processes), Arc::clone(&shell))),
         Arc::new(ReadProcess::new(Arc::clone(&processes))),
-        Arc::new(KillProcess::new(processes)),
+        Arc::new(KillProcess::new(Arc::clone(&processes))),
     ])
-    .map_err(|error| immortality_core::Error::Protocol(format!("the tool registry is broken: {error}")))
+    .map_err(|error| immortality_core::Error::Protocol(format!("the tool registry is broken: {error}")))?;
+    Ok((registry, processes))
 }
 
 /// The directory a task's journal lives in, given the repository it belongs to.

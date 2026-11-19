@@ -50,6 +50,9 @@ fn check(id: &str, required: bool, passed: bool) -> CheckOutcome {
         duration_ms: 10,
         passed,
         output_tail: String::new(),
+        stdout_lines: 0,
+        stderr_lines: 0,
+        artifact: None,
     }
 }
 
@@ -518,6 +521,51 @@ fn a_check_that_never_ran_says_why_instead_of_no_exit_code() {
 }
 
 #[test]
+fn a_timed_out_check_records_the_timeout_not_the_stdout_heading() {
+    // The live run's journal had `"why": "--- stdout ---"` next to `"timed out after 120070 ms"`:
+    // `reason()` took the first line of the tail, and for a killed command the tail opens with a
+    // channel label. The heading became *the reason*, and a post-mortem that read only `why`
+    // learned nothing.
+    //
+    // The heading is still in the excerpt, which is right: it labels the lines under it. What must
+    // not happen is the heading standing in for the reason, so the assertion is about the first
+    // line, not about the presence of the label.
+    let mut report = green();
+    report.checks = vec![CheckOutcome {
+        id: "final_rspec".to_string(),
+        command: "bundle exec rspec".to_string(),
+        required: true,
+        exit_code: None,
+        timed_out: true,
+        duration_ms: 120_070,
+        passed: false,
+        output_tail: "--- stdout ---\n147 examples, 0 failures".to_string(),
+        stdout_lines: 2,
+        stderr_lines: 0,
+        artifact: None,
+    }];
+    let records = GateRecord::of(&report);
+    let GateRecord::Check { why, .. } = &records[1] else {
+        panic!("the second record must be the check: {records:?}");
+    };
+    let why = why.as_deref().expect("a timed-out check records the timeout");
+    assert!(why.contains("timed out after 120070 ms"), "{why}");
+    assert!(
+        !why.starts_with("--- stdout ---"),
+        "the heading must not be the reason: {why}"
+    );
+    assert_eq!(
+        why.lines().next(),
+        Some("`final_rspec` timed out after 120070 ms (2 line(s) of stdout, 0 of stderr)"),
+        "{why}"
+    );
+
+    // The excerpt under it stays: it is bounded, says how much it dropped, and is what a reader
+    // opens when the counts say the command looped.
+    assert!(why.contains("147 examples, 0 failures"), "{why}");
+}
+
+#[test]
 fn a_refused_check_records_the_reason_in_the_journal() {
     // `exit_code: null, passed: false` and nothing else is what made the first run's journal
     // unreadable after the fact: "a check failed" and "a check never ran" looked identical.
@@ -543,6 +591,171 @@ fn a_refused_check_records_the_reason_in_the_journal() {
         panic!("the second record must be the check: {records:?}");
     };
     assert!(why.is_none(), "{why:?}");
+}
+
+#[test]
+fn a_red_check_carries_the_output_that_says_what_failed() {
+    // The live `black_jack` run: a 192-example `rspec` run with one failure became
+    // "`rspec_after_add` (exit 1)" in the journal and in the next attempt's brief. The model
+    // never learned which example failed, and the failure it needed was one line of output the
+    // gate had already captured and thrown away.
+    //
+    // This is the injection: give the check a tail that names the failure and assert the reader
+    // gets it. Delete the `failure_text` call in `GateRecord::of` and this test goes red on the
+    // `why` assertion; revert `GateReport::verdict` to `summary()` and it goes red on the verdict.
+    let mut report = green();
+    report.checks = vec![CheckOutcome {
+        output_tail: "\
+Run options: --seed 1234
+
+Failures:
+
+  1) BlackJack::Interface#wait_and_clean clears the screen via Kernel.system
+     Failure/Error: expect(Kernel).to receive(:system).with('clear')
+       expected: 1 time with arguments: (\"clear\")
+       received: 0 times
+     # ./spec/lib/black_jack/interface_edge_spec.rb:100
+
+Finished in 0.03 seconds (files took 0.07 seconds to load)
+192 examples, 1 failure"
+            .to_string(),
+        ..check("rspec_after_add", true, false)
+    }];
+
+    let records = GateRecord::of(&report);
+    let GateRecord::Check { why, .. } = &records[1] else {
+        panic!("the second record must be the check: {records:?}");
+    };
+    let why = why.as_deref().expect("a red check records what it printed");
+    assert!(why.contains("(exit 1)"), "the summary is still there: {why}");
+    assert!(
+        why.contains("received: 0 times"),
+        "the failure itself must reach the journal: {why}"
+    );
+    assert!(
+        why.contains("interface_edge_spec.rb:100"),
+        "the file and line must reach the journal: {why}"
+    );
+
+    // And the brief: the verdict's `why` is the only thing the next attempt is told about a red
+    // check, so it has to be the same fact rather than the one-line summary it used to be.
+    let Some(GateVerdict::Failed { why, .. }) = Some(report.verdict()) else {
+        panic!("a red check is a failed verdict");
+    };
+    assert!(why.contains("received: 0 times"), "{why}");
+    assert!(why.contains("`rspec_after_add` (exit 1)"), "{why}");
+}
+
+#[test]
+fn a_long_check_tail_keeps_the_end_and_says_how_much_it_left_out() {
+    // The brief is re-sent on every step of the next attempt, so an unbounded tail would spend the
+    // budget it was meant to save. The cut must keep the failure — the end — and be honest about
+    // what it dropped.
+    let log = (1..=500).map(|n| format!("line {n}")).collect::<Vec<_>>();
+    let mut report = green();
+    report.checks = vec![CheckOutcome {
+        output_tail: log.join("\n"),
+        ..check("test", true, false)
+    }];
+    let records = GateRecord::of(&report);
+    let GateRecord::Check { why, .. } = &records[1] else {
+        panic!("the second record must be the check: {records:?}");
+    };
+    let why = why.as_deref().expect("a red check records its output");
+    assert!(why.contains("line 500"), "the end survives: {why}");
+    assert!(!why.contains("line 1\n"), "the start is cut: {why}");
+    assert!(why.contains("earlier line(s) not shown"), "{why}");
+    // Bounded: the excerpt is at most the stated number of lines plus the omission marker.
+    assert!(
+        why.lines().count() <= TAIL_LINES_FOR_READING + 2,
+        "{} lines",
+        why.lines().count()
+    );
+}
+
+#[test]
+fn a_timed_out_check_reports_its_line_count_instead_of_a_wall_of_repeating_output() {
+    // Measured on `black_jack`: the game-loop spec printed 9169 lines before the 120 s deadline.
+    // Every line of that tail is a copy of a screen, so copying it into the journal says nothing
+    // and costs the next attempt its context. The line count is the fact that survives.
+    let mut report = green();
+    report.checks = vec![CheckOutcome {
+        id: "rspec_after_add".to_string(),
+        exit_code: None,
+        timed_out: true,
+        duration_ms: 120_239,
+        passed: false,
+        output_tail: "--- stdout ---\n┌─────────┐\n│J        │\n└─────────┘".to_string(),
+        stdout_lines: 9169,
+        stderr_lines: 4,
+        ..check("rspec_after_add", true, false)
+    }];
+    let verdict = report.verdict();
+    let Some(GateVerdict::Failed { why, .. }) = Some(verdict) else {
+        panic!("a timeout is a failed verdict");
+    };
+    assert!(why.contains("timed out after 120239 ms"), "{why}");
+    assert!(why.contains("9169 line(s) of stdout"), "{why}");
+    assert!(
+        why.lines().count() <= TAIL_LINES_ON_TIMEOUT + 2,
+        "a timeout's excerpt must be short: {} lines\n{why}",
+        why.lines().count()
+    );
+}
+
+#[test]
+fn a_check_that_never_ran_records_the_refusal_and_no_artifact() {
+    // `not_run` has no output and no artifact, and both fields must stay out of the journal
+    // rather than appearing as empty strings a reader has to interpret.
+    let mut report = green();
+    report.checks = vec![CheckOutcome::not_run(
+        "check_readme",
+        "grep -qE '~> *3\\.4' README.md",
+        true,
+        "the policy refused this command: the path could not be resolved",
+    )];
+    let records = GateRecord::of(&report);
+    let GateRecord::Check { why, artifact, .. } = &records[1] else {
+        panic!("the second record must be the check: {records:?}");
+    };
+    let why = why.as_deref().expect("a refused check records why");
+    assert!(why.contains("the policy refused"), "{why}");
+    assert_eq!(*artifact, None, "nothing ran, so nothing was spooled");
+}
+
+#[test]
+fn a_passing_check_records_no_reason_and_no_artifact() {
+    // A green check says nothing: recording its output would make every successful gate as large
+    // as the test suite it ran.
+    let mut report = green();
+    report.checks = vec![CheckOutcome {
+        output_tail: "148 examples, 0 failures".to_string(),
+        artifact: Some("sha256:abc".to_string()),
+        ..check("test", true, true)
+    }];
+    let records = GateRecord::of(&report);
+    let GateRecord::Check { why, artifact, .. } = &records[1] else {
+        panic!("the second record must be the check: {records:?}");
+    };
+    assert!(why.is_none(), "{why:?}");
+    assert_eq!(*artifact, None, "a green check has nothing to explain");
+}
+
+#[test]
+fn a_red_check_records_the_artifact_a_human_can_open() {
+    // The excerpt is bounded, so the digest is what makes it honest. The live run's two red gate
+    // `rspec` runs left no artifact at all, while the same command run by the model did.
+    let mut report = green();
+    report.checks = vec![CheckOutcome {
+        output_tail: "192 examples, 1 failure".to_string(),
+        artifact: Some("sha256:deadbeef".to_string()),
+        ..check("rspec_after_add", true, false)
+    }];
+    let records = GateRecord::of(&report);
+    let GateRecord::Check { artifact, .. } = &records[1] else {
+        panic!("the second record must be the check: {records:?}");
+    };
+    assert_eq!(artifact.as_deref(), Some("sha256:deadbeef"));
 }
 
 #[test]

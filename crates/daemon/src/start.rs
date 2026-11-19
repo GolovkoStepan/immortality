@@ -111,7 +111,30 @@ pub async fn start(state: &ServerState, params: &Value) -> Result<Value, RpcErro
     // plan that is absent is planned from the goal. Missing both is a usage error that names
     // which of the two the human left out, not a silent re-plan.
     let on_disk = immortality_core::planner::existing(&project.path);
-    let (plan, planned) = if on_disk.any() && !force {
+    let needs_plan = !on_disk.any() || force;
+    // Asked before the slot is claimed because it has no side effect: a usage error should not
+    // take and release the project's slot on the way out.
+    missing_goal(needs_plan, force, &project, goal.as_deref())?;
+
+    let task = TaskId::generate();
+    let at = immortality_core::time::now();
+    // Claimed before *anything* is written, including a plan. `plan_now` below rewrites
+    // `PLAN.md`, `TASKS.json` and the scratch files in the project's `.agent/`, and those are the
+    // files the run already going in this project is executing from: a second `start --force`
+    // that was refused only after the model call had finished would have replaced the live run's
+    // tree under it and then said "another task is running". That is the worst pair of answers —
+    // the work changed *and* the request failed. The refusal has to come before the first byte
+    // of the plan, not before the first byte of the journal (D-142).
+    let slot = RunSlot::claim(state, &project.id, &task)?;
+
+    let (plan, planned) = if needs_plan {
+        // Unwrapped with `expect` only after the check above proved it is `Some`; an `unwrap` in
+        // a daemon that must phrase its own refusals would turn a logic slip into a panic.
+        let goal = goal.clone().ok_or_else(|| {
+            bad_params("a goal is required to plan; this check runs before the slot is taken")
+        })?;
+        (plan_now(state, &project, &task, &goal, force).await?, true)
+    } else {
         let plan = Plan::load(&project.path, depth).map_err(|error| {
             bad_params(format!(
                 "the plan in {} cannot be read ({error}); fix it, or pass `--force` with a goal \
@@ -120,23 +143,6 @@ pub async fn start(state: &ServerState, params: &Value) -> Result<Value, RpcErro
             ))
         })?;
         (plan, false)
-    } else {
-        let goal = goal.clone().ok_or_else(|| {
-            if force {
-                bad_params(
-                    "`--force` re-plans an existing tree, and re-planning needs a goal: \
-                     `immortality start \"what to do\" --force`",
-                )
-            } else {
-                bad_params(format!(
-                    "there is no plan to run in {}; give a goal — \
-                     `immortality start \"what to do\"` — or write one with \
-                     `immortality plan --goal`",
-                    project.path.display()
-                ))
-            }
-        })?;
-        (plan_now(state, &project, &goal, force).await?, true)
     };
     if plan.subtasks().is_empty() {
         return Err(bad_params(
@@ -144,13 +150,6 @@ pub async fn start(state: &ServerState, params: &Value) -> Result<Value, RpcErro
         ));
     }
 
-    let task = TaskId::generate();
-    let at = immortality_core::time::now();
-    // The project's slot is claimed before anything is written. `start` journals `task_created`
-    // before the run thread exists, so a second admission of the same project that was refused
-    // only after that write would still have appended to the one file both runs share — the
-    // refusal has to come before the first byte, not before the thread (D-142).
-    let slot = RunSlot::claim(state, &project.id, &task)?;
     let task_dir = project.state_dir(&state.state_root).join(task.as_str());
     std::fs::create_dir_all(&task_dir)
         .map_err(|error| internal(format!("cannot create {}: {error}", task_dir.display())))?;
@@ -208,12 +207,51 @@ pub async fn start(state: &ServerState, params: &Value) -> Result<Value, RpcErro
     }))
 }
 
+/// Refuse a request that would need a goal and has none, naming the piece that is missing.
+///
+/// Split out of [`start`] so the line that claims the slot is not buried in three branches of
+/// message-writing: this check has no side effect, and its only job is to say which of "write a
+/// goal" and "write a plan" the human left out.
+fn missing_goal(
+    needs_plan: bool,
+    force: bool,
+    project: &Project,
+    goal: Option<&str>,
+) -> Result<(), RpcError> {
+    if !needs_plan || goal.is_some() {
+        return Ok(());
+    }
+    Err(if force {
+        bad_params(
+            "`--force` re-plans an existing tree, and re-planning needs a goal: \
+             `immortality start \"what to do\" --force`",
+        )
+    } else {
+        bad_params(format!(
+            "there is no plan to run in {}; give a goal — \
+             `immortality start \"what to do\"` — or write one with `immortality plan --goal`",
+            project.path.display()
+        ))
+    })
+}
+
 /// Ask the planner for a tree and load what it wrote.
-async fn plan_now(state: &ServerState, project: &Project, goal: &str, force: bool) -> Result<Plan, RpcError> {
+///
+/// `caller` is this admission's own task id, already holding the project's slot: the planner
+/// refuses a plan over a live run, and the run asking for its *own* first plan is not that
+/// collision.
+async fn plan_now(
+    state: &ServerState,
+    project: &Project,
+    task: &TaskId,
+    goal: &str,
+    force: bool,
+) -> Result<Plan, RpcError> {
     let params = serde_json::json!({
         "project": project.path,
         "goal": goal,
         "force": force,
+        "caller": task,
     });
     crate::planner::write_plan(state, &params).await?;
     Plan::load(&project.path, state.config.loop_.max_subtask_depth)
@@ -441,9 +479,8 @@ impl RunSlot {
                 ErrorCode::BadParams,
                 format!(
                     "task {task} cannot run: {holder} is already running in this project, and its \
-                     journal is one file — two runs would fork the chain. Wait for it or cancel \
-                     it, or watch it with `immortality attach {holder}`; `immortality status` \
-                     lists both."
+                     journal is one file — two runs would fork the chain. Wait for it, or watch it \
+                     with `immortality attach {holder}`; `immortality status` lists both."
                 ),
             ));
         }
@@ -513,9 +550,13 @@ fn execute(run: Run) -> Result<TaskState, String> {
     };
     let judge = judged(&config, &project, &task, Arc::clone(&model))?;
     let deps = deps.with_judge(judge, &goal);
-    let registry = toolset::build(&deps).map_err(|error| format!("cannot build the tools: {error}"))?;
+    let (registry, processes) =
+        toolset::build_with_processes(&deps).map_err(|error| format!("cannot build the tools: {error}"))?;
 
     let gate = Arc::clone(&deps.gate);
+    // The same store the `shell` tool writes to, cloned: a red gate's whole output becomes an
+    // artifact a human can open, rather than a bound tail that dies with the process.
+    let gate_artifacts = std::sync::Arc::new(deps.artifacts.clone());
     let runner = Runner {
         model: Arc::clone(&model),
         model_name: config.models.executor.clone(),
@@ -537,7 +578,7 @@ fn execute(run: Run) -> Result<TaskState, String> {
         gates: Some(Arc::new(RealGates::new(
             worktree.path.clone(),
             Arc::clone(&gate),
-            CheckRunner::new(worktree.path.clone()),
+            CheckRunner::new(worktree.path.clone()).spooling_to(gate_artifacts),
             gate_base(&worktree.path, &project.path, &task),
         ))),
         reviewer: Some(Arc::new(
@@ -560,6 +601,9 @@ fn execute(run: Run) -> Result<TaskState, String> {
         // The same collector the registry's `escalate` holds: the tool could not write the
         // journal, and this runner is the only thing holding it (D-117).
         escalations: vec![Arc::clone(&deps.escalations)],
+        // The same registry the process tools hold, so a sweep addresses the handles the model
+        // was given. A second registry over one directory would allocate the same `proc_1` twice.
+        processes: Some(processes),
     };
 
     wire_delegation(&runner, &deps.sub_agent);

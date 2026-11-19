@@ -35,7 +35,7 @@ use crate::domain::{SubtaskId, TaskId, Timestamp};
 /// The rule is asymmetric on purpose: a reader accepts every version **up to** its own and
 /// refuses anything newer. Old journals stay readable, because a version-1 journal is a subset of
 /// what this build understands — every one of its kinds still exists and still means the same
-/// thing. A version-2 journal read by a version-1 build is refused, which is the direction that
+/// thing. A version-3 journal read by a version-2 build is refused, which is the direction that
 /// must fail: the older reader would have to skip a record it cannot name, and a skipped record
 /// might be the one saying a mutating command already ran.
 ///
@@ -43,7 +43,7 @@ use crate::domain::{SubtaskId, TaskId, Timestamp};
 /// recorded by it would have become unreadable, and recovery blocks a task whose journal it
 /// cannot read ([`crate::Error::JournalVersion`]). Refusing only the future is what lets the
 /// schema grow without a migration step that has to be written before it can be used.
-pub const SCHEMA_VERSION: u16 = 2;
+pub const SCHEMA_VERSION: u16 = 3;
 
 /// The closed set of event kinds.
 ///
@@ -98,6 +98,8 @@ pub enum Kind {
     // ── environment ────────────────────────────────────────────────────────────
     BackendUnavailable,
     BackendRestored,
+    // ── processes (D-152) ──────────────────────────────────────────────────────
+    ProcessStopped,
 }
 
 impl Kind {
@@ -156,6 +158,7 @@ impl Kind {
             // ── environment ────────────────────────────────────────────────────
             Self::BackendUnavailable => "backend_unavailable",
             Self::BackendRestored => "backend_restored",
+            Self::ProcessStopped => "process_stopped",
         }
     }
 
@@ -202,6 +205,7 @@ impl Kind {
         Self::JudgeVerdict,
         Self::BackendUnavailable,
         Self::BackendRestored,
+        Self::ProcessStopped,
     ];
 
     /// A number that is distinct for every variant, and that the compiler forces to stay
@@ -256,6 +260,7 @@ impl Kind {
             Self::JudgeVerdict => 34,
             Self::BackendUnavailable => 35,
             Self::BackendRestored => 36,
+            Self::ProcessStopped => 37,
         }
     }
 
@@ -589,6 +594,17 @@ mod tests {
             let wire = serde_json::to_value(kind).unwrap();
             assert_eq!(wire.as_str(), Some(kind.as_str()), "{kind:?}");
         }
+    }
+
+    #[test]
+    fn every_kind_is_covered_by_the_version_that_introduced_it() {
+        // The schema rule is "a new `kind` means a new version". `process_stopped` arrived in
+        // version 3 (D-152), and a build that writes it under version 2 would produce a journal
+        // the previous release reads by *skipping* the record — the one direction the reader
+        // deliberately refuses. The assertion is on the version, not on the count, because the
+        // count is what a hasty bump would satisfy while leaving the number alone.
+        assert_eq!(SCHEMA_VERSION, 3, "`process_stopped` needs version 3");
+        assert!(Kind::ALL.contains(&Kind::ProcessStopped));
     }
 
     #[test]
