@@ -36,6 +36,7 @@ fn with_checks(checks: &[(&str, &str)], review: bool) -> Dod {
                 id: (*id).to_string(),
                 command: (*command).to_string(),
                 required: true,
+                timeout_secs: None,
             })
             .collect(),
         review,
@@ -219,6 +220,7 @@ fn dropping_the_reviewer_is_refused_when_the_parent_needed_one() {
         id: "build".to_string(),
         command: "cargo build".to_string(),
         required: true,
+        timeout_secs: None,
     }];
     let other = sub("01ARZ3NDEKTSV4RRFFQ69G5FAC", 2);
     let error = validate_split(&parent, &[child, other], 2).expect_err("review dropped");

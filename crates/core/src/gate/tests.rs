@@ -518,6 +518,32 @@ fn a_check_that_never_ran_says_why_instead_of_no_exit_code() {
 }
 
 #[test]
+fn a_timed_out_check_records_the_timeout_not_the_stdout_heading() {
+    // The live run's journal had `"why": "--- stdout ---"` next to `"timed out after 120070 ms"`:
+    // `reason()` took the first line of the tail, and for a killed command the tail opens with a
+    // channel label. The heading is not a reason, and a post-mortem that reads only `why` learns
+    // nothing. The timeout's own sentence is in `summary()`.
+    let mut report = green();
+    report.checks = vec![CheckOutcome {
+        id: "final_rspec".to_string(),
+        command: "bundle exec rspec".to_string(),
+        required: true,
+        exit_code: None,
+        timed_out: true,
+        duration_ms: 120_070,
+        passed: false,
+        output_tail: "--- stdout ---\n147 examples, 0 failures".to_string(),
+    }];
+    let records = GateRecord::of(&report);
+    let GateRecord::Check { why, .. } = &records[1] else {
+        panic!("the second record must be the check: {records:?}");
+    };
+    let why = why.as_deref().expect("a timed-out check records the timeout");
+    assert!(why.contains("timed out after 120070 ms"), "{why}");
+    assert!(!why.contains("--- stdout ---"), "{why}");
+}
+
+#[test]
 fn a_refused_check_records_the_reason_in_the_journal() {
     // `exit_code: null, passed: false` and nothing else is what made the first run's journal
     // unreadable after the fact: "a check failed" and "a check never ran" looked identical.

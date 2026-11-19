@@ -69,6 +69,10 @@ observable result. A task whose acceptance is \"it works\" has no gate.
 - A `command` is one program, not a pipeline. Never write `cargo test | tail -20`: a shell takes \
 the exit code of the last command in a pipe, so `tail` succeeds and the check is green on a build \
 that did not compile. The plan is rejected if a check contains an unquoted `|`.
+- A check may carry `\"timeout_secs\": 540` (at most 600) when the command is honestly slow — an \
+integration suite, a full build from cold. Every check otherwise gets the runner's default of 120 \
+seconds, and a check that is cut short fails. Declare the deadline instead of shortening the \
+command: `bundle exec rspec` that takes 6 minutes is a slow check, not a broken one.
 - Prefer few, meaningful subtasks. One subtask per file is not a plan.";
 
 /// The user message: the goal, and whatever the caller knows about the repository.

@@ -461,8 +461,17 @@ impl CheckOutcome {
     ///
     /// The tail is the whole explanation for a refusal (`the policy refused this command: …`), but
     /// a journal record wants one line, and the first is the sentence the tool wrote.
+    ///
+    /// A timeout is the exception, and it was a real one: a killed command's tail starts with the
+    /// literal `--- stdout ---` label, so `gate_result` recorded `"why": "--- stdout ---"` for a
+    /// check that had timed out, while the verdict beside it said "timed out after 120070 ms".
+    /// The first line of a timeout tail is not a reason, it is a heading, and the reason is in
+    /// [`Self::summary`].
     #[must_use]
     pub fn reason(&self) -> String {
+        if self.timed_out {
+            return self.summary();
+        }
         self.output_tail
             .lines()
             .next()

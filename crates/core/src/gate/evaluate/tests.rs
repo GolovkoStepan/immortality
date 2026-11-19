@@ -15,6 +15,8 @@ struct World {
     refused: RefCell<Vec<String>>,
     /// Per-command result; a missing entry is an exit 0.
     outcomes: RefCell<Vec<(String, CommandRun)>>,
+    /// The deadline each `run` was handed, so a test can see what the check declared.
+    deadlines: RefCell<Vec<(String, Option<Duration>)>>,
 }
 
 impl World {
@@ -40,6 +42,10 @@ impl World {
     fn ran(&self) -> Vec<String> {
         self.runs.borrow().clone()
     }
+
+    fn deadlines(&self) -> Vec<(String, Option<Duration>)> {
+        self.deadlines.borrow().clone()
+    }
 }
 
 impl Gates for World {
@@ -54,8 +60,9 @@ impl Gates for World {
         Ok(())
     }
 
-    fn run(&self, command: &str) -> Result<CommandRun, String> {
+    fn run(&self, command: &str, timeout: Option<Duration>) -> Result<CommandRun, String> {
         self.runs.borrow_mut().push(command.to_string());
+        self.deadlines.borrow_mut().push((command.to_string(), timeout));
         let outcomes = self.outcomes.borrow();
         if let Some((_, run)) = outcomes.iter().find(|(name, _)| name == command) {
             return Ok(run.clone());
@@ -116,6 +123,7 @@ fn check(id: &str, required: bool) -> DodCheck {
         id: id.to_string(),
         command: format!("run-{id}"),
         required,
+        timeout_secs: None,
     }
 }
 
@@ -225,6 +233,27 @@ fn a_refused_command_is_a_red_check_and_nothing_runs() {
 }
 
 #[test]
+fn a_check_reaches_the_runner_with_its_own_deadline() {
+    // The `black_jack` defect: one number for every check, so a suite that honestly took 6 m 39 s
+    // was cut at 120 s on every attempt. The deadline is now a property of the check, and this is
+    // the assertion that it survives the trip from `TASKS.json` to `Gates::run`.
+    let world = World::new(Diff::default());
+    let mut slow = check("slow", true);
+    slow.timeout_secs = Some(540);
+    let quick = check("quick", true);
+    let report = evaluate(&dod(vec![quick, slow], false), &world, None, None).expect("evaluate");
+
+    assert!(report.is_green(), "{report:?}");
+    assert_eq!(
+        world.deadlines(),
+        vec![
+            ("run-quick".to_string(), None),
+            ("run-slow".to_string(), Some(Duration::from_secs(540))),
+        ]
+    );
+}
+
+#[test]
 fn a_timeout_is_a_failure_even_with_a_zero_exit_code() {
     // A killed process's status is not evidence: the check never finished, so it never proved
     // anything.
@@ -318,7 +347,7 @@ fn a_diff_that_cannot_be_produced_is_the_only_error() {
         fn authorise(&self, _command: &str) -> Result<(), String> {
             Ok(())
         }
-        fn run(&self, _command: &str) -> Result<CommandRun, String> {
+        fn run(&self, _command: &str, _timeout: Option<Duration>) -> Result<CommandRun, String> {
             Ok(ok())
         }
     }
@@ -337,7 +366,7 @@ fn a_command_that_cannot_start_is_a_red_check() {
         fn authorise(&self, _command: &str) -> Result<(), String> {
             Ok(())
         }
-        fn run(&self, _command: &str) -> Result<CommandRun, String> {
+        fn run(&self, _command: &str, _timeout: Option<Duration>) -> Result<CommandRun, String> {
             Err("no such binary".to_string())
         }
     }

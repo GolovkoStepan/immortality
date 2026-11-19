@@ -14,6 +14,8 @@
 //! evaluation — is testable in microseconds and without a repository. The daemon supplies the real
 //! implementations; the rules stay here.
 
+use std::time::Duration;
+
 use super::{CheckOutcome, Diff, Finding, GateReport, ReviewRequest, ReviewVerdict, sanity};
 use crate::domain::{Dod, DodCheck};
 
@@ -58,7 +60,13 @@ pub trait Gates {
     fn authorise(&self, command: &str) -> Result<(), String>;
 
     /// Run one command. Called only after `authorise` said yes.
-    fn run(&self, command: &str) -> Result<CommandRun, String>;
+    ///
+    /// `timeout` is the check's own deadline when its `DoD` declared one, and the configured
+    /// default otherwise. It is passed per call rather than held by the implementation because it
+    /// is a property of the *check*: one plan can legitimately contain a two-second `grep` and a
+    /// nine-minute `cargo test`, and a runner that decided their deadline once would either cut
+    /// the test short or wait nine minutes for the grep.
+    fn run(&self, command: &str, timeout: Option<Duration>) -> Result<CommandRun, String>;
 }
 
 /// The reviewer, which is one model call with no tools.
@@ -135,7 +143,7 @@ fn run_check(gates: &dyn Gates, check: &DodCheck) -> CheckOutcome {
             format!("the policy refused this command: {why}"),
         );
     }
-    match gates.run(&check.command) {
+    match gates.run(&check.command, check.timeout_secs.map(Duration::from_secs)) {
         Ok(run) => CheckOutcome {
             id: check.id.clone(),
             command: check.command.clone(),

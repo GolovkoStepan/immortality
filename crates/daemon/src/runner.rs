@@ -2798,7 +2798,11 @@ mod tests {
             Ok(())
         }
 
-        fn run(&self, command: &str) -> Result<immortality_core::gate::CommandRun, String> {
+        fn run(
+            &self,
+            command: &str,
+            _timeout: Option<Duration>,
+        ) -> Result<immortality_core::gate::CommandRun, String> {
             if let Ok(mut runs) = self.runs.lock() {
                 runs.push(command.to_string());
             }
@@ -2965,6 +2969,7 @@ mod tests {
                 id: "build".to_string(),
                 command: "cargo build".to_string(),
                 required: true,
+                timeout_secs: None,
             }],
             review: false,
         };
@@ -3010,11 +3015,13 @@ mod tests {
                     id: "outdated".to_string(),
                     command: "cargo outdated".to_string(),
                     required: false,
+                    timeout_secs: None,
                 },
                 immortality_core::domain::DodCheck {
                     id: "build".to_string(),
                     command: "cargo build".to_string(),
                     required: true,
+                    timeout_secs: None,
                 },
             ],
             review: false,
@@ -3044,6 +3051,7 @@ mod tests {
                 id: "test".to_string(),
                 command: "sudo cargo test".to_string(),
                 required: true,
+                timeout_secs: None,
             }],
             review: false,
         };
@@ -3119,6 +3127,7 @@ mod tests {
                 id: "build".to_string(),
                 command: "cargo build".to_string(),
                 required: true,
+                timeout_secs: None,
             }],
             review: true,
         };
@@ -4153,6 +4162,7 @@ mod tests {
                 id: "build".to_string(),
                 command: "cargo build".to_string(),
                 required: true,
+                timeout_secs: None,
             }],
             review: false,
         };
@@ -5320,6 +5330,7 @@ mod tests {
                 id: "build".to_string(),
                 command: "cargo build".to_string(),
                 required: true,
+                timeout_secs: None,
             }],
             review: false,
         };

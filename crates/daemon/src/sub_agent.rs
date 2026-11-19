@@ -81,7 +81,7 @@ impl Gates for BriefGates {
         Ok(())
     }
 
-    fn run(&self, command: &str) -> Result<CommandRun, String> {
+    fn run(&self, command: &str, _timeout: Option<std::time::Duration>) -> Result<CommandRun, String> {
         // Unreachable while the brief's `DoD` is empty. Refusing rather than passing is the
         // difference between a loud wiring change and a brief that silently "passes" a check it
         // never ran.

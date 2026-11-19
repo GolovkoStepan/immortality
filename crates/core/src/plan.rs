@@ -934,11 +934,13 @@ mod tests {
                     id: "test".to_string(),
                     command: "cargo test".to_string(),
                     required: true,
+                    timeout_secs: None,
                 },
                 DodCheck {
                     id: "test".to_string(),
                     command: "cargo build".to_string(),
                     required: true,
+                    timeout_secs: None,
                 },
             ],
             review: false,

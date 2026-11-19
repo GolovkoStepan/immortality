@@ -129,8 +129,12 @@ impl Gates for RealGates {
             .unwrap_or_else(|| "the command needs a human".to_string()))
     }
 
-    fn run(&self, command: &str) -> Result<CommandRun, String> {
-        let output = immortality_tools::run_command(command, &self.checks.worktree, self.checks.timeout)
+    fn run(&self, command: &str, timeout: Option<Duration>) -> Result<CommandRun, String> {
+        // The check's own deadline wins: a plan that declares nine minutes for `cargo test` means
+        // it, and a runner that clamped it to the default would fail a check the author knowingly
+        // made slow. `run_command` applies the outer cap, so a plan cannot ask for an hour either.
+        let timeout = timeout.unwrap_or(self.checks.timeout);
+        let output = immortality_tools::run_command(command, &self.checks.worktree, timeout)
             .map_err(|error| error.to_string())?;
         Ok(CommandRun {
             exit_code: output.exit_code,
@@ -476,9 +480,36 @@ mod tests {
     #[test]
     fn a_command_runs_in_the_worktree() {
         let (dir, _) = repo();
-        let run = gates(dir.path()).run("test -f a.txt && echo ok").expect("run");
+        let run = gates(dir.path())
+            .run("test -f a.txt && echo ok", None)
+            .expect("run");
         assert_eq!(run.exit_code, Some(0));
         assert!(run.output_tail.contains("ok"), "{run:?}");
+    }
+
+    #[test]
+    fn a_check_deadline_overrides_the_runner_default_for_that_command_only() {
+        // The `black_jack` defect end to end: the runner's default is the 120 s tool default, and a
+        // check that declares its own longer deadline has to get it while its neighbours keep the
+        // default. Here the direction is inverted on purpose — a one-second deadline against a
+        // command that sleeps — because a short deadline is observable in a test and a nine-minute
+        // one is not.
+        let (dir, _) = repo();
+        let runner = gates(dir.path());
+        let configured = runner.checks.timeout;
+        assert_eq!(configured, Duration::from_secs(10), "the fixture's default");
+
+        // No declared deadline: the configured default applies and a quick command passes.
+        let plain = runner.run("true", None).expect("run");
+        assert!(!plain.timed_out, "{plain:?}");
+        assert_eq!(plain.exit_code, Some(0));
+
+        // A declared deadline wins over the default, even when it is far shorter.
+        let run = runner.run("sleep 5", Some(Duration::from_secs(1))).expect("run");
+        assert!(run.timed_out, "{run:?}");
+        assert_eq!(run.exit_code, None);
+        // And the override did not mutate the runner: the next check gets the default back.
+        assert_eq!(runner.checks.timeout, configured);
     }
 
     #[test]

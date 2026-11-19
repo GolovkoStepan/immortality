@@ -225,11 +225,13 @@ fn parser_subtask() -> Subtask {
                     id: "build".to_string(),
                     command: "cargo build".to_string(),
                     required: true,
+                    timeout_secs: None,
                 },
                 DodCheck {
                     id: "test".to_string(),
                     command: "cargo test".to_string(),
                     required: true,
+                    timeout_secs: None,
                 },
             ],
             review: true,
@@ -310,7 +312,11 @@ impl Gates for FakeGates {
         Ok(())
     }
 
-    fn run(&self, _command: &str) -> std::result::Result<immortality_core::gate::CommandRun, String> {
+    fn run(
+        &self,
+        _command: &str,
+        _timeout: Option<std::time::Duration>,
+    ) -> std::result::Result<immortality_core::gate::CommandRun, String> {
         Ok(immortality_core::gate::CommandRun {
             exit_code: Some(0),
             timed_out: false,

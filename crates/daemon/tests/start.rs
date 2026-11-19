@@ -250,6 +250,7 @@ fn notes_subtask(at: Timestamp) -> Subtask {
                 id: "ok".to_string(),
                 command: "true".to_string(),
                 required: true,
+                timeout_secs: None,
             }],
             review: false,
         },
