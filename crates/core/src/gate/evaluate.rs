@@ -28,6 +28,16 @@ pub struct CommandRun {
     pub duration_ms: u64,
     /// The tail of stdout and stderr, already combined and bounded.
     pub output_tail: String,
+    /// Total stdout lines, before the tail was cut.
+    pub stdout_lines: usize,
+    /// Total stderr lines, before the tail was cut.
+    pub stderr_lines: usize,
+    /// Where the whole output lives, when the caller could keep it.
+    ///
+    /// A gate command's tail is bounded and its stdout dies with the process, so without this a
+    /// red check leaves nothing a human can open. `None` when no artifact store was wired, which
+    /// is the honest answer for a test or a read-only session.
+    pub artifact: Option<String>,
 }
 
 impl CommandRun {
@@ -153,6 +163,9 @@ fn run_check(gates: &dyn Gates, check: &DodCheck) -> CheckOutcome {
             duration_ms: run.duration_ms,
             passed: run.passed(),
             output_tail: run.output_tail,
+            stdout_lines: run.stdout_lines,
+            stderr_lines: run.stderr_lines,
+            artifact: run.artifact,
         },
         Err(why) => CheckOutcome::not_run(
             check.id.clone(),

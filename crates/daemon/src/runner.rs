@@ -3017,7 +3017,14 @@ mod tests {
                 exit_code: Some(i32::from(failed)),
                 timed_out: false,
                 duration_ms: 1,
-                output_tail: if failed { "boom".to_string() } else { String::new() },
+                output_tail: if failed {
+                    "boom: 192 examples, 1 failure".to_string()
+                } else {
+                    String::new()
+                },
+                stdout_lines: usize::from(failed),
+                stderr_lines: 0,
+                artifact: None,
             })
         }
     }
@@ -5609,6 +5616,64 @@ mod tests {
         assert_eq!(outcome.attempt.state, AttemptState::Failed);
         assert_eq!(outcome.attempt.failure, Some(FailureReason::GateFailed));
         assert_eq!(outcome.ended(), Ended::Failed(Cause::Limit(Limit::Steps)));
+    }
+
+    #[test]
+    fn a_red_check_after_the_step_budget_tells_the_next_attempt_what_failed() {
+        // The end of the chain the whole `black_jack` investigation is about. That run's attempt 4
+        // was told, verbatim, `rspec_after_add` timed out after 120239 ms — and nothing else. The
+        // gate had measured what the command printed and dropped it, the verdict carried only a
+        // one-line summary, and the strategy that reaches the next brief then cut that summary to
+        // 400 characters from the start. So the failing example's name, which is what the model
+        // had to fix, never arrived.
+        //
+        // This asserts the chain end to end: the fake check's output is derivable from the real
+        // journal's, and the string the *next attempt's strategy* carries must contain the failure.
+        let mut subtask = subtask();
+        subtask.dod = Dod {
+            statement: "the build is green".to_string(),
+            checks: vec![immortality_core::domain::DodCheck {
+                id: "build".to_string(),
+                command: "cargo build".to_string(),
+                required: true,
+                timeout_secs: None,
+            }],
+            review: false,
+        };
+        let mut diff = immortality_core::gate::Diff::default();
+        diff.files.push(immortality_core::gate::ChangedFile {
+            path: PathBuf::from("src/parser.rs"),
+            status: immortality_core::gate::FileStatus::Modified,
+            binary: false,
+            added_lines: vec!["still broken".to_string()],
+        });
+        let model = Scripted::new(looping_replies(5));
+        let (dir, mut runner) = runner(model, registry(vec![Arc::new(Touch)]));
+        runner.limits.max_steps = 2;
+        let gates = FakeGates::with_diff(diff);
+        gates
+            .failing
+            .lock()
+            .expect("lock")
+            .push("cargo build".to_string());
+        runner.gates = Some(Arc::new(gates));
+        let mut journal = journal(&dir);
+        let outcome = runner.run(&subtask, 1, "", &mut journal).expect("run");
+
+        // What the attempt report remembers, which is what a restart quotes.
+        let remembered = outcome.report.rejected_ideas.join("\n");
+        assert!(
+            remembered.contains("192 examples, 1 failure"),
+            "the gate's output must reach the report, not only its exit code: {remembered}"
+        );
+
+        // And the strategy written for the next attempt keeps it.
+        let cause = Cause::Limit(Limit::Steps);
+        let next = immortality_core::restart::strategy(&cause, "", &outcome.report.rejected_ideas);
+        assert!(
+            next.contains("192 examples, 1 failure"),
+            "the next attempt's brief must say what actually failed: {next}"
+        );
     }
 
     #[test]

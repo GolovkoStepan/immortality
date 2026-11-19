@@ -42,7 +42,7 @@ pub use processes::{
 };
 pub use read::{ReadFile, looks_binary};
 pub use search::Grep;
-pub use shell::{CommandOutput, run_command};
+pub use shell::{CommandOutput, run_command, run_command_spooled};
 pub use shell::{Shell, ShellState};
 pub use state::{GrepJournal, ReadState, StateFile, UpdateState};
 pub use tool::{OutputBudget, Registry, RegistryError, Tool, ToolCtx, ToolError, ToolResult};

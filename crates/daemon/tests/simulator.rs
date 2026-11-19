@@ -333,6 +333,9 @@ impl Gates for FakeGates {
             timed_out: false,
             duration_ms: 1_500,
             output_tail: "ok".to_string(),
+            stdout_lines: 1,
+            stderr_lines: 0,
+            artifact: None,
         })
     }
 }
@@ -689,6 +692,9 @@ impl Gates for Recording {
                     timed_out: false,
                     duration_ms: 1,
                     output_tail: "recorded".to_string(),
+                    stdout_lines: 1,
+                    stderr_lines: 0,
+                    artifact: None,
                 })
             },
         )

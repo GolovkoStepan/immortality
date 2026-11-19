@@ -106,6 +106,9 @@ fn ok() -> CommandRun {
         timed_out: false,
         duration_ms: 5,
         output_tail: String::new(),
+        stdout_lines: 0,
+        stderr_lines: 0,
+        artifact: None,
     }
 }
 
@@ -115,6 +118,9 @@ fn failing() -> CommandRun {
         timed_out: false,
         duration_ms: 5,
         output_tail: "test failed".to_string(),
+        stdout_lines: 1,
+        stderr_lines: 0,
+        artifact: None,
     }
 }
 
@@ -264,6 +270,9 @@ fn a_timeout_is_a_failure_even_with_a_zero_exit_code() {
             timed_out: true,
             duration_ms: 600_000,
             output_tail: "still running".to_string(),
+            stdout_lines: 1,
+            stderr_lines: 0,
+            artifact: None,
         },
     );
     let report = evaluate(&dod(vec![check("test", true)], false), &world, None, None).expect("evaluate");

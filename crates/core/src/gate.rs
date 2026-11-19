@@ -23,6 +23,7 @@
 //! failed its own definition of done is not a subtask that succeeded.
 
 use std::fmt;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -430,6 +431,25 @@ pub struct CheckOutcome {
     /// The tail of the output, for the journal and for the next attempt's brief.
     #[serde(default)]
     pub output_tail: String,
+    /// How many lines the command wrote to stdout, before the tail was cut.
+    ///
+    /// The tail of a *timeout* is worthless on its own: a command that loops prints the same
+    /// block until the deadline, so the last two hundred lines are the loop and not the reason.
+    /// The count is the signal that survives a timeout — 9169 lines of a spinning game loop is a
+    /// different fact from four lines of a compiler error — and it was the one number the live
+    /// `black_jack` run needed and did not have.
+    #[serde(default)]
+    pub stdout_lines: usize,
+    /// How many lines the command wrote to stderr.
+    #[serde(default)]
+    pub stderr_lines: usize,
+    /// Where the whole output was kept, when the gates could spool it.
+    ///
+    /// `None` for a check that never ran, and for a daemon wired without an artifact store. A red
+    /// check with a digest is one a human can actually read; the live `black_jack` gates left
+    /// nothing behind, while the same command run by the model had a full artifact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact: Option<String>,
 }
 
 impl CheckOutcome {
@@ -454,6 +474,9 @@ impl CheckOutcome {
             duration_ms: 0,
             passed: false,
             output_tail: why.into(),
+            stdout_lines: 0,
+            stderr_lines: 0,
+            artifact: None,
         }
     }
 
@@ -490,14 +513,92 @@ impl CheckOutcome {
     #[must_use]
     pub fn summary(&self) -> String {
         if self.timed_out {
-            return format!("`{}` timed out after {} ms", self.id, self.duration_ms);
+            // The count, not the tail: a command killed at its deadline has usually been printing
+            // the same block for the whole window, so the last lines say nothing about why. The
+            // line count is what separates "it looped" from "it was slow".
+            return format!(
+                "`{}` timed out after {} ms ({} line(s) of stdout, {} of stderr)",
+                self.id, self.duration_ms, self.stdout_lines, self.stderr_lines
+            );
         }
         self.exit_code.map_or_else(
             || format!("`{}` did not run: {}", self.id, self.reason()),
             |code| format!("`{}` (exit {code})", self.id),
         )
     }
+
+    /// The output a reader needs to act on a failed check, or nothing when there is none.
+    ///
+    /// # Why this is not the raw tail
+    ///
+    /// [`Self::output_tail`] is up to two hundred lines, which is right for the model reading a
+    /// command it just ran and far too much for a journal record and a brief that is re-sent on
+    /// every step. This cut keeps the end, where the failure is, and says how much it left out so
+    /// nobody mistakes the excerpt for the whole story.
+    ///
+    /// # Why it is trimmed of blank padding
+    ///
+    /// A killed command's tail opens with the `--- stdout ---` / `--- stderr ---` labels and can
+    /// consist mostly of them when the output was empty. Those lines are headings, not evidence.
+    #[must_use]
+    pub fn output_for_reading(&self) -> Option<String> {
+        let lines: Vec<&str> = self
+            .output_tail
+            .lines()
+            .map(str::trim_end)
+            .filter(|line| !line.trim().is_empty())
+            .collect();
+        if lines.is_empty() {
+            return None;
+        }
+        // A killed command has usually been printing the same block for the whole deadline, so
+        // forty lines of it are forty copies of one line. The last few still show where it stopped,
+        // and the line counts in the summary carry the rest.
+        let budget = if self.timed_out {
+            TAIL_LINES_ON_TIMEOUT
+        } else {
+            TAIL_LINES_FOR_READING
+        };
+        let kept = budget.min(lines.len());
+        let omitted = lines.len() - kept;
+        let mut out = String::new();
+        if omitted > 0 {
+            let _ = writeln!(out, "… {omitted} earlier line(s) not shown");
+        }
+        for line in &lines[lines.len() - kept..] {
+            let _ = writeln!(out, "{line}");
+        }
+        Some(out.trim_end().to_string())
+    }
+
+    /// What a failed check tells the journal and the next attempt.
+    ///
+    /// One field, one answer: [`Self::summary`] names the check and its exit code, then the output
+    /// excerpt follows. Before this existed the reader got the first half only, and "the gate
+    /// named nothing" was the most expensive sentence in the live run.
+    ///
+    /// A check that never ran carries its reason in `output_tail` already, so the excerpt is the
+    /// reason — there is nothing else to say, and the two halves do not compete.
+    #[must_use]
+    pub fn failure_text(&self) -> String {
+        self.output_for_reading()
+            .map_or_else(|| self.summary(), |tail| format!("{}\n{tail}", self.summary()))
+    }
 }
+
+/// How many lines of a failed check's output reach the journal and the next attempt's brief.
+///
+/// Forty rather than the two hundred a `shell` observation may carry: the brief is re-sent on
+/// every step of the next attempt, and the failure itself is at the end. Enough for an `rspec`
+/// failure block with its backtrace, which is what a one-line `(exit 1)` was hiding.
+pub const TAIL_LINES_FOR_READING: usize = 40;
+
+/// How many lines of a *timed out* check's output reach the journal and the brief.
+///
+/// Fewer, because a killed command's tail is repetition: the live `black_jack` run printed 9169
+/// lines of a spinning game loop before the deadline, and forty lines of that is forty copies of
+/// the same screen. The line counts in the summary say it looped; this says where it stopped.
+pub const TAIL_LINES_ON_TIMEOUT: usize = 8;
 
 /// One `gate_result` journal record.
 ///
@@ -532,6 +633,13 @@ pub enum GateRecord {
         /// and the brief inherited the silence.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         why: Option<String>,
+        /// Where a failed check's whole output was kept, when the gates could spool it.
+        ///
+        /// The excerpt in `why` is bounded, and a bounded excerpt is a lie of omission unless the
+        /// reader can get the rest. A digest is that rest: the same content-addressed form a
+        /// `shell` observation carries.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        artifact: Option<String>,
     },
     /// The reviewer's verdict.
     Review { approved: bool, issues: Vec<String> },
@@ -566,10 +674,17 @@ impl GateRecord {
             duration_ms: outcome.duration_ms,
             passed: outcome.passed,
             required: outcome.required,
-            // Only when no code came back: a check that ran has its tail in the report the
-            // reviewer saw, and copying that into the journal would make every record as long as
-            // the test output it came from.
-            why: outcome.exit_code.is_none().then(|| outcome.reason()),
+            // Every failed check, not only one that never reported a code.
+            //
+            // The older rule wrote this only when `exit_code` was `None`, justified by "a check
+            // that ran has its tail in the report the reviewer saw". That sentence was false:
+            // [`crate::gate::ReviewRequest`] carries the statement and the diff and nothing else,
+            // and a failed check does not even reach the reviewer. So a red `rspec` recorded
+            // `"exit 1"` and its failure text was dropped here, in the one place that would have
+            // kept it. The live `black_jack` run paid for that: the next attempt was told
+            // "`rspec_after_add` (exit 1)" and had no way to learn which of 192 examples failed.
+            why: (!outcome.passed).then(|| outcome.failure_text()),
+            artifact: outcome.artifact.clone().filter(|_| !outcome.passed),
         }));
         if let Some(review) = &report.review {
             records.push(Self::Review {
@@ -633,7 +748,9 @@ impl GateReport {
         if let Some(check) = self.checks.iter().find(|check| check.required && !check.passed) {
             return GateVerdict::Failed {
                 reason: FailureReason::GateFailed,
-                why: check.summary(),
+                // The failure text, not the summary: this string is the only thing the next
+                // attempt learns about a red check, and `(exit 1)` alone names no failure.
+                why: check.failure_text(),
             };
         }
         match &self.review {

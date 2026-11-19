@@ -554,6 +554,9 @@ fn execute(run: Run) -> Result<TaskState, String> {
         toolset::build_with_processes(&deps).map_err(|error| format!("cannot build the tools: {error}"))?;
 
     let gate = Arc::clone(&deps.gate);
+    // The same store the `shell` tool writes to, cloned: a red gate's whole output becomes an
+    // artifact a human can open, rather than a bound tail that dies with the process.
+    let gate_artifacts = std::sync::Arc::new(deps.artifacts.clone());
     let runner = Runner {
         model: Arc::clone(&model),
         model_name: config.models.executor.clone(),
@@ -575,7 +578,7 @@ fn execute(run: Run) -> Result<TaskState, String> {
         gates: Some(Arc::new(RealGates::new(
             worktree.path.clone(),
             Arc::clone(&gate),
-            CheckRunner::new(worktree.path.clone()),
+            CheckRunner::new(worktree.path.clone()).spooling_to(gate_artifacts),
             gate_base(&worktree.path, &project.path, &task),
         ))),
         reviewer: Some(Arc::new(

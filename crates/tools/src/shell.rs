@@ -457,20 +457,7 @@ impl Shell {
         let mut header = String::new();
         let _ = writeln!(header, "$ {command}");
         let _ = writeln!(header, "--- stdout ---");
-        let stdout = stream_of(&finished.stdout)?;
-        let stderr = stream_of(&finished.stderr)?;
-
-        // `Read::chain` nests, so four pieces are three calls and no trait objects.
-        let reader = std::io::Cursor::new(header.into_bytes())
-            .chain(stdout)
-            .chain(std::io::Cursor::new(b"\n--- stderr ---\n".to_vec()))
-            .chain(stderr);
-        store
-            .put_from(reader)
-            .ok()
-            // `digest_text`, not bare hex: the observation carries `sha256:<64 hex>`, which is the
-            // form `parse_digest` accepts and the form the journal writes.
-            .map(|digest| immortality_core::journal::digest_text(&digest))
+        spool_output(store, header, finished)
     }
 }
 
@@ -549,6 +536,78 @@ pub fn run_command(command: &str, directory: &Path, timeout: Duration) -> Result
         stdout_lines: finished.stdout.total_lines,
         stderr_lines: finished.stderr.total_lines,
     })
+}
+
+/// [`run_command`], with the whole output also kept as a content-addressed artifact.
+///
+/// # Why the gate needs this and the model does not
+///
+/// A model's `shell` call is one step in a conversation: the tail in the observation is what it
+/// reads, and the artifact is a convenience for the human checking up on it. A gate command is the
+/// opposite. Nothing in the system records what it printed beyond a bounded tail, and when a gate
+/// goes red the *whole* output is the only evidence of why it did — the live `black_jack` run left
+/// two gate `rspec` runs that no one could inspect afterwards, while the same command run by the
+/// model had a full artifact.
+///
+/// The artifact is written before this returns, so a daemon that dies during a long check still
+/// leaves whatever it printed. Returns the digest for the caller to record.
+///
+/// # Errors
+/// The command could not be spawned, or its capture files could not be created. A failed artifact
+/// write is *not* an error: the check's verdict does not depend on it, and failing the check
+/// because a disk filled up would report the wrong thing.
+pub fn run_command_spooled(
+    command: &str,
+    directory: &Path,
+    timeout: Duration,
+    artifacts: &ArtifactStore,
+) -> Result<(CommandOutput, Option<String>), ToolError> {
+    let timeout = timeout.clamp(Duration::from_secs(1), Duration::from_secs(MAX_TIMEOUT_SECS));
+    let finished = run(command, directory, &[], timeout)?;
+    let mut tail = String::new();
+    for (label, captured) in [("stdout", &finished.stdout), ("stderr", &finished.stderr)] {
+        if captured.bytes == 0 {
+            continue;
+        }
+        if !tail.is_empty() {
+            tail.push('\n');
+        }
+        let _ = writeln!(tail, "--- {label} ---");
+        tail.push_str(&captured.tail);
+        if captured.omitted > 0 {
+            let _ = writeln!(tail, "… {} earlier line(s) not shown", captured.omitted);
+        }
+    }
+    // Written even when the streams were empty: "the check printed nothing" is a fact a post-mortem
+    // asks about, and an absent artifact cannot answer it.
+    let mut header = String::new();
+    let _ = writeln!(header, "$ {command}");
+    let digest = spool_output(artifacts, header, &finished);
+    Ok((
+        CommandOutput {
+            exit_code: finished.status.and_then(|status| status.code()),
+            timed_out: finished.timed_out,
+            duration: finished.duration,
+            tail,
+            stdout_lines: finished.stdout.total_lines,
+            stderr_lines: finished.stderr.total_lines,
+        },
+        digest,
+    ))
+}
+
+/// Stream one run's capture files into the store, labelled behind `header`.
+fn spool_output(artifacts: &ArtifactStore, header: String, finished: &Finished) -> Option<String> {
+    let stdout = stream_of(&finished.stdout)?;
+    let stderr = stream_of(&finished.stderr)?;
+    let reader = std::io::Cursor::new(header.into_bytes())
+        .chain(stdout)
+        .chain(std::io::Cursor::new(b"\n--- stderr ---\n".to_vec()))
+        .chain(stderr);
+    artifacts
+        .put_from(reader)
+        .ok()
+        .map(|digest| immortality_core::journal::digest_text(&digest))
 }
 
 /// Wrap a command so its `cwd` and exit code survive the `sh` that ran it.
@@ -1498,6 +1557,47 @@ mod tests {
         assert!(!out.succeeded());
         assert!(out.tail.contains("error[E0308]"), "{}", out.tail);
         assert_eq!(out.stderr_lines, 1);
+    }
+
+    #[test]
+    fn run_command_spooled_keeps_the_whole_output_as_an_artifact() {
+        // The gate's equivalent of what `shell` already did: a red check must leave something a
+        // human can open, not just a bounded tail that dies with the process. The live
+        // `black_jack` run left two red gate `rspec` runs with no artifact at all.
+        let dir = tempfile::tempdir().unwrap();
+        let store = ArtifactStore::open(dir.path().join("artifacts")).unwrap();
+        let (out, digest) = run_command_spooled(
+            "printf 'a\\nb\\nc\\n'; printf 'oops\\n' >&2; exit 1",
+            dir.path(),
+            Duration::from_secs(10),
+            &store,
+        )
+        .unwrap();
+        assert_eq!(out.exit_code, Some(1));
+        assert_eq!(out.stdout_lines, 3);
+        assert_eq!(out.stderr_lines, 1);
+        let digest = digest.expect("a command with output leaves an artifact");
+        let digest = immortality_core::journal::parse_digest(&digest).unwrap();
+        let kept = String::from_utf8(store.read(&digest).unwrap()).unwrap();
+        assert!(kept.starts_with('$'), "the command is named: {kept}");
+        assert!(kept.contains("a\nb\nc"), "{kept}");
+        assert!(kept.contains("oops"), "{kept}");
+    }
+
+    #[test]
+    fn run_command_spooled_keeps_an_artifact_for_a_silent_command() {
+        // "The check printed nothing" is a fact a post-mortem asks about, and an absent artifact
+        // cannot answer it. The model-facing `spool` returns `None` here by design — its
+        // observation already says the output was empty — but a gate has no observation.
+        let dir = tempfile::tempdir().unwrap();
+        let store = ArtifactStore::open(dir.path().join("artifacts")).unwrap();
+        let (out, digest) = run_command_spooled("true", dir.path(), Duration::from_secs(10), &store).unwrap();
+        assert!(out.succeeded());
+        assert_eq!(out.stdout_lines, 0);
+        let digest = digest.expect("even a silent check leaves the record that it was silent");
+        let digest = immortality_core::journal::parse_digest(&digest).unwrap();
+        let kept = String::from_utf8(store.read(&digest).unwrap()).unwrap();
+        assert!(kept.contains("$ true"), "{kept}");
     }
 
     #[test]

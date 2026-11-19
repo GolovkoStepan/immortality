@@ -44,6 +44,13 @@ pub struct CheckRunner {
     pub worktree: PathBuf,
     /// Per-command deadline.
     pub timeout: Duration,
+    /// Where a check's whole output is kept, when one is wired.
+    ///
+    /// A gate check is the one command in the system whose output nothing else records: the tail
+    /// is bounded, the process exits, and a post-mortem has no way to ask what it printed. The
+    /// live `black_jack` run left two red `rspec` gates that nobody could inspect afterwards,
+    /// while the same command run through `shell` had a full artifact.
+    pub artifacts: Option<std::sync::Arc<immortality_core::artifacts::ArtifactStore>>,
 }
 
 impl CheckRunner {
@@ -53,7 +60,18 @@ impl CheckRunner {
         Self {
             worktree: worktree.into(),
             timeout: Duration::from_secs(immortality_tools::shell::DEFAULT_TIMEOUT_SECS),
+            artifacts: None,
         }
+    }
+
+    /// Keep every check's whole output in `artifacts`.
+    #[must_use]
+    pub fn spooling_to(
+        mut self,
+        artifacts: std::sync::Arc<immortality_core::artifacts::ArtifactStore>,
+    ) -> Self {
+        self.artifacts = Some(artifacts);
+        self
     }
 }
 
@@ -134,13 +152,27 @@ impl Gates for RealGates {
         // it, and a runner that clamped it to the default would fail a check the author knowingly
         // made slow. `run_command` applies the outer cap, so a plan cannot ask for an hour either.
         let timeout = timeout.unwrap_or(self.checks.timeout);
-        let output = immortality_tools::run_command(command, &self.checks.worktree, timeout)
-            .map_err(|error| error.to_string())?;
+        let (output, artifact) = match &self.checks.artifacts {
+            Some(store) => {
+                let (output, digest) =
+                    immortality_tools::run_command_spooled(command, &self.checks.worktree, timeout, store)
+                        .map_err(|error| error.to_string())?;
+                (output, digest)
+            }
+            None => (
+                immortality_tools::run_command(command, &self.checks.worktree, timeout)
+                    .map_err(|error| error.to_string())?,
+                None,
+            ),
+        };
         Ok(CommandRun {
             exit_code: output.exit_code,
             timed_out: output.timed_out,
             duration_ms: u64::try_from(output.duration.as_millis()).unwrap_or(u64::MAX),
             output_tail: output.tail,
+            stdout_lines: output.stdout_lines,
+            stderr_lines: output.stderr_lines,
+            artifact,
         })
     }
 }
@@ -360,6 +392,9 @@ mod tests {
             CheckRunner {
                 worktree: worktree.to_path_buf(),
                 timeout: Duration::from_secs(10),
+                // No artifact store in a test: `None` is the honest answer, and the check still
+                // runs and reports its exit code.
+                artifacts: None,
             },
             None,
         )
