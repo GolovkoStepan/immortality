@@ -42,6 +42,7 @@
 //! the attempt `Succeeded`; a red one closes it `Failed` with the gate's reason, and the report
 //! carries what the gate said so the next attempt can act on it instead of re-guessing.
 
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -1115,6 +1116,43 @@ impl<'a> AttemptSession<'a> {
                 // Nothing is started, so nothing is written: the stop is the caller's to act on,
                 // and the scheduler owns what a subtask becomes.
                 Decision::Stop(stop) => {
+                    // One stop does leave work behind, and it is the one the scheduler answers by
+                    // starting *another* subtask: an exhausted subtask becomes `blocked`, the task
+                    // runs its next independent subtask, and that subtask's base checkpoint would
+                    // be this one's dirty tree. Measured on `black_jack`: a blocked subtask's
+                    // hanging spec stayed on disk, every later subtask started from it, and no
+                    // rollback could ever remove it because each base contained it already.
+                    //
+                    // So the spent subtask's work is set aside — snapshotted, named in the
+                    // journal, then removed from the tree — before the caller moves on.
+                    if matches!(stop, Stop::Exhausted(_)) {
+                        match self.discard(outcome.attempt.number, journal)? {
+                            Discard::Done { discarded } => {
+                                if let Some(sha) = discarded {
+                                    // The blocked subtask's report is what a human reopens it
+                                    // from, so it has to say where the work went: "your work was
+                                    // discarded" without a name is the loss the branch exists to
+                                    // prevent.
+                                    let _ = write!(
+                                        self.report.outcome,
+                                        "\nThe work of attempt {} was set aside in checkpoint {sha} \
+                                         and the tree was returned to the subtask's base, so the next \
+                                         subtask does not start on it.",
+                                        outcome.attempt.number
+                                    );
+                                }
+                            }
+                            // A tree that could not be put back is not a tree to build on, and the
+                            // stop says git's words rather than pretending the rollback happened.
+                            Discard::Blocked(reason) => {
+                                return Ok(SessionEnd {
+                                    outcome,
+                                    stop: Stop::Blocked(reason),
+                                    report: self.report.clone(),
+                                });
+                            }
+                        }
+                    }
                     return Ok(SessionEnd {
                         outcome,
                         stop,
@@ -1385,6 +1423,106 @@ impl<'a> AttemptSession<'a> {
         )?;
         Ok(RollBack::Done)
     }
+
+    /// Set a blocked subtask's work aside and return the tree to its base.
+    ///
+    /// # The defect this exists for
+    ///
+    /// `blocked` is a *settled* state: [`immortality_core::scheduler::next`] moves the task on to
+    /// its next independent subtask, and [`AttemptSession::drive`] of that subtask takes its own
+    /// base from whatever is on disk. Nothing in between puts the tree back — a `Retry` and a
+    /// restore both leave the work where it is, and an `Exhausted` stop never rolls back at all.
+    /// So a blocked subtask's half-finished, wrong, or actively harmful work became the next
+    /// subtask's starting point.
+    ///
+    /// Measured on the third live `black_jack` run: a spec file that hangs forever was committed
+    /// into the base checkpoint at 05:57, every later subtask's base contained it, and no rollback
+    /// could remove it because rolling back to a base that holds it is not removal. The run was
+    /// unrecoverable from that point and no gate could have said so, because the poison was in the
+    /// starting tree rather than in any diff.
+    ///
+    /// # Why the work is snapshotted first
+    ///
+    /// The same rule as an L3 restart, and for the same reason: the work is about to disappear
+    /// from the tree, and the subtask's report is what a human reopens it from. A human told
+    /// "your blocked subtask's work was set aside" has to be able to find it.
+    ///
+    /// # Why no `rollback` marker
+    ///
+    /// `role: "rollback"` promises a following `attempt_restarted`, and recovery treats one
+    /// without it as an interrupted restart to finish. This discard happens *after* the attempt is
+    /// closed, so there is no restart to confirm; it writes `role: "settled"` instead, which names
+    /// where the tree now is without claiming a rollback is in flight.
+    fn discard(&self, closed: u32, journal: &mut Journal) -> immortality_core::Result<Discard> {
+        // A caller with no checkpoint world is a test, not a run: there is no base and no git.
+        if self.runner.checkpoints.is_none() {
+            return Ok(Discard::Done { discarded: None });
+        }
+        let Some(base) = self.base.clone() else {
+            // No base means the tree cannot be put back (a repository with no commits, or a
+            // first-attempt snapshot that failed). The work stays, and the report says so rather
+            // than letting the next subtask inherit it in silence.
+            return Ok(Discard::Done { discarded: None });
+        };
+        let checkpoints = self
+            .runner
+            .checkpoints
+            .as_deref()
+            .ok_or_else(|| immortality_core::Error::Protocol("no checkpoint world".to_string()))?;
+        let reason = format!(
+            "the work of `{}`, blocked after attempt {closed}, set aside so the next subtask \
+             starts from its own base",
+            self.subtask.title
+        );
+        let taken = match checkpoint_snapshot(checkpoints, &reason) {
+            Ok(taken) => taken,
+            // A snapshot that could not be taken is not a reason to leave the tree alone: the
+            // work stays and is named as unset-aside, which is worse than a lost SHA but still
+            // better than claiming the discard happened.
+            Err(why) => return Ok(Discard::Blocked(why)),
+        };
+        let discarded = match taken {
+            Some(safety) => {
+                record_checkpoint(
+                    self.runner.clock.now(),
+                    journal,
+                    &self.subtask.id,
+                    closed,
+                    &safety,
+                    "discarded",
+                )?;
+                Some(safety.sha)
+            }
+            None => None,
+        };
+        if let Err(why) = checkpoints.restore(&base.sha) {
+            return Ok(Discard::Blocked(why));
+        }
+        journal.append_scoped(
+            self.runner.clock.now(),
+            Kind::CheckpointCreated,
+            serde_json::json!({
+                "sha": base.sha,
+                "branch": base.branch,
+                "role": "settled",
+                "attempt": closed,
+                "why": reason,
+            }),
+            &Scope::attempt(self.subtask.id.clone(), closed),
+        )?;
+        Ok(Discard::Done { discarded })
+    }
+}
+
+/// What setting a blocked subtask's work aside produced.
+enum Discard {
+    /// The tree is back at the base; the SHA of the set-aside work, when there was any.
+    Done {
+        /// The checkpoint the discarded work was written to, or `None` for a clean tree.
+        discarded: Option<String>,
+    },
+    /// The tree could not be put back, and the string is why.
+    Blocked(String),
 }
 
 /// What a session stopped on.
@@ -5800,10 +5938,22 @@ mod tests {
             .expect("session");
 
         assert_eq!(end.outcome.attempt.number, 2, "{:?}", end.outcome.attempt);
+        // A rejected claim is a `Retry`, not a `Restart`: no rollback record, and the second
+        // attempt started on the first one's work. That is the property this test is about — the
+        // tree between two attempts is kept.
+        let restarts = journal_records(&dir)
+            .into_iter()
+            .filter(|record| record.fields.kind == Kind::AttemptRestarted)
+            .count();
+        assert_eq!(restarts, 0, "a rejected claim must not roll back");
+        // The one restore that does happen is the *discard* of the exhausted subtask's work, after
+        // the last attempt closed: a blocked subtask's unverified tree may not become the next
+        // subtask's base, and a reviewer's rejection is the clearest case of "unverified".
         assert_eq!(
             checkpoints.restored(),
-            Vec::<String>::new(),
-            "a rejected claim must not roll back"
+            vec!["ckpt-0".to_string()],
+            "{:?}",
+            checkpoints.calls()
         );
         // The second attempt's brief quotes the gate's own words.
         assert_eq!(end.outcome.attempt.failure, Some(FailureReason::ReviewRejected));
@@ -5831,6 +5981,86 @@ mod tests {
         assert!(reason.contains("locked"), "{reason}");
         // The failed attempt is the last one that ran; nothing was started on top of it.
         assert_eq!(end.outcome.attempt.number, 1);
+    }
+
+    #[test]
+    fn an_exhausted_subtask_returns_the_tree_to_its_base_before_the_next_one_starts() {
+        // The `black_jack` poisoning. A blocked subtask is settled: the task moves on to its next
+        // independent subtask, which takes its own base from whatever is on disk. Nothing used to
+        // put the tree back, so the blocked subtask's half-finished work became the next subtask's
+        // starting point — and no rollback could remove it, because each later base contained it.
+        //
+        // The assertion is on the *restore target*: it must be the base, and the work that was
+        // there must first be named in a `discarded` checkpoint, so a human can find it.
+        let checkpoints = FakeCheckpoints::new();
+        let (dir, mut runner) = runner(Scripted::new(looping_replies(6)), registry(vec![Arc::new(Touch)]));
+        // One step per attempt, and no restarts left: the first failure is the last attempt, so the
+        // only restore this test can see is the discard's own.
+        runner.limits.max_steps = 1;
+        runner = with_checkpoints(runner, Arc::clone(&checkpoints));
+        let mut journal = journal(&dir);
+        let end = runner
+            .session(&subtask(), 1)
+            .drive(allowance(3, 0), &mut journal)
+            .expect("session");
+
+        assert!(matches!(end.stop, Stop::Exhausted(_)), "{:?}", end.stop);
+        // The base is the first snapshot; the discard restored to it rather than leaving the tree
+        // as the spent attempts left it.
+        assert_eq!(
+            checkpoints.restored(),
+            vec!["ckpt-0".to_string()],
+            "a blocked subtask's tree must be returned to its base: {:?}",
+            checkpoints.calls()
+        );
+        // And the work that was thrown away is named before it is thrown away.
+        let discarded = journal_records(&dir)
+            .into_iter()
+            .filter(|record| record.fields.kind == Kind::CheckpointCreated)
+            .filter(|record| record.event.payload["role"] == serde_json::json!("discarded"))
+            .count();
+        assert_eq!(
+            discarded,
+            1,
+            "the discarded work must be findable: {:?}",
+            checkpoints.calls()
+        );
+        // The settlement marker names where the tree now is, and it is not a `rollback`: that role
+        // promises a following `attempt_restarted`, which recovery would then try to finish.
+        let settled = journal_records(&dir)
+            .into_iter()
+            .filter(|record| record.fields.kind == Kind::CheckpointCreated)
+            .any(|record| record.event.payload["role"] == serde_json::json!("settled"));
+        assert!(settled, "the journal must say the tree was settled");
+        // The report says where the work went, because a report is what a human reopens it from.
+        assert!(
+            end.report.outcome.contains("ckpt-1"),
+            "the report must name the set-aside work: {}",
+            end.report.outcome
+        );
+    }
+
+    #[test]
+    fn a_verified_subtask_keeps_its_work_because_it_is_committed_not_discarded() {
+        // The other half of the rule, and the reason the discard is scoped to `Exhausted`: a
+        // `done` subtask's work is committed by the cycle and must survive the session. A
+        // session that discarded on every stop would delete exactly the work that passed.
+        let checkpoints = FakeCheckpoints::new();
+        let (dir, mut runner) = runner(Scripted::new(vec![Ok(finish())]), registry(vec![Arc::new(Touch)]));
+        runner.gates = Some(Arc::new(FakeGates::green()));
+        runner = with_checkpoints(runner, Arc::clone(&checkpoints));
+        let mut journal = journal(&dir);
+        let end = runner
+            .session(&subtask(), 1)
+            .drive(allowance(3, 2), &mut journal)
+            .expect("session");
+
+        assert_eq!(end.stop, Stop::Done);
+        assert_eq!(
+            checkpoints.restored(),
+            Vec::<String>::new(),
+            "a closed subtask's tree is the work, not something to roll away"
+        );
     }
 
     #[test]
