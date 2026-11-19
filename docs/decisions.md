@@ -5765,6 +5765,15 @@ not find them»). Факт закреплён
   пишется **и при пустом выводе**: «проверка ничего не напечатала» — факт, о котором спрашивает
   посмертный разбор, и отсутствующий артефакт на него не отвечает.
 
+**Дефект, найденный при сверке с документацией.** `gc` решает, что удалять, по **полю записи**
+`event.artifact` (`gc::referenced_artifacts`), а `record_gate` писал digest только внутрь
+`payload`. Живой набор красной проверки был пуст, и `gc` мог удалить единственную копию вывода
+упавшего гейта, пока задача ещё не завершена, — тот самый случай, ради которого live set и
+существует. У `shell` такой асимметрии нет: он идёт через `append_full`/`spilled`, где поле
+заполнено. Теперь `record_gate` использует `JournalEvent::spilled`, а `GateRecord::artifact()`
+— единственное место, которое знает, какая разновидность записи несёт тело. Payload тоже
+сохраняет digest, поэтому читатель записи находит артефакт и оттуда.
+
 **Почему не «ещё одна попытка» и не облачная модель.** Диагноз был не в уме модели: она сама
 нашла stdin-зависание через `probe.rb` и `< /dev/null` (9169 строк), а на шаге 60 из 60
 диагностировала падение и правила `before do … and_call_original`. Не хватало шагов и информации.
@@ -5778,7 +5787,9 @@ not find them»). Факт закреплён
 падает `a_rejected_idea_keeps_the_end_where_the_failure_is` с сообщением «the failure itself must
 reach the next attempt's brief». Убрать счётчики строк из `summary()` таймаута → падают оба
 таймаутных теста. Не писать артефакт при пустом выводе → падает
-`run_command_spooled_keeps_an_artifact_for_a_silent_command`.
+`run_command_spooled_keeps_an_artifact_for_a_silent_command`. Вернуть `record_gate` к записи
+payload без поля → падает `a_red_checks_artifact_is_in_the_records_own_field_so_gc_keeps_it` с
+сообщением «the artifact must be live, or gc deletes the only copy of the failure» и `left: 0`.
 
 **Схема журнала не повышается.** Добавление полей в payload — прецедент `8a8b16a`
 (`why` в `Check`), `v` остался 3: новые поля необязательны (`#[serde(default)]`), старый журнал
