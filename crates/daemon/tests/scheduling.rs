@@ -280,6 +280,42 @@ fn a_plan_with_every_subtask_settled_offers_no_work() {
 }
 
 #[test]
+fn a_task_that_ended_failed_gates_is_reported_as_waiting_for_a_human() {
+    // The measured run: the journal's last `task_state` was `failed_gates`, the plan had two
+    // `blocked` subtasks and no `pending` one, and `status` rendered "1 with no subtask left to
+    // run" — which reads as "the plan is exhausted, nothing to see". The task was waiting for a
+    // person: its `rspec_pass` gate had timed out and the only way forward was reopening a
+    // subtask or retrying by hand.
+    let fixture = Fixture::with_plan(&plan_body(SubtaskState::Blocked));
+    {
+        let mut journal = fixture.journal();
+        journal
+            .append_event(
+                immortality_core::time::now(),
+                Kind::TaskState,
+                serde_json::json!({ "state": "failed_gates" }),
+            )
+            .expect("failed_gates");
+        journal.close().expect("close");
+    }
+    let candidate = fixture.only();
+    assert_eq!(candidate.state, TaskState::FailedGates);
+    assert!(
+        !candidate.has_work,
+        "a blocked subtask is not an attempt worth starting"
+    );
+    assert_eq!(
+        candidate.ineligible_for_inference(),
+        Some(Ineligible::FailedGates),
+        "`NoWork` would send a human to the plan to look for a pending subtask"
+    );
+    assert_eq!(
+        immortality_core::scheduler::queue::summarise(&[(&candidate.task, Ineligible::FailedGates)]),
+        "1 waiting for a human after failed gates"
+    );
+}
+
+#[test]
 fn an_unreadable_plan_offers_no_work_rather_than_starting_a_doomed_attempt() {
     // The failure a `has_work` derived from "TASKS.json exists" would produce: an attempt starts,
     // fails on the first step, and spends the subtask's budget on a planner bug.
@@ -306,8 +342,8 @@ fn a_task_whose_journal_cannot_be_read_is_visible_and_does_not_take_a_slot() {
     assert!(!candidate.has_work);
     assert_eq!(
         candidate.ineligible_for_inference(),
-        Some(Ineligible::NoWork),
-        "a blocked task is a reason, not work"
+        Some(Ineligible::Blocked),
+        "a blocked task is a reason a human acts on, not `NoWork`"
     );
 }
 

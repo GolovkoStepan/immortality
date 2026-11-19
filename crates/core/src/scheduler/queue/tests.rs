@@ -185,3 +185,77 @@ fn the_idle_reason_names_what_a_human_can_fix() {
     assert!(text.contains("1 with no subtask left to run"), "{text}");
     assert!(!text.contains("finished"), "{text}");
 }
+
+#[test]
+fn a_task_that_failed_its_gates_is_waiting_for_a_human_not_for_work() {
+    // Measured on the `black_jack` task that ended `failed_gates` after its `rspec_pass` gate timed
+    // out: `status` said "1 with no subtask left to run". True, and it sends a person to the plan
+    // to look for a pending subtask that does not exist. The task was waiting for one action —
+    // somebody reading the timeout and reopening a subtask.
+    let queue = Queue::new();
+    let mut failed = candidate("01ARZ3NDEKTSV4RRFFQ69G5FAA", 0);
+    failed.state = TaskState::FailedGates;
+    failed.has_work = false;
+    let (chosen, rejected) = queue.next_for_inference(std::slice::from_ref(&failed));
+    assert!(chosen.is_none());
+    assert_eq!(
+        rejected,
+        vec![(&id("01ARZ3NDEKTSV4RRFFQ69G5FAA"), Ineligible::FailedGates)]
+    );
+    assert_eq!(summarise(&rejected), "1 waiting for a human after failed gates");
+}
+
+#[test]
+fn a_red_verdict_is_not_overturned_by_a_tree_that_still_has_work() {
+    // The state, not `has_work`, is the authority once a verdict exists. A `failed_gates` tree can
+    // very well contain a `pending` subtask — the gate that failed belongs to the task, not to the
+    // subtask that was open — and scheduling it would start an attempt on top of a verdict nobody
+    // reviewed. Resuming is `start --task`, which takes the `retry` edge explicitly.
+    let mut failed = candidate("01ARZ3NDEKTSV4RRFFQ69G5FAA", 0);
+    failed.state = TaskState::FailedGates;
+    assert!(failed.has_work, "the fixture must have work to be a real test");
+    assert_eq!(failed.ineligible_for_inference(), Some(Ineligible::FailedGates));
+    assert_eq!(failed.ineligible_for_offline(), Some(Ineligible::FailedGates));
+}
+
+#[test]
+fn a_task_waiting_for_a_merge_and_a_blocked_one_are_named_too() {
+    // The same "no subtask left to run" sentence covered three different human actions. A task at
+    // `ready_for_review` is waiting for a merge decision, not for a gate to finish; a task L5
+    // blocked is waiting for a reopened subtask.
+    let review = Candidate {
+        state: TaskState::ReadyForReview,
+        ..candidate("01ARZ3NDEKTSV4RRFFQ69G5FAA", 0)
+    };
+    assert_eq!(
+        review.ineligible_for_inference(),
+        Some(Ineligible::ReadyForReview)
+    );
+
+    let blocked = Candidate {
+        state: TaskState::Blocked,
+        has_work: false,
+        ..candidate("01ARZ3NDEKTSV4RRFFQ69G5FAB", 0)
+    };
+    assert_eq!(blocked.ineligible_for_inference(), Some(Ineligible::Blocked));
+
+    let rejected = vec![
+        (&review.task, Ineligible::ReadyForReview),
+        (&blocked.task, Ineligible::Blocked),
+    ];
+    let text = summarise(&rejected);
+    assert!(text.contains("1 ready for review"), "{text}");
+    assert!(text.contains("1 blocked, waiting for a human"), "{text}");
+    assert!(!text.contains("no subtask"), "{text}");
+}
+
+#[test]
+fn a_blocked_task_that_still_has_an_independent_subtask_is_runnable_again() {
+    // L5 blocks a task only when nothing independent is left. A human who adds a subtask to a
+    // blocked task's plan makes it runnable without touching the lifecycle, and the queue must
+    // notice: keying the parked reason on the state alone would make that edit do nothing.
+    let mut blocked = candidate("01ARZ3NDEKTSV4RRFFQ69G5FAA", 0);
+    blocked.state = TaskState::Blocked;
+    assert!(blocked.has_work);
+    assert_eq!(blocked.ineligible_for_inference(), None);
+}
