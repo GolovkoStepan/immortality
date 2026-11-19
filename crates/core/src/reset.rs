@@ -728,6 +728,38 @@ mod tests {
     }
 
     #[test]
+    fn the_process_records_a_task_left_behind_go_with_the_state_directory() {
+        // `start_process` writes `proc_N.json` plus capture files under
+        // `state/<project>/<task>/processes/` (D-152). A reset that left those behind would leave
+        // handles pointing at pids that were reused by something else by the time the next run
+        // reads them, and `kill_process` would then signal a stranger.
+        //
+        // It is covered by the wholesale `state/` entry rather than by a rule of its own, and that
+        // is the property worth pinning: a future change that made `state/` removal selective —
+        // "keep the journals for metrics" — would silently keep these too.
+        let (_dir, repo, state) = fixture();
+        let task = "tsk_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let processes = state
+            .task_dir("prj_01ARZ3NDEKTSV4RRFFQ69G5FAV", task)
+            .join("processes");
+        std::fs::create_dir_all(&processes).expect("processes");
+        std::fs::write(processes.join("proc_1.json"), "{}").expect("record");
+        std::fs::write(processes.join("proc_1.stdout"), "out").expect("stdout");
+        let _ = &repo;
+
+        let inventory = inventory(&state).expect("inventory");
+        assert!(
+            inventory.state_dirs.contains(&state.root().join("state")),
+            "{inventory:?}"
+        );
+        execute(&state, &inventory, false).expect("execute");
+        assert!(
+            !processes.exists(),
+            "a leftover handle would name whatever pid was reused"
+        );
+    }
+
+    #[test]
     fn a_registered_repository_that_is_gone_is_reported_not_failed_on() {
         // A repository that was moved: there is no git to ask, and the reset of everything else
         // must still be possible. Its state directory is under `state/` and is removed with it.

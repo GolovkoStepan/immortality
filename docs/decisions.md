@@ -5663,8 +5663,20 @@ not find them»). Факт закреплён
 `a_worktrees_bundle_config_names_paths_too` (worktree тоже консультируется),
 `an_outside_directory_survives_yes_and_is_removed_only_with_outside`,
 `the_registry_a_plain_yes_deleted_is_why_outside_must_ride_along`,
-`a_project_with_no_bundle_config_adds_no_outside_entry`. CLI: dry-run называет каталог и конфиг,
-`--yes` оставляет его и печатает `kept`, `--yes --outside` удаляет, `--json` несёт `outside`.
+`a_project_with_no_bundle_config_adds_no_outside_entry`,
+`the_process_records_a_task_left_behind_go_with_the_state_directory`. CLI: dry-run называет
+каталог и конфиг, `--yes` оставляет его и печатает `kept`, `--yes --outside` удаляет, `--json`
+несёт `outside`.
+
+**Записи процессов при том же сбросе.** `start_process` пишет `proc_N.json` и файлы захвата в
+`state/<project>/<task>/processes/` (D-152). Сброс их уносит — но не отдельным правилом, а
+целиком через `state/`, и именно это стоило закрепить: будущая правка «оставим журналы ради
+метрик», сделав удаление `state/` выборочным, молча оставила бы и их, а хендл `proc_1` после
+этого указывал бы на pid, который к следующему прогону переиспользован другим процессом.
+`the_process_records_a_task_left_behind_go_with_the_state_directory` создаёт такой каталог,
+проверяет, что `state/` в инвентаре, и что после `execute` каталога нет. Саботаж — убрать
+`state.root().join("state")` из `candidates` — роняет его и
+`the_agent_directory_and_the_state_root_contents_are_both_listed`.
 
 **Саботаж.** Четыре, все собираются. `outside_paths` возвращает пусто — падают шесть тестов ядра
 (все, что ждут запись). Убрать `if !outside` (то есть удалять всегда) — падают
