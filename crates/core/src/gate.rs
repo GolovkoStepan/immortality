@@ -703,6 +703,23 @@ impl GateRecord {
         });
         records
     }
+
+    /// The artifact this record points at, if it points at one.
+    ///
+    /// Only a `check` record carries a body, and only when the check failed: the excerpt in `why`
+    /// is bounded, and the digest is what lets a human read the rest.
+    ///
+    /// The writer needs this because a digest inside `payload` is invisible to `gc`, which reads
+    /// the record's own `artifact` field to decide what is live. A failed gate's output left only
+    /// in the payload would be collectable while the task still runs, and it is precisely the
+    /// evidence a post-mortem opens.
+    #[must_use]
+    pub fn artifact(&self) -> Option<&str> {
+        match self {
+            Self::Check { artifact, .. } => artifact.as_deref(),
+            Self::Sanity { .. } | Self::Review { .. } | Self::Verdict { .. } => None,
+        }
+    }
 }
 
 /// What the reviewer said.

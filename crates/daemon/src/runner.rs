@@ -1039,7 +1039,25 @@ fn record_gate(
 ) -> immortality_core::Result<()> {
     let payload =
         serde_json::to_value(record).map_err(|error| immortality_core::Error::Protocol(error.to_string()))?;
-    journal.append_scoped(at, Kind::GateResult, payload, scope)?;
+    // A red check's whole output is an artifact, and the **record's** `artifact` field is what
+    // `gc` reads to decide the body is live (`gc::referenced_artifacts`). Leaving the digest only
+    // inside `payload` would make a failed gate's evidence collectable while the task is still
+    // running — which is the one case the live set exists to protect (D-156).
+    match record.artifact() {
+        Some(digest) => {
+            let digest = immortality_core::journal::parse_digest(digest)
+                .map_err(|error| immortality_core::Error::Protocol(error.to_string()))?;
+            journal.append_full_scoped(
+                at,
+                Kind::GateResult,
+                immortality_core::journal::JournalEvent::spilled(payload, digest),
+                scope,
+            )?;
+        }
+        None => {
+            journal.append_scoped(at, Kind::GateResult, payload, scope)?;
+        }
+    }
     Ok(())
 }
 
@@ -5616,6 +5634,54 @@ mod tests {
         assert_eq!(outcome.attempt.state, AttemptState::Failed);
         assert_eq!(outcome.attempt.failure, Some(FailureReason::GateFailed));
         assert_eq!(outcome.ended(), Ended::Failed(Cause::Limit(Limit::Steps)));
+    }
+
+    #[test]
+    fn a_red_checks_artifact_is_in_the_records_own_field_so_gc_keeps_it() {
+        // The digest of a failed check's whole output is what makes the bounded excerpt honest.
+        // `gc` decides what is live from `record.event.artifact`, never from a key inside
+        // `payload` (`gc::referenced_artifacts`), so a digest left only in the payload is
+        // collectable while the task still runs — and that artifact is the only copy of the
+        // output, since gate output has no observation to fall back on (D-156).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut journal = journal(&dir);
+        let scope = Scope::attempt(SubtaskId::from_suffix("01ARZ3NDEKTSV4RRFFQ69G5FAV"), 1);
+        let record = GateRecord::Check {
+            check: "rspec_after_add".to_string(),
+            command: "bundle exec rspec".to_string(),
+            exit_code: Some(1),
+            duration_ms: 1200,
+            passed: false,
+            required: true,
+            why: Some("`rspec_after_add` (exit 1)\n192 examples, 1 failure".to_string()),
+            artifact: Some(immortality_core::journal::digest_text(
+                &immortality_core::artifacts::digest_of(b"192 examples, 1 failure\n"),
+            )),
+        };
+        record_gate(chrono::Local::now().into(), &mut journal, &scope, &record).expect("record");
+
+        let read = immortality_core::journal::JournalReader::open(journal.dir(), journal.task())
+            .expect("reader")
+            .read()
+            .expect("read");
+        let live = immortality_core::gc::referenced_artifacts(&read.records);
+        assert_eq!(
+            live.len(),
+            1,
+            "the artifact must be live, or gc deletes the only copy of the failure: {live:?}"
+        );
+
+        // And the payload still carries the digest, so a reader of the record can find the body.
+        let check = read
+            .records
+            .iter()
+            .find(|record| record.fields.kind == Kind::GateResult)
+            .expect("the gate record");
+        assert_eq!(
+            check.event.payload.get("artifact").and_then(|it| it.as_str()),
+            record.artifact(),
+            "the payload and the field name the same artifact"
+        );
     }
 
     #[test]
