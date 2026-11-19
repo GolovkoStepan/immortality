@@ -868,7 +868,16 @@ mod tests {
         // `~/.gem/shared` is what bundler writes and what the human recognizes; the literal string
         // is not a directory. A reset that took it at face value would report `./~/.gem/shared`
         // inside the repository and delete nothing at all.
+        //
+        // Asserted on `outside_paths` rather than on `inventory`, because `inventory` keeps only
+        // the paths that exist (a report must not list directories a machine does not have). This
+        // test used to assert through `inventory` and therefore silently required `~/.gem/shared`
+        // to exist on the machine running it: it passed where a gem directory happened to be and
+        // failed on a clean one, which says nothing about the expansion it is named for. The
+        // listing half is covered by `a_bundle_path_outside_the_repository_is_listed_with_the_config_that_named_it`,
+        // which creates a real directory outside the repository.
         let (_dir, repo, state) = fixture();
+        drop(state);
         std::fs::create_dir_all(repo.join(".bundle")).expect("bundle dir");
         std::fs::write(
             repo.join(".bundle").join("config"),
@@ -876,15 +885,12 @@ mod tests {
         )
         .expect("config");
 
-        let inventory = inventory(&state).expect("inventory");
+        let entries = outside_paths(&repo);
         let home = std::env::var_os("HOME").expect("HOME");
-        assert_eq!(inventory.outside.len(), 1, "{inventory:?}");
-        assert_eq!(
-            inventory.outside[0].path,
-            PathBuf::from(home).join(".gem").join("shared")
-        );
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0].path, PathBuf::from(home).join(".gem").join("shared"));
         assert!(
-            !inventory.outside[0].path.starts_with(&repo),
+            !entries[0].path.starts_with(&repo),
             "an unexpanded `~` would read as a path inside the repository"
         );
     }
